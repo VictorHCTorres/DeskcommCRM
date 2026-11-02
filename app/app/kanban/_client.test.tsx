@@ -20,6 +20,10 @@ vi.mock("@/hooks/pipelines/usePipelines", () => ({
   useEditarFunil: () => ({ mutate: editar, isPending: false }),
   useArquivarFunil: () => ({ mutate: arquivar, isPending: false }),
 }));
+vi.mock("@/hooks/pipelines/usePipelineGroups", () => ({
+  useCriarGrupoDeFunil: () => ({ mutate: vi.fn(), isPending: false }),
+  useEditarGrupoDeFunil: () => ({ mutate: vi.fn(), isPending: false }),
+}));
 
 const funil = (id: string): FunilDaLista => ({
   id,

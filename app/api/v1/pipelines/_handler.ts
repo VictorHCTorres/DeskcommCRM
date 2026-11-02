@@ -27,6 +27,7 @@ export interface PipelineRow {
   position: number;
   vocabulary: Record<string, unknown> | null;
   settings: Record<string, unknown> | null;
+  group_id: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -51,7 +52,7 @@ export async function listPipelinesHandler(
   let query = supabase
     .from("crm_pipelines")
     .select(
-      "id, organization_id, name, slug, description, is_default, is_archived, position, vocabulary, settings, created_at, updated_at",
+      "id, organization_id, name, slug, description, is_default, is_archived, position, vocabulary, settings, group_id, created_at, updated_at",
     )
     .eq("organization_id", ctx.organization_id)
     .order("position", { ascending: true });

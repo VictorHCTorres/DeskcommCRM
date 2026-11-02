@@ -2,9 +2,9 @@
   "schema_version": 1,
   "diagram_type": "fluxo",
   "meta": {
-    "titulo": "Captação por webhook: do formulário do site ao campo usado na mensagem",
+    "titulo": "Captação por webhook: do formulário público ou do site ao campo usado na mensagem",
     "pergunta": "O que chega de um formulário, como o CRM o entende, onde fica, quem vê e onde o campo volta a ser usado?",
-    "resumo": "Um formulário manda dados por um endereço com token. A rota escolhe o adaptador pela forma do envio, grava o lead e o histórico da captação, e a equipe vê o painel. O campo pode ser cadastrado no funil, e daí volta como rótulo no painel, no card do lead, nos botões da automação e na entrada da IA."
+    "resumo": "Um formulário manda dados por um endereço com token. A fonte também pode publicar uma página nativa quando está ativa e sem HMAC; o honeypot barra robôs antes de qualquer escrita. A rota escolhe o adaptador pela forma do envio, grava o lead e o histórico da captação, e a equipe vê o painel. O campo pode ser cadastrado no funil, e daí volta como rótulo no painel, no card do lead, nos botões da automação e na entrada da IA."
   },
   "lanes": [
     {
@@ -49,6 +49,30 @@
       "type": "external",
       "label": "Formulário do site",
       "sublabel": "Elementor Pro · JetFormBuilder · RD Station · Respondi · Zapier/n8n"
+    },
+    {
+      "id": "formulario-nativo",
+      "lane": "entrada",
+      "col": 2,
+      "type": "frontend",
+      "label": "GET /f/[token]",
+      "sublabel": "página acessível; sucesso e erro aparecem sem tirar a pessoa do formulário"
+    },
+    {
+      "id": "resolver-formulario",
+      "lane": "entendimento",
+      "col": 6,
+      "type": "lib",
+      "label": "formulario-publico.ts",
+      "sublabel": "publica só fonte ativa sem HMAC; não devolve organization_id"
+    },
+    {
+      "id": "antispam-formulario",
+      "lane": "entendimento",
+      "col": 7,
+      "type": "lib",
+      "label": "honeypot __deskcomm_site",
+      "sublabel": "bot recebe sucesso, mas não cria contato, card nem histórico"
     },
     {
       "id": "rota",
@@ -121,6 +145,14 @@
       "type": "frontend",
       "label": "CapturaDetail",
       "sublabel": "Webhooks › Leads recebidos: o rótulo no lugar da chave"
+    },
+    {
+      "id": "configurar-formulario-nativo",
+      "lane": "humano",
+      "col": 5,
+      "type": "frontend",
+      "label": "SourceDetail",
+      "sublabel": "abre e copia o link; explica por que fonte pausada ou com HMAC não publica"
     },
     {
       "id": "cadastrar",
@@ -369,6 +401,42 @@
       "from": "autorizar-ia-formulario",
       "to": "contato-elegivel-ia",
       "label": "autorização atômica ou recusa; nunca envia mensagem"
+    },
+    {
+      "id": "form-nativo-configura",
+      "from": "configurar-formulario-nativo",
+      "to": "formulario-nativo",
+      "label": "abre ou copia /f/[token]"
+    },
+    {
+      "id": "form-nativo-resolve",
+      "from": "formulario-nativo",
+      "to": "resolver-formulario",
+      "label": "token do path; 404 uniforme quando indisponível"
+    },
+    {
+      "id": "form-nativo-publica",
+      "from": "resolver-formulario",
+      "to": "formulario-nativo",
+      "label": "nome e perguntas validadas"
+    },
+    {
+      "id": "form-nativo-antispam",
+      "from": "formulario-nativo",
+      "to": "antispam-formulario",
+      "label": "POST JSON com honeypot reservado"
+    },
+    {
+      "id": "form-nativo-entra",
+      "from": "antispam-formulario",
+      "to": "rota",
+      "label": "só payload humano segue ao motor canônico"
+    },
+    {
+      "id": "form-nativo-feedback",
+      "from": "rota",
+      "to": "formulario-nativo",
+      "label": "laço: sucesso inline ou recusa acionável"
     }
   ],
   "cards": [
@@ -387,6 +455,10 @@
     {
       "titulo": "Limites conhecidos",
       "texto": "Os botões de campo na ação de WhatsApp usam o funil PADRÃO da organização, não o funil específico da regra. Variável ausente vira vazio (comportamento que já existia). O mapeador de chaves (resolveField) lê o protótipo: {{constructor}} já imprimia 'function Object()' antes desta mudança e continua imprimindo."
+    },
+    {
+      "titulo": "Formulário nativo e a fronteira da assinatura",
+      "texto": "O navegador não recebe o segredo HMAC. Por isso /f/[token] só existe para fonte ativa e sem assinatura; a própria tela de configuração explica o portão. A submissão usa o POST canônico, então idempotência, histórico, funil, atribuição e regras continuam tendo uma fonte de verdade. O laço de retorno é visível: erro mantém o formulário preenchível; sucesso confirma na mesma página e a captação aparece em Webhooks › Leads recebidos."
     }
   ]
 }

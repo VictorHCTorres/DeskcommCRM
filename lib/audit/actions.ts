@@ -499,6 +499,9 @@ export const AUDIT_ACTIONS = [
   "pipeline.created",
   "pipeline.updated",
   "pipeline.archived",
+  "pipeline_group.created",
+  "pipeline_group.updated",
+  "pipeline_group.archived",
   // Só existe para o funil que nunca recebeu negócio: com histórico, a operação
   // vira `pipeline.archived` e a linha continua no banco.
   "pipeline.deleted",

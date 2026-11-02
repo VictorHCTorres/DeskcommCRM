@@ -32,7 +32,9 @@ import { Button } from "@/components/ui/button";
 import {
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
+  SelectLabel,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
@@ -43,6 +45,7 @@ import type { Pipeline, Stage } from "@/lib/kanban/types";
 import { categoriaDoMotivo } from "@/lib/leads/motivos-de-perda-do-funil";
 import { ROLE_RANK, type Role } from "@/lib/auth/types";
 import { cn } from "@/lib/utils";
+import { gruposPorArea, type GrupoDeFunil } from "@/lib/pipelines/grupos";
 
 /**
  * AS TRÊS VISÕES DO FUNIL (#2770, #3172).
@@ -72,6 +75,7 @@ export function PipelinePageClient({
   initialName,
   role,
   funis,
+  grupos = [],
   funilInicial,
   etapasIniciais,
 }: {
@@ -83,7 +87,9 @@ export function PipelinePageClient({
    * partição da tela de Funis. É o que alimenta o seletor de troca rápida do
    * cabeçalho; sem ele o quadro não sabe que existem outros funis.
    */
-  funis: Array<{ id: string; name: string }>;
+  funis: Array<{ id: string; name: string; group_id?: string | null }>;
+  /** Áreas e grupos ativos que dão contexto ao seletor de troca rápida. */
+  grupos?: GrupoDeFunil[];
   /**
    * O FUNIL, da leitura leve — `crm_pipelines` menos os negócios (#3172, item 4
    * do CR). É dele que a aba Lista tira o `settings` da ficha e o vocabulário,
@@ -264,6 +270,10 @@ export function PipelinePageClient({
   const nomeAtual = data?.pipeline.name ?? initialName;
   // Um funil só = nada para trocar: o seletor seria ruído permanente.
   const podeTrocar = funis.length > 1;
+  const estruturaDeFunis = gruposPorArea(grupos);
+  const idsAgrupados = new Set(
+    estruturaDeFunis.flatMap(({ grupos: filhos }) => filhos.map((g) => g.id)),
+  );
 
   return (
     <div
@@ -343,11 +353,34 @@ export function PipelinePageClient({
               <SelectValue placeholder={nomeAtual} />
             </SelectTrigger>
             <SelectContent>
-              {funis.map((f) => (
-                <SelectItem key={f.id} value={f.id} data-testid={`trocar-funil-opcao-${f.id}`}>
-                  {f.name}
-                </SelectItem>
+              {estruturaDeFunis.map(({ area, grupos: filhos }) => (
+                <SelectGroup key={area.id}>
+                  <SelectLabel>{area.name}</SelectLabel>
+                  {filhos.flatMap((grupo) => {
+                    const doGrupo = funis.filter((funil) => funil.group_id === grupo.id);
+                    return doGrupo.map((funil) => (
+                      <SelectItem
+                        key={funil.id}
+                        value={funil.id}
+                        data-testid={`trocar-funil-opcao-${funil.id}`}
+                      >
+                        {grupo.name} › {funil.name}
+                      </SelectItem>
+                    ));
+                  })}
+                </SelectGroup>
               ))}
+              {funis
+                .filter((funil) => !funil.group_id || !idsAgrupados.has(funil.group_id))
+                .map((funil) => (
+                  <SelectItem
+                    key={funil.id}
+                    value={funil.id}
+                    data-testid={`trocar-funil-opcao-${funil.id}`}
+                  >
+                    {funil.name}
+                  </SelectItem>
+                ))}
             </SelectContent>
           </Select>
         )}

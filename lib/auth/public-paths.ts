@@ -9,6 +9,10 @@ export const PUBLIC_PATHS: RegExp[] = [
   /^\/login(\/.*)?$/,
   /^\/signup$/,
   /^\/auth\/confirm$/,
+  // Formulário nativo de uma fonte de captação. O token resolve a fonte no
+  // servidor; fonte pausada ou protegida por HMAC responde 404. Um segmento
+  // só e âncora final: nenhum sub-path futuro nasce público de carona.
+  /^\/f\/[^/]+$/,
   // A VOLTA DA ENTRADA COM GOOGLE (issue #1388). Quem chega aqui é o NAVEGADOR
   // que o Google devolveu, via 302 do GoTrue — navegação vinda de outro site,
   // onde o cookie de sessão (`sameSite: "strict"`) não viaja por definição.

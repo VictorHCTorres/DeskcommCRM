@@ -19,6 +19,7 @@ import { requireSupportWrite } from "@/lib/impersonate/support";
 import { randomUUID } from "node:crypto";
 import { type NextRequest } from "next/server";
 import { z } from "zod";
+import type { SupabaseClient } from "@supabase/supabase-js";
 
 import { fail, ok } from "@/lib/api/wrappers";
 import { audit } from "@/lib/audit";
@@ -75,6 +76,7 @@ const bodySchema = z
      */
     is_archived: z.boolean().optional(),
     depois_de: z.string().min(1).nullable().optional(),
+    group_id: z.string().uuid().nullable().optional(),
   })
   .strict()
   .refine((b) => Object.keys(b).length > 0, { message: "Nada para alterar." });
@@ -86,6 +88,7 @@ type PatchDoFunil = {
   is_default?: boolean;
   is_client_pipeline?: boolean;
   is_archived?: boolean;
+  group_id?: string | null;
 };
 
 export async function PATCH(req: NextRequest, ctx: RouteCtx): Promise<Response> {
@@ -195,6 +198,32 @@ export async function PATCH(req: NextRequest, ctx: RouteCtx): Promise<Response> 
     patchDoAlvo.description = pedido.description?.trim() || null;
   }
 
+  if (pedido.group_id !== undefined) {
+    if (pedido.group_id !== null) {
+      // A FK composta repete esta garantia no banco. A validação aqui existe
+      // para devolver uma orientação legível em vez de um 23503 cru.
+      const bancoAberto = supabase as unknown as SupabaseClient;
+      const { data: grupo, error: grupoErr } = await bancoAberto
+        .from("crm_pipeline_groups")
+        .select("id, kind, archived_at")
+        .eq("id", pedido.group_id)
+        .eq("organization_id", orgId)
+        .maybeSingle();
+      if (grupoErr) return fail("internal_error", grupoErr.message, 500, { requestId });
+      const destino = grupo as unknown as {
+        id: string;
+        kind: string;
+        archived_at: string | null;
+      } | null;
+      if (!destino || destino.kind !== "grupo" || destino.archived_at !== null) {
+        return fail("unprocessable_entity", "Escolha um Grupo ativo desta organização.", 422, {
+          requestId,
+        });
+      }
+    }
+    patchDoAlvo.group_id = pedido.group_id;
+  }
+
   // Tirar do arquivo é update SIMPLES: nenhum índice a disputar (nem o de slug
   // nem o de padrão são parciais em `is_archived`, então o funil já ocupava o
   // lugar dele enquanto estava arquivado). Só entra no patch se ele ESTIVER
@@ -215,10 +244,9 @@ export async function PATCH(req: NextRequest, ctx: RouteCtx): Promise<Response> 
     if (ocupado) {
       return fail(
         "state_conflict",
-        t("Já existe um funil ativo chamado «{nome}». Renomeie um dos dois antes de tirar este funil do arquivo.").replace(
-          "{nome}",
-          ocupado,
-        ),
+        t(
+          "Já existe um funil ativo chamado «{nome}». Renomeie um dos dois antes de tirar este funil do arquivo.",
+        ).replace("{nome}", ocupado),
         409,
         { requestId },
       );
@@ -245,7 +273,9 @@ export async function PATCH(req: NextRequest, ctx: RouteCtx): Promise<Response> 
     if (!Number.isFinite(posicao)) {
       return fail(
         "state_conflict",
-        t("Os funis desta lista estão empatados na ordenação. Recarregue a página e mova o funil para outro lugar."),
+        t(
+          "Os funis desta lista estão empatados na ordenação. Recarregue a página e mova o funil para outro lugar.",
+        ),
         409,
         { requestId },
       );
@@ -369,7 +399,11 @@ export async function DELETE(req: NextRequest, ctx: RouteCtx): Promise<Response>
   }
 
   const { error } = definitivo
-    ? await supabase.from("crm_pipelines").delete().eq("id", pipelineId).eq("organization_id", orgId)
+    ? await supabase
+        .from("crm_pipelines")
+        .delete()
+        .eq("id", pipelineId)
+        .eq("organization_id", orgId)
     : await supabase
         .from("crm_pipelines")
         .update({ is_archived: true })
