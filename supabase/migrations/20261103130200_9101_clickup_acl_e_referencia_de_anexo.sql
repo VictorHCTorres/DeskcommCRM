@@ -46,7 +46,7 @@ begin
           else
             storage_path ~ (
               '^' || organization_id::text || '/[A-Za-z0-9._-]+/leads/' || lead_id::text ||
-              '/[0-9a-f]{64}\\.[a-z0-9]+$'
+              '/[0-9a-f]{64}\.[a-z0-9]+$'
             )
         end
       );
