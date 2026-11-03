@@ -19,6 +19,7 @@ import { ScoreSlot } from "./ScoreSlot";
 import { LeadTimeline } from "./LeadTimeline";
 import { PropostasDoNegocio } from "./PropostasDoNegocio";
 import { TarefasDoNegocio } from "./TarefasDoNegocio";
+import { RelacoesClickUpDoLead } from "./RelacoesClickUpDoLead";
 import { OwnerBadge } from "./OwnerBadge";
 import { EtapaNoDossie } from "./EtapaNoDossie";
 import { SecaoDoDossie, useSecoesRecolhidas } from "./SecaoDoDossie";
@@ -26,6 +27,7 @@ import { resolveLeadOwner } from "@/lib/kanban/owner";
 import type { AtalhoDoCard } from "@/lib/leads/atalhos-do-card";
 import { formatValorDoNegocio, MOEDA_PADRAO } from "@/lib/money";
 import type { CustomFieldDef } from "@/components/contacts/CustomFieldsEditor";
+import { clickUpLeadPresentation, formatClickUpEstimate } from "@/lib/clickup/presentation/lead";
 
 interface Props {
   open: boolean;
@@ -111,6 +113,7 @@ export function LeadDossier({
 }: Props) {
   const tagDoIdioma = useTagDeIdioma();
   const t = useT();
+  const clickup = clickUpLeadPresentation(lead.source_metadata, lead.tags);
   // Sem prop, nenhum botão: quem abre o dossiê TEM o funil em mão (o quadro, a
   // lista e o calendário passam `atalhos`) e é de lá que sai o `settings`. Ler
   // o cache do react-query aqui dentro custaria um `QueryClientProvider`
@@ -143,7 +146,9 @@ export function LeadDossier({
   const user = useUser();
   const activeOrg = useActiveOrg();
   const podeCriarProposta =
-    user.is_platform_admin || (activeOrg && ROLE_RANK[activeOrg.role] >= ROLE_RANK.manager) || false;
+    user.is_platform_admin ||
+    (activeOrg && ROLE_RANK[activeOrg.role] >= ROLE_RANK.manager) ||
+    false;
   // A MESMA régua do arrasto e do "Mover para…" do card (`KanbanCardActions`).
   const podeMoverCard = usePermission("pipeline.move_card");
   // Tarefas são `agent`+, a mesma régua da tela de Tarefas e da rota — e o
@@ -194,7 +199,7 @@ export function LeadDossier({
 
         {/* ① cabeçalho vivo */}
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 border-b border-border pb-3 text-xs">
-          <span className="font-medium tabular-nums text-text">
+          <span className="font-medium text-text tabular-nums">
             {formatValor(lead.value_cents, lead.currency)}
           </span>
           {etapas && onMudarEtapa ? (
@@ -212,6 +217,16 @@ export function LeadDossier({
             ownerName={owner.name}
             agentVersion={owner.agentVersion}
           />
+          {clickup.startAt ? (
+            <span className="text-text-muted">
+              {t("Início")}: {new Date(clickup.startAt).toLocaleString(tagDoIdioma)}
+            </span>
+          ) : null}
+          {clickup.timeEstimateMs != null ? (
+            <span className="text-text-muted">
+              {t("Estimativa")}: {formatClickUpEstimate(clickup.timeEstimateMs)}
+            </span>
+          ) : null}
           {score && (
             // O MESMO componente do card, não uma cópia do medidor.
             // "Superfície nova herda as decisões da antiga" só vale como
@@ -257,11 +272,7 @@ export function LeadDossier({
             card: um botão que exige rolar até o fim é o mesmo que copiar o
             telefone e colar no softphone. Sem atalho configurado, nada é
             desenhado — nem separador, nem faixa vazia. */}
-        <AtalhosDoNegocio
-          atalhos={atalhosDoCard}
-          lead={lead}
-          contactId={lead.contact_id}
-        />
+        <AtalhosDoNegocio atalhos={atalhosDoCard} lead={lead} contactId={lead.contact_id} />
 
         <ConversaNoDossie
           conversa={lead.conversa}
@@ -278,11 +289,7 @@ export function LeadDossier({
           recolhida={fechadas.has("contato")}
           aoAlternar={alternar}
         >
-          <ContatoDoNegocio
-            contactId={lead.contact_id}
-            pipelineId={pipelineId}
-            leadId={lead.id}
-          />
+          <ContatoDoNegocio contactId={lead.contact_id} pipelineId={pipelineId} leadId={lead.id} />
         </SecaoDoDossie>
 
         {/* ② Dados do negócio — o que se PREENCHE, agora ANTES da linha do
@@ -304,7 +311,12 @@ export function LeadDossier({
               podeDecidir={podeConfirmarDoDocumento}
               aoDecidir={(confirmado) => formulario.current?.confirmarCampo(confirmado)}
             />
-            <LeadFieldsForm lead={lead} pipelineId={pipelineId} fieldDefs={fieldDefs} controle={formulario} />
+            <LeadFieldsForm
+              lead={lead}
+              pipelineId={pipelineId}
+              fieldDefs={fieldDefs}
+              controle={formulario}
+            />
           </div>
         </SecaoDoDossie>
 
@@ -319,6 +331,7 @@ export function LeadDossier({
           podeEditar={podeEditarTarefas}
           aberto={open}
         />
+        <RelacoesClickUpDoLead leadId={lead.id} />
 
         {/* ③ Linha do tempo — a CONSULTA, por último. Recolhida, mostra as três
             entradas mais recentes e o "ver tudo" (pedido do autor): a seção

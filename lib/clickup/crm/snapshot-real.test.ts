@@ -4,29 +4,56 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import summary from "@/tests/fixtures/clickup-2026-11-02-summary.json";
+import { clickupManifestSchema } from "@/lib/clickup/contrato";
+import { exportarClickUpCrmBundleV3 } from "../../../scripts/clickup-crm-bundle-v3.mjs";
 
-const snapshot = path.resolve(
-  process.cwd(),
-  "../../03-API-E-CODIGO/clickup-harness/backups/2026-11-02",
-);
+const snapshot = path.resolve("/Volumes/ProjectSSD/clickup-harness-backups/2026-11-03");
 const hash = (ids: Iterable<string>) =>
   createHash("sha256")
     .update([...ids].sort().join("\n"))
     .digest("hex");
 
 describe("reconciliação do snapshot real ClickUp 2026-11-02", () => {
+  it.skipIf(!existsSync(snapshot))(
+    "o bundle completo de 5.813 objetos cabe no schema e no guard de 20 MiB",
+    async () => {
+      const manifest = await exportarClickUpCrmBundleV3({
+        backup: snapshot,
+        connectionId: "00000000-0000-4000-8000-000000000001",
+      });
+      expect(manifest.objects).toHaveLength(5_813);
+      expect(clickupManifestSchema.safeParse(manifest).success).toBe(true);
+      expect(Buffer.byteLength(JSON.stringify(manifest), "utf8")).toBeLessThanOrEqual(
+        20 * 1024 * 1024,
+      );
+    },
+  );
   it("mantém no CI a fixture estrutural sem PII e fecha a equação", () => {
     expect(summary).toMatchObject({
-      lists: 48,
-      unique_lists: 48,
-      empty_lists: 14,
-      task_records: 1_983,
-      root_tasks: 1_758,
+      archive_scope: "active_and_archived",
+      include_timl: true,
+      tasks_with_backup_provenance: 2_096,
+      lists: 76,
+      unique_lists: 76,
+      empty_lists: 29,
+      task_records: 2_096,
+      root_tasks: 1_871,
       subtasks: 225,
       archived_tasks: 0,
-      field_bindings: 1_932,
-      unique_fields: 145,
+      field_bindings: 3_149,
+      unique_fields: 166,
       docs_metadata_only: 50,
+      prioritized_tasks: 306,
+      tagged_tasks: 609,
+      tag_occurrences: 731,
+      unique_tags: 29,
+      start_dates: 49,
+      time_estimates_nonnull: 82,
+      time_estimates_positive: 81,
+      linked_tasks_raw: 28,
+      canonical_relations: 14,
+      checklist_groups: 4,
+      checklist_items: 15,
     });
     const {
       fixture_structure_sha256: expectedStructure,
@@ -37,7 +64,7 @@ describe("reconciliação do snapshot real ClickUp 2026-11-02", () => {
     expect(createHash("sha256").update(JSON.stringify(structure)).digest("hex")).toBe(
       expectedStructure,
     );
-    const results = { created: 0, updated: 0, unchanged: 1_983, skipped: 0, conflicts: 0 };
+    const results = { created: 0, updated: 0, unchanged: 2_096, skipped: 0, conflicts: 0 };
     expect(summary.task_records).toBe(
       results.created + results.updated + results.unchanged + results.skipped + results.conflicts,
     );
@@ -56,6 +83,18 @@ describe("reconciliação do snapshot real ClickUp 2026-11-02", () => {
     let discoveredTasks = 0;
     let rootTasks = 0;
     let subtasks = 0;
+    let prioritizedTasks = 0;
+    let taggedTasks = 0;
+    let tagOccurrences = 0;
+    let startDates = 0;
+    let timeEstimates = 0;
+    let positiveTimeEstimates = 0;
+    let linkedTasksRaw = 0;
+    let checklistGroups = 0;
+    let checklistItems = 0;
+    let tasksWithBackupProvenance = 0;
+    const tagDictionary: string[] = [];
+    const canonicalRelations: string[] = [];
     const relationships: string[] = [];
     for (const file of readdirSync(path.join(snapshot, "tasks")).filter((name) =>
       name.endsWith(".jsonl"),
@@ -64,9 +103,37 @@ describe("reconciliação do snapshot real ClickUp 2026-11-02", () => {
         if (!line.trim()) continue;
         discoveredTasks += 1;
         const task = JSON.parse(line);
+        if (
+          task.backup_provenance?.archive_scope === "active_and_archived" &&
+          task.backup_provenance?.include_timl === true
+        ) {
+          tasksWithBackupProvenance += 1;
+        }
         taskIds.add(String(task.id));
         if (task.parent) subtasks += 1;
         else rootTasks += 1;
+        if (task.priority?.priority) prioritizedTasks += 1;
+        if (task.tags?.length) taggedTasks += 1;
+        tagOccurrences += task.tags?.length ?? 0;
+        for (const tag of task.tags ?? []) {
+          tagDictionary.push(`${tag.name}\u0000${tag.tag_bg ?? tag.tag_fg ?? ""}`);
+        }
+        if (task.start_date != null) startDates += 1;
+        if (task.time_estimate != null) {
+          timeEstimates += 1;
+          if (Number(task.time_estimate) > 0) positiveTimeEstimates += 1;
+        }
+        linkedTasksRaw += task.linked_tasks?.length ?? 0;
+        for (const link of task.linked_tasks ?? []) {
+          const [left, right] = [String(link.task_id), String(link.link_id)].sort();
+          canonicalRelations.push(`linked:${left}:${right}`);
+        }
+        checklistGroups += task.checklists?.length ?? 0;
+        checklistItems += (task.checklists ?? []).reduce(
+          (total: number, checklist: { items?: unknown[] }) =>
+            total + (checklist.items?.length ?? 0),
+          0,
+        );
         const parent = task.parent
           ? String(typeof task.parent === "object" ? task.parent.id : task.parent)
           : "";
@@ -81,6 +148,22 @@ describe("reconciliação do snapshot real ClickUp 2026-11-02", () => {
     expect(rootTasks).toBe(summary.root_tasks);
     expect(subtasks).toBe(summary.subtasks);
     expect(taskIds.size).toBe(summary.unique_tasks);
+    expect(tasksWithBackupProvenance).toBe(summary.tasks_with_backup_provenance);
+    expect(prioritizedTasks).toBe(summary.prioritized_tasks);
+    expect(taggedTasks).toBe(summary.tagged_tasks);
+    expect(tagOccurrences).toBe(summary.tag_occurrences);
+    expect(new Set(tagDictionary.map((tag) => tag.split("\u0000")[0])).size).toBe(
+      summary.unique_tags,
+    );
+    expect(startDates).toBe(summary.start_dates);
+    expect(timeEstimates).toBe(summary.time_estimates_nonnull);
+    expect(positiveTimeEstimates).toBe(summary.time_estimates_positive);
+    expect(linkedTasksRaw).toBe(summary.linked_tasks_raw);
+    expect(new Set(canonicalRelations).size).toBe(summary.canonical_relations);
+    expect(checklistGroups).toBe(summary.checklist_groups);
+    expect(checklistItems).toBe(summary.checklist_items);
+    expect(hash(new Set(tagDictionary))).toBe(summary.tag_dictionary_sha256);
+    expect(hash(new Set(canonicalRelations))).toBe(summary.canonical_relations_sha256);
     expect(hash(listIds)).toBe(summary.list_ids_sha256);
     expect(hash(taskIds)).toBe(summary.task_ids_sha256);
     const fieldIds = new Set<string>();

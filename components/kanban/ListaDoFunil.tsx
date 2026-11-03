@@ -18,6 +18,7 @@ import {
 import { camposDoFunil, camposPorEscopo } from "@/lib/leads/campos-do-funil";
 import { formatValorDoNegocio } from "@/lib/money";
 import { rotuloDaRecorrencia } from "@/lib/leads/valor-recorrente";
+import { clickUpLeadPresentation, formatClickUpEstimate } from "@/lib/clickup/presentation/lead";
 import type { Lead } from "@/lib/types/leads";
 import type { Pipeline, Stage } from "@/lib/kanban/types";
 
@@ -228,41 +229,82 @@ export function ListaDoFunil({
               </tr>
             </thead>
             <tbody>
-              {leads.map((l) => (
-                <tr
-                  key={l.id}
-                  className="border-t transition-colors hover:bg-muted/40"
-                  data-testid={`lista-negocio-${l.id}`}
-                >
-                  <td className="p-3">
-                    {/* O clique abre a MESMA ficha do quadro. É um botão, e não
+              {leads.map((l) => {
+                const clickup = clickUpLeadPresentation(l.source_metadata, l.tags);
+                const prioridade = clickup.priority
+                  ? {
+                      low: t("Baixa"),
+                      medium: t("Média"),
+                      high: t("Alta"),
+                      urgent: t("Urgente"),
+                    }[clickup.priority]
+                  : null;
+                return (
+                  <tr
+                    key={l.id}
+                    className="border-t transition-colors hover:bg-muted/40"
+                    data-testid={`lista-negocio-${l.id}`}
+                  >
+                    <td className="p-3">
+                      {/* O clique abre a MESMA ficha do quadro. É um botão, e não
                         a linha inteira: quem navega por teclado precisa de um
                         alvo focável por negócio. */}
-                    <button
-                      type="button"
-                      onClick={() => setDossieId(l.id)}
-                      className="text-left font-medium underline-offset-2 hover:underline"
-                    >
-                      {l.title}
-                    </button>
-                  </td>
-                  <td className="p-3 text-muted-foreground">{nomeDaEtapa(l.stage_id)}</td>
-                  <td className="p-3 text-right tabular-nums">
-                    {valorUnico(l) ?? (recorrente(l) ? "" : "—")}
-                    {recorrente(l) && (
-                      <span className="block text-xs font-normal text-muted-foreground">
-                        {valorUnico(l) ? "+ " : ""}
-                        {recorrente(l)}
-                      </span>
-                    )}
-                  </td>
-                  <td className="p-3 text-muted-foreground">
-                    {l.last_activity_at
-                      ? diaCurto.format(new Date(l.last_activity_at))
-                      : t("Sem atividade")}
-                  </td>
-                </tr>
-              ))}
+                      <button
+                        type="button"
+                        onClick={() => setDossieId(l.id)}
+                        className="text-left font-medium underline-offset-2 hover:underline"
+                      >
+                        {l.title}
+                      </button>
+                      {prioridade ||
+                      clickup.tags.length ||
+                      clickup.startAt ||
+                      clickup.timeEstimateMs != null ? (
+                        <div
+                          className="mt-1 flex max-w-sm flex-wrap items-center gap-1 text-[10px]"
+                          aria-label={t("Prioridade e tags do ClickUp")}
+                        >
+                          {prioridade ? (
+                            <span className="rounded border px-1.5 py-0.5 text-muted-foreground">
+                              {t("Prioridade")}: {prioridade}
+                            </span>
+                          ) : null}
+                          {clickup.tags.map((tag) => (
+                            <span key={tag} className="rounded-full bg-muted px-1.5 py-0.5">
+                              {tag}
+                            </span>
+                          ))}
+                          {clickup.startAt ? (
+                            <span className="text-muted-foreground">
+                              {t("Início")}: {diaCurto.format(new Date(clickup.startAt))}
+                            </span>
+                          ) : null}
+                          {clickup.timeEstimateMs != null ? (
+                            <span className="text-muted-foreground">
+                              {t("Estimativa")}: {formatClickUpEstimate(clickup.timeEstimateMs)}
+                            </span>
+                          ) : null}
+                        </div>
+                      ) : null}
+                    </td>
+                    <td className="p-3 text-muted-foreground">{nomeDaEtapa(l.stage_id)}</td>
+                    <td className="p-3 text-right tabular-nums">
+                      {valorUnico(l) ?? (recorrente(l) ? "" : "—")}
+                      {recorrente(l) && (
+                        <span className="block text-xs font-normal text-muted-foreground">
+                          {valorUnico(l) ? "+ " : ""}
+                          {recorrente(l)}
+                        </span>
+                      )}
+                    </td>
+                    <td className="p-3 text-muted-foreground">
+                      {l.last_activity_at
+                        ? diaCurto.format(new Date(l.last_activity_at))
+                        : t("Sem atividade")}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>

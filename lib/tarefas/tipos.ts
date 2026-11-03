@@ -64,6 +64,11 @@ export interface Tarefa {
   recurrence_id?: string | null;
   recurrence_generation?: number;
   recurrence_scheduled_for?: string | null;
+  /** Fidelidade operacional importada do ClickUp; tarefas humanas mantêm defaults vazios. */
+  tags?: string[];
+  start_at?: string | null;
+  time_estimate_ms?: number | null;
+  source_metadata?: Record<string, unknown>;
   /**
    * Derivado (não é coluna): o negócio de `lead_id`, embutido pela rota para a
    * lista de Tarefas dizer DE QUEM é a tarefa sem uma consulta por linha. Nulo

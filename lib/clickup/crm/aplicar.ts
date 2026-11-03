@@ -8,6 +8,14 @@ import {
   clickupCustomFieldKey,
   type ClickUpCrmListMapping,
 } from "@/lib/clickup/crm/contrato";
+import {
+  clickUpFidelityMetadata,
+  clickUpPriorityToCrm,
+  clickUpTagNames,
+  epochMillisecondsToIso,
+  normalizeNonNegativeMilliseconds,
+} from "@/lib/clickup/crm/fidelidade";
+import { applyClickUpCrmRelation } from "@/lib/clickup/crm/relacoes";
 
 type Row = Record<string, unknown>;
 
@@ -387,6 +395,11 @@ async function aplicarTask(
       .join("\n\n") || null;
   const dueDate = normalizeClickUpDueDate(meta.due_date);
   const owner = await activeMemberByEmail(db, org, meta, assigneeStrategy);
+  const tags = clickUpTagNames(meta.tags);
+  const priority = clickUpPriorityToCrm(meta.priority);
+  const startAt = epochMillisecondsToIso(meta.start_date);
+  const timeEstimateMs = normalizeNonNegativeMilliseconds(meta.time_estimate);
+  const clickupMetadata = clickUpFidelityMetadata(meta);
 
   if (parentExternalId && !mapping.import_subtasks) return "skipped" as const;
 
@@ -411,6 +424,11 @@ async function aplicarTask(
       title,
       description,
       due_date: dueDate,
+      start_at: startAt,
+      time_estimate_ms: timeEstimateMs,
+      tags,
+      priority,
+      source_metadata: { clickup: clickupMetadata, clickup_import_run_id: run.id },
       assigned_to: owner,
       status:
         meta.date_done ||
@@ -474,6 +492,11 @@ async function aplicarTask(
       title,
       description,
       due_date: dueDate,
+      start_at: startAt,
+      time_estimate_ms: timeEstimateMs,
+      tags,
+      priority,
+      source_metadata: { clickup: clickupMetadata, clickup_import_run_id: run.id },
       assigned_to: owner,
     });
     await receipt(db, run, item, "task", externalId, { task_id: taskId });
@@ -530,6 +553,7 @@ async function aplicarTask(
     source_metadata: {
       clickup_import_run_id: run.id,
       clickup_list_id: mapping.list_id,
+      clickup: clickupMetadata,
       ...(usedUpdatedAtFallback ? { clickup_closed_at_fallback: "date_updated" } : {}),
       ...(attachmentStatus !== "none"
         ? {
@@ -538,6 +562,7 @@ async function aplicarTask(
         : {}),
     },
     custom_fields: customValues,
+    tags,
     owner_user_id: owner,
   });
   await receipt(db, run, item, "task", externalId, { lead_id: leadId });
@@ -546,9 +571,10 @@ async function aplicarTask(
 
 export async function applyClickUpCrmItem(db: SupabaseClient, run: Row, item: Row) {
   const parsed = clickupCrmMappingConfigSchema.parse((run.mapping_config as Row | null)?.crm);
+  if (run.dry_run === true) return "validated" as const;
+  if (item.entity_type === "task_relation") return applyClickUpCrmRelation(db, run, item);
   const mapping = listFor(item, parsed.lists);
   if (!mapping) return "skipped" as const;
-  if (run.dry_run === true) return "validated" as const;
   if (["list", "task", "status", "custom_field"].includes(String(item.entity_type))) {
     const { data: previous } = await db
       .from("clickup_object_mappings")

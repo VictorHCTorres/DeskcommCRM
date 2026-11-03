@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { deriveClickUpCrmLists } from "./_clickup-import";
+import { clickUpCoverageBlocksExecution, deriveClickUpCrmLists } from "./_clickup-import";
 
 describe("editor de mapping ClickUp CRM", () => {
   it("deriva List, hierarquia, statuses e fields sem JSON de mapping externo", () => {
@@ -90,5 +90,27 @@ describe("editor de mapping ClickUp CRM", () => {
       list_id: "l-stage",
       statuses: [{ status_id: "open", name: "Aberto" }],
     });
+  });
+
+  it("coverage active_only e campos futuros bloqueiam execução como no servidor", () => {
+    const base = {
+      archive_scope: "active_only" as const,
+      coverage: "partial" as const,
+      tasks_scanned: 1_983,
+      dimensions: [],
+      assignees: { assignments: 13, resolved: 13, unresolved: 0 },
+    };
+    expect(
+      clickUpCoverageBlocksExecution({
+        ...base,
+        warnings: [{ code: "archive_scope_active_only", blocking: false, count: 1 }],
+      }),
+    ).toBe(true);
+    expect(
+      clickUpCoverageBlocksExecution({
+        ...base,
+        warnings: [{ code: "unsupported_dependencies", blocking: true, count: 1 }],
+      }),
+    ).toBe(true);
   });
 });

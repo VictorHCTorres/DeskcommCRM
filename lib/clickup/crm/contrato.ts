@@ -219,10 +219,28 @@ export function validateEveryListIsMapped(
 }
 
 export function checklistToMarkdown(
-  checklist: readonly { name: string; resolved?: boolean }[] | null | undefined,
+  checklist:
+    | readonly {
+        name: string;
+        resolved?: boolean | number;
+        items?: readonly { name: string; resolved?: boolean }[];
+      }[]
+    | null
+    | undefined,
 ): string | null {
   if (!checklist?.length) return null;
-  return checklist.map((item) => `- [${item.resolved ? "x" : " "}] ${item.name.trim()}`).join("\n");
+  return checklist
+    .flatMap((group) =>
+      group.items
+        ? [
+            `### ${group.name.trim()}`,
+            ...(group.items.length
+              ? group.items.map((item) => `- [${item.resolved ? "x" : " "}] ${item.name.trim()}`)
+              : ["- _(sem itens)_"]),
+          ]
+        : [`- [${group.resolved ? "x" : " "}] ${group.name.trim()}`],
+    )
+    .join("\n");
 }
 
 export function clickupAssigneeEmail(

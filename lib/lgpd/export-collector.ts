@@ -332,6 +332,10 @@ export interface TaskRow {
   due_date: string | null;
   status: string;
   priority: string;
+  tags: string[];
+  start_at: string | null;
+  time_estimate_ms: number | null;
+  source_metadata: Record<string, unknown>;
 }
 
 /**
@@ -1799,7 +1803,9 @@ export async function collectExportData(args: CollectArgs): Promise<ExportPayloa
     const filtroDasTarefas = filtroDeTarefasDoTitular(contactId, leadIds);
     const { data, error } = await admin
       .from("crm_tasks")
-      .select("id, title, description, due_date, status, priority")
+      .select(
+        "id, title, description, due_date, status, priority, tags, start_at, time_estimate_ms, source_metadata",
+      )
       .eq("organization_id", organizationId)
       .or(filtroDasTarefas)
       .order("due_date", { ascending: false })

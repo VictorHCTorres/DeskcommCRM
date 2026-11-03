@@ -45,13 +45,23 @@ export function discoveredObjectToStaging(object: ClickUpDiscoveredObject, now =
     external_id: object.source_id,
     parent_external_id: object.parent_source_id ?? null,
     source_revision: object.source_revision ?? null,
-    source_hash: clickupHash({
-      source_type: object.source_type,
-      source_id: object.source_id,
-      source_revision: object.source_revision ?? null,
-      metadata: object.metadata,
-      payload: object.payload,
-    }),
+    source_hash: clickupHash(
+      object.source_type === "task_relation"
+        ? {
+            source_type: object.source_type,
+            source_id: object.source_id,
+            relation_type: object.metadata.relation_type,
+            source_task_id: object.metadata.source_task_id,
+            target_task_id: object.metadata.target_task_id,
+          }
+        : {
+            source_type: object.source_type,
+            source_id: object.source_id,
+            source_revision: object.source_revision ?? null,
+            metadata: object.metadata,
+            payload: object.payload,
+          },
+    ),
     source_metadata: object.metadata,
     source_payload: hasPayload ? object.payload : null,
     payload_expires_at: hasPayload

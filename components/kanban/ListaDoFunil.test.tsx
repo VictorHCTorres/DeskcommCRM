@@ -33,7 +33,23 @@ const ETAPAS = [
 ] as unknown as Stage[];
 
 const PAGINA = {
-  leads: [{ id: "l-1", title: "Negócio A", stage_id: "e-1", value_cents: null, currency: null }],
+  leads: [
+    {
+      id: "l-1",
+      title: "Negócio A",
+      stage_id: "e-1",
+      value_cents: null,
+      currency: null,
+      tags: ["VIP"],
+      source_metadata: {
+        clickup: {
+          priority: "urgent",
+          start_at: "2026-11-03T12:00:00.000Z",
+          time_estimate_ms: 5_400_000,
+        },
+      },
+    },
+  ],
   page: 1,
   perPage: 50,
   hasMore: true,
@@ -62,6 +78,15 @@ describe("a Lista e a barra de filtros", () => {
       undefined,
       ORDEM_PADRAO,
     );
+  });
+
+  it("mostra prioridade, tags, início e estimativa projetados sem metadata bruta", () => {
+    montar({});
+    expect(screen.getByText(/Prioridade: Urgente/)).toBeInTheDocument();
+    expect(screen.getByText("VIP")).toBeInTheDocument();
+    expect(screen.getByText(/Início:/)).toBeInTheDocument();
+    expect(screen.getByText(/Estimativa: 1h 30min/)).toBeInTheDocument();
+    expect(screen.queryByText("time_estimate_ms")).toBeNull();
   });
 
   it('"Todos" da barra (`any`/`all`) não vira filtro: o funil inteiro', () => {

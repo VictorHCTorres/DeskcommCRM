@@ -41,6 +41,81 @@ describe("contrato do envelope ClickUp", () => {
     expect(one.objects.map((item) => item.source_type)).toEqual(["space", "task"]);
   });
 
+  it("usa hash semântico estável para relação observada em um ou nos dois lados", () => {
+    const base = {
+      source_type: "task_relation" as const,
+      source_id: "linked:a:b",
+      content_access: "none" as const,
+      metadata: {
+        relation_type: "linked",
+        source_task_id: "a",
+        target_task_id: "b",
+      },
+    };
+    const unilateral = discoveredObjectToStaging({
+      ...base,
+      source_revision: "rev-1",
+      metadata: { ...base.metadata, provenance: { raw_occurrences: 1, observed_from: ["a"] } },
+    });
+    const bilateralInvertido = discoveredObjectToStaging({
+      ...base,
+      source_revision: "rev-2",
+      metadata: { ...base.metadata, provenance: { raw_occurrences: 2, observed_from: ["b", "a"] } },
+    });
+    expect(bilateralInvertido.source_hash).toBe(unilateral.source_hash);
+  });
+
+  it("recusa identidade duplicada e relação com endpoint fora do snapshot", () => {
+    const duplicate = clickupManifestSchema.safeParse({
+      connection_id: CONNECTION,
+      workspace_id: "wk",
+      objects: [
+        { source_type: "task", source_id: "a", metadata: {} },
+        { source_type: "task", source_id: "a", metadata: {} },
+      ],
+    });
+    expect(duplicate.success).toBe(false);
+    const dangling = clickupManifestSchema.safeParse({
+      connection_id: CONNECTION,
+      workspace_id: "wk",
+      objects: [
+        { source_type: "task", source_id: "a", metadata: {} },
+        {
+          source_type: "task_relation",
+          source_id: "linked:a:b",
+          metadata: { relation_type: "linked", source_task_id: "a", target_task_id: "b" },
+        },
+      ],
+    });
+    expect(dangling.success).toBe(false);
+  });
+
+  it("aceita o volume real de 5.813 objetos e preserva o teto de 10 mil", () => {
+    const objects = Array.from({ length: 5_813 }, (_, index) => ({
+      source_type: "task" as const,
+      source_id: `task-${index}`,
+      metadata: {},
+    }));
+    expect(
+      clickupManifestSchema.safeParse({
+        connection_id: CONNECTION,
+        workspace_id: "wk-volume-real",
+        objects,
+      }).success,
+    ).toBe(true);
+    expect(
+      clickupManifestSchema.safeParse({
+        connection_id: CONNECTION,
+        workspace_id: "wk-acima-do-teto",
+        objects: Array.from({ length: 10_001 }, (_, index) => ({
+          source_type: "task" as const,
+          source_id: `overflow-${index}`,
+          metadata: {},
+        })),
+      }).success,
+    ).toBe(false);
+  });
+
   it("bloqueia metadado de Docs sem conteúdo autorizado", () => {
     const object = {
       source_type: "doc" as const,

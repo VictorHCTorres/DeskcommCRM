@@ -15,6 +15,12 @@ import {
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
 import { createClient } from "@/lib/supabase/browser";
+import {
+  clickUpCoverageBlocksExecution,
+  type ClickUpPreviewCoverage,
+} from "@/lib/clickup/presentation/coverage";
+
+export { clickUpCoverageBlocksExecution };
 
 type Run = {
   id: string;
@@ -28,6 +34,7 @@ type Run = {
   warnings_count: number;
 };
 type Connection = { id: string; workspace_id: string; workspace_name: string };
+type Coverage = ClickUpPreviewCoverage;
 type StatusMap = { status_id: string; name: string; terminal: "open" | "won" | "lost" };
 type FieldMap = {
   field_id: string;
@@ -209,6 +216,7 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
   const [error, setError] = useState<string>();
   const [busy, setBusy] = useState(false);
   const [queued, setQueued] = useState(false);
+  const [coverage, setCoverage] = useState<Coverage>();
   const [connections, setConnections] = useState<Connection[]>([]);
   const [connectionId, setConnectionId] = useState("");
   const [workspaceId, setWorkspaceId] = useState("");
@@ -286,6 +294,11 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
     } while (after);
     setRun(discoveredRun);
     setLists(deriveClickUpCrmLists({ objects: items }));
+    setCoverage(
+      await data<Coverage>(
+        await fetch(`/api/v1/clickup/imports/${discoveredRun.id}/preview-coverage`),
+      ),
+    );
   }
   async function uploadBundle(file?: File) {
     if (!file) return;
@@ -375,6 +388,25 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
       setBusy(false);
     }
   }
+  const hasBlockingCoverage = coverage ? clickUpCoverageBlocksExecution(coverage) : false;
+  const coverageLabels: Record<string, string> = {
+    priority: "Prioridade",
+    tags: "Tags",
+    start_date: "Data de início",
+    time_estimate: "Estimativa",
+    links: "Relações",
+    checklists: "Checklists",
+    watchers: "Watchers",
+    dependencies: "Dependências",
+    locations: "Localizações",
+    archived: "Arquivadas",
+    time_spent: "Tempo gasto",
+  };
+  const classificationLabels: Record<Coverage["dimensions"][number]["classification"], string> = {
+    native: "Nativo",
+    provenance: "Proveniência",
+    unsupported: "Não suportado",
+  };
   return (
     <Dialog>
       <DialogTrigger asChild>
@@ -471,6 +503,67 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
                 {run.preview_revision} · mapping r{run.mapping_revision}
               </p>
             </div>
+          ) : null}
+          {coverage ? (
+            <section
+              className="space-y-3 rounded-md border p-3"
+              aria-labelledby="clickup-coverage-title"
+            >
+              <div>
+                <h3 id="clickup-coverage-title" className="font-medium">
+                  Cobertura da prévia
+                </h3>
+                <p className="text-xs text-muted-foreground">
+                  {coverage.tasks_scanned} Tasks auditadas · cobertura{" "}
+                  {coverage.coverage === "full" ? "completa" : "parcial"}
+                </p>
+              </div>
+              {coverage.archive_scope === "active_only" ? (
+                <p
+                  className="rounded border border-amber-500/40 bg-amber-500/10 p-2 text-sm"
+                  role="alert"
+                >
+                  Importação bloqueada: somente a hierarquia ativa foi auditada. Inclua as Tasks
+                  arquivadas e gere uma cobertura completa antes de continuar.
+                </p>
+              ) : null}
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead>
+                    <tr>
+                      <th className="py-1">Dimensão</th>
+                      <th>Tratamento</th>
+                      <th>Encontrados</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {coverage.dimensions.map((dimension) => (
+                      <tr key={dimension.key} className="border-t">
+                        <td className="py-1.5">{coverageLabels[dimension.key] ?? dimension.key}</td>
+                        <td>{classificationLabels[dimension.classification]}</td>
+                        <td>
+                          {dimension.present}
+                          {dimension.detail !== undefined ? ` · ${dimension.detail} itens` : ""}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <p className="text-sm">
+                Responsáveis: {coverage.assignees.resolved} resolvidos ·{" "}
+                {coverage.assignees.unresolved} não resolvidos · {coverage.assignees.assignments}{" "}
+                atribuições.
+              </p>
+              {coverage.warnings
+                .filter((warning) => warning.blocking)
+                .map((warning) => (
+                  <p key={warning.code} className="text-sm text-destructive" role="alert">
+                    Importação bloqueada: {warning.code} ({warning.count}). Atualize o suporte antes
+                    de continuar.
+                  </p>
+                ))}
+            </section>
           ) : null}
           {run && !run.mapping_hash ? (
             <>
@@ -650,8 +743,8 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
               Validar mapping
             </Button>
           ) : (
-            <Button disabled={busy || queued} onClick={() => void execute()}>
-              Confirmar importação
+            <Button disabled={busy || queued || hasBlockingCoverage} onClick={() => void execute()}>
+              {coverage?.coverage === "partial" ? "Importação bloqueada" : "Confirmar importação"}
             </Button>
           )}
         </DialogFooter>

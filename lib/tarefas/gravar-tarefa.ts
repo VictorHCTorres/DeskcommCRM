@@ -3,7 +3,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import type { Tarefa } from "@/lib/tarefas/tipos";
 
 export const COLUNAS_DA_TAREFA =
-  "id, organization_id, title, description, due_date, priority, status, lead_id, contact_id, demanda_id, assigned_to, created_by, created_at, updated_at, parent_task_id, recurrence_id, recurrence_generation, recurrence_scheduled_for, lead:crm_leads(id, title)";
+  "id, organization_id, title, description, due_date, priority, status, lead_id, contact_id, demanda_id, assigned_to, created_by, created_at, updated_at, parent_task_id, recurrence_id, recurrence_generation, recurrence_scheduled_for, tags, start_at, time_estimate_ms, lead:crm_leads(id, title)";
 
 export type LinhaNovaDeTarefa = Omit<Tarefa, "id" | "created_at" | "updated_at" | "lead">;
 

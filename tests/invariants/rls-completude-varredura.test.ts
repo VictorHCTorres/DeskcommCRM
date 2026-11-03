@@ -75,6 +75,13 @@ interface Excecao {
  * linhas da OUTRA organização, não uma leitura como superusuário.
  */
 const PROVA_PROPRIA: readonly Excecao[] = [
+  {
+    tabela: "crm_clickup_relations",
+    razao:
+      "tests/invariants/w3-clickup-fidelidade-relacoes.test.ts — duas organizações têm " +
+      "relações reais; JWT authenticated lê o controle positivo local e zero linhas do " +
+      "tenant vizinho, com FKs compostas e ACL read-only.",
+  },
   { tabela: "crm_pipeline_groups", razao: "tests/invariants/hierarquia-de-funis.test.ts — JWT authenticated de duas organizações prova leitura local e zero cross-org, além de FKs compostas e escrita limitada a manager+." },
   ...["crm_pipeline_views", "crm_task_recurrences"].map(tabela => ({ tabela, razao: "tests/invariants/w2-visoes-tarefas-schema.test.ts — JWT authenticated de usuários e organizações distintas prova leitura local, zero cross-org, ACL por papel e vínculos compostos tenant-safe." })),
   ...["clickup_connections", "clickup_import_runs", "clickup_import_items", "clickup_object_mappings"].map(tabela => ({ tabela, razao: "tests/invariants/w3-clickup-import-envelope.test.ts — duas organizações reais com conexão, run, item e mapping: JWT authenticated prova controle positivo local e zero cross-tenant nas quatro projeções; authenticated não escreve diretamente e nunca lê token nem source_payload." })),

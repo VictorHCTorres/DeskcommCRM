@@ -74,6 +74,24 @@ describe("aplicação CRM do ClickUp", () => {
         { entity_type: "task", external_id: "task-1", source_metadata: { list_id: "list-1" } },
       ),
     ).resolves.toBe("validated");
+    await expect(
+      applyClickUpCrmItem(
+        db,
+        {
+          dry_run: true,
+          mapping_config: { crm: { lists: [{ list_id: "list-1", mode: "ignore" }] } },
+        },
+        {
+          entity_type: "task_relation",
+          external_id: "linked:a:b",
+          source_metadata: {
+            relation_type: "linked",
+            source_task_id: "a",
+            target_task_id: "b",
+          },
+        },
+      ),
+    ).resolves.toBe("validated");
   });
 
   it("converte tipos suportados e recusa valores inválidos", () => {

@@ -272,6 +272,21 @@ export async function cascadeRedactContact(args: CascadeArgs): Promise<CascadeRe
   }
   const idsDasTarefas = (tarefasDosLeads ?? []).map((tarefa) => tarefa.id);
   if (idsDasTarefas.length > 0) {
+    const { error: redigirTarefasErro } = await admin
+      .from("crm_tasks")
+      .update({
+        tags: [],
+        start_at: null,
+        time_estimate_ms: null,
+        source_metadata: {},
+      })
+      .eq("organization_id", args.organizationId)
+      .in("id", idsDasTarefas);
+    if (redigirTarefasErro) {
+      throw new Error(
+        `[lgpd-redact-cascade] fidelidade ClickUp das tarefas não redigida: ${redigirTarefasErro.message}`,
+      );
+    }
     const { data: anexosDasTarefas, error: anexosErro } = await admin
       .from("crm_task_attachments")
       .select("id,task_id,storage_path")

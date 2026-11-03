@@ -49,6 +49,7 @@ import { describe, expect, it } from "vitest";
 const RAIZ = path.resolve(__dirname, "../..");
 const BASELINE = fs.readFileSync(path.join(RAIZ, "supabase/baseline.sql"), "utf8");
 const COLETOR = fs.readFileSync(path.join(RAIZ, "lib/lgpd/export-collector.ts"), "utf8");
+const CASCATA = fs.readFileSync(path.join(RAIZ, "lib/lgpd/redact-cascade.ts"), "utf8");
 
 /** Corpos de função cujo NOME anuncia limpeza de dado pessoal — redigir OU apagar.
  *  No dump vêm com identificador entre aspas. */
@@ -115,6 +116,14 @@ function colunasDoContatoExportadas(): Set<string> {
 }
 
 describe("LGPD: o export alcança tudo que a redação alcança", () => {
+  it("exporta e redige a fidelidade pessoal importada do ClickUp nas tarefas", () => {
+    for (const coluna of ["tags", "start_at", "time_estimate_ms", "source_metadata"]) {
+      expect(COLETOR).toContain(coluna);
+      expect(CASCATA).toContain(coluna);
+    }
+    expect(CASCATA).toContain("source_metadata: {}");
+    expect(CASCATA).toContain("tags: []");
+  });
   it("CONTROLE: as duas varreduras acham tabela (senão o teste passa medindo o vazio)", () => {
     // Sem isto, um regex que deixe de casar devolve dois conjuntos vazios e a
     // asserção abaixo fica verde — o modo de falha que este repo já pagou várias

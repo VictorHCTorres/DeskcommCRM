@@ -93,7 +93,7 @@ export async function runClickUpCrmWorker(
       const message =
         error instanceof Error ? error.message.slice(0, 500) : "Falha ao importar item.";
       const transient =
-        /timeout|timed out|network|fetch failed|connection|unavailable|ECONN|5\d\d|clickup_parent_.*_(not_applied|not_staged)/i.test(
+        /timeout|timed out|network|fetch failed|connection|unavailable|ECONN|5\d\d|clickup_parent_.*_(not_applied|not_staged)|clickup_relation_parent_not_mapped/i.test(
           message,
         );
       const canRetry = transient && Number(item.attempts ?? 0) < Number(item.max_attempts ?? 1);

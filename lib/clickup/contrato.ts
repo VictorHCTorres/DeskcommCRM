@@ -13,6 +13,7 @@ export const clickupSourceTypeSchema = z.enum([
   "user",
   "status",
   "custom_field",
+  "task_relation",
 ]);
 
 export type ClickUpSourceType = z.infer<typeof clickupSourceTypeSchema>;
@@ -78,9 +79,36 @@ export const clickupManifestSchema = z
     scope: z.enum(["crm", "docs", "all"]).default("crm"),
     manifest_version: z.number().int().positive().default(1),
     source_revision: z.string().trim().min(1).max(512).nullable().optional(),
-    objects: z.array(clickupDiscoveredObjectSchema).max(5_000),
+    objects: z.array(clickupDiscoveredObjectSchema).max(10_000),
   })
-  .strict();
+  .strict()
+  .superRefine((manifest, context) => {
+    const keys = new Set<string>();
+    const taskIds = new Set(
+      manifest.objects.filter((item) => item.source_type === "task").map((item) => item.source_id),
+    );
+    for (const [index, object] of manifest.objects.entries()) {
+      const key = `${object.source_type}\u0000${object.source_id}`;
+      if (keys.has(key)) {
+        context.addIssue({
+          code: "custom",
+          path: ["objects", index, "source_id"],
+          message: "Identidade de origem duplicada no manifesto.",
+        });
+      }
+      keys.add(key);
+      if (object.source_type !== "task_relation") continue;
+      const source = String(object.metadata.source_task_id ?? "");
+      const target = String(object.metadata.target_task_id ?? "");
+      if (!taskIds.has(source) || !taskIds.has(target)) {
+        context.addIssue({
+          code: "custom",
+          path: ["objects", index, "metadata"],
+          message: "Relação referencia Task ausente do mesmo manifesto.",
+        });
+      }
+    }
+  });
 
 export const clickupConnectionCreateSchema = z
   .object({
@@ -143,7 +171,7 @@ const clickupMappingConfigSchema = z
             }
           }),
       )
-      .max(5_000)
+      .max(10_000)
       .default([]),
     crm: clickupCrmMappingConfigSchema.optional(),
   })

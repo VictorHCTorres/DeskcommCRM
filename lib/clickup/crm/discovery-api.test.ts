@@ -11,7 +11,9 @@ import {
 
 describe("descoberta CRM pela API ClickUp", () => {
   it("hidrata List folderless, bindings, tasks e omite URLs assinadas", async () => {
+    const requested: string[] = [];
     const fetchImpl = (async (input: string | URL | Request) => {
+      requested.push(String(input));
       const path = new URL(String(input)).pathname;
       const url = new URL(String(input));
       const body = path.endsWith("/team/w1/space")
@@ -44,6 +46,13 @@ describe("descoberta CRM pela API ClickUp", () => {
                             name: "Registro",
                             status: { id: "closed", type: "done" },
                             date_done: "1730619000000",
+                            priority: { priority: "high" },
+                            tags: [{ name: "VIP", tag_bg: "#fff" }],
+                            start_date: "1710052200000",
+                            time_estimate: 0,
+                            watchers: [{ id: 42, email: "nao-persistir@example.com" }],
+                            linked_tasks:
+                              index === 0 ? [{ task_id: "t1", link_id: "t101" }] : [],
                             attachments:
                               index === 0 ? [{ url: "https://signed.example/secret" }] : [],
                           }))
@@ -64,11 +73,23 @@ describe("descoberta CRM pela API ClickUp", () => {
         expect.objectContaining({
           source_type: "task",
           source_id: "t1",
-          metadata: expect.objectContaining({ date_done: "1730619000000", attachment_count: 1 }),
+          metadata: expect.objectContaining({
+            date_done: "1730619000000",
+            attachment_count: 1,
+            priority: "high",
+            tags: [{ name: "VIP", color: "#fff" }],
+            watcher_ids: ["42"],
+          }),
         }),
       ]),
     );
     expect(JSON.stringify(objects)).not.toContain("signed.example");
+    expect(JSON.stringify(objects)).not.toContain("nao-persistir@example.com");
+    expect(objects).toContainEqual(
+      expect.objectContaining({ source_type: "task_relation", source_id: "linked:t1:t101" }),
+    );
+    expect(requested.some((url) => url.includes("archived=true"))).toBe(true);
+    expect(requested.some((url) => url.includes("include_timl=true"))).toBe(true);
     expect(objects.filter((object) => object.source_type === "task")).toHaveLength(101);
     expect(objects).toContainEqual(
       expect.objectContaining({
@@ -99,7 +120,8 @@ describe("descoberta CRM pela API ClickUp", () => {
         sleep: async (ms) => void sleeps.push(ms),
       }),
     ).resolves.toHaveLength(1);
-    expect(calls).toBe(2);
+    // retry da primeira passagem + passagens active/archived do workspace
+    expect(calls).toBe(3);
     expect(sleeps).toEqual([1_000]);
 
     for (const status of [401, 403]) {

@@ -29,6 +29,7 @@ import {
 import { cn } from "@/lib/utils";
 import { ComentariosImportados } from "./ComentariosImportados";
 import { AssetsImportados } from "./AssetsImportados";
+import { RelacoesClickUp } from "./RelacoesClickUp";
 
 interface Props {
   tarefas: Tarefa[];
@@ -169,9 +170,32 @@ function Linha({
               <span className="truncate">{tarefa.lead.title}</span>
             </Link>
           ) : null}
+          {tarefa.start_at ? (
+            <span className="text-muted-foreground">
+              {t("Início")}: {new Date(tarefa.start_at).toLocaleString(tag)}
+            </span>
+          ) : null}
+          {tarefa.time_estimate_ms ? (
+            <span className="text-muted-foreground">
+              {t("Estimativa")}: {Math.round(tarefa.time_estimate_ms / 3_600_000)}h
+            </span>
+          ) : null}
         </div>
+        {tarefa.tags?.length ? (
+          <div className="mt-1 flex flex-wrap gap-1" aria-label={t("Tags do ClickUp")}>
+            {tarefa.tags.map((tag) => (
+              <span
+                key={tag}
+                className="rounded-full bg-muted px-2 py-0.5 text-[10px] text-muted-foreground"
+              >
+                {tag}
+              </span>
+            ))}
+          </div>
+        ) : null}
         <ComentariosImportados taskId={tarefa.id} />
         <AssetsImportados taskId={tarefa.id} />
+        <RelacoesClickUp taskId={tarefa.id} />
       </div>
 
       {podeEditar ? (
