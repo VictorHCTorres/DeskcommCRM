@@ -39,12 +39,14 @@ jobs:
   abrir-pr-de-release:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    env:
+      TEM_RELEASE_APP: ${{ secrets.RELEASE_APP_ID != '' && secrets.RELEASE_APP_PRIVATE_KEY != '' }}
     permissions:
       contents: read
     steps:
       - uses: actions/create-github-app-token@v3
         id: token
-        if: secrets.RELEASE_APP_ID != '' && secrets.RELEASE_APP_PRIVATE_KEY != ''
+        if: env.TEM_RELEASE_APP == 'true'
         with:
           app-id: ${{ secrets.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
@@ -104,6 +106,8 @@ jobs:
   cortar-tag:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    env:
+      TEM_RELEASE_APP: ${{ secrets.RELEASE_APP_ID != '' && secrets.RELEASE_APP_PRIVATE_KEY != '' }}
     permissions:
       contents: read
       # A guarda pergunta à API quem abriu o PR de origem do merge
@@ -114,7 +118,7 @@ jobs:
     steps:
       - uses: actions/create-github-app-token@v3
         id: token
-        if: secrets.RELEASE_APP_ID != '' && secrets.RELEASE_APP_PRIVATE_KEY != ''
+        if: env.TEM_RELEASE_APP == 'true'
         with:
           app-id: ${{ secrets.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
