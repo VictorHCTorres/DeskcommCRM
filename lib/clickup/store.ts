@@ -29,6 +29,13 @@ function throwDb(error: { code?: string; message: string } | null, fallback: str
   throw new ClickUpStoreError("database_error", fallback);
 }
 
+/** Função SQL que retorna rowtype serializa `return null` como composite all-null no PostgREST. */
+function claimedComposite(data: unknown): Record<string, unknown> | null {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return null;
+  const claimed = data as Record<string, unknown>;
+  return claimed.id == null ? null : claimed;
+}
+
 export const CLICKUP_CONNECTION_SAFE_COLUMNS =
   "id, organization_id, workspace_id, workspace_name, token_last4, status, created_by, created_at, updated_at";
 export const CLICKUP_RUN_SAFE_COLUMNS =
@@ -346,7 +353,7 @@ export async function claimClickUpRunForProcessor(
     p_lease_seconds: 90,
   });
   if (error) throwDb(error, "Não foi possível reivindicar a importação.");
-  return data as Record<string, unknown> | null;
+  return claimedComposite(data);
 }
 
 export async function claimClickUpItemForProcessor(
@@ -362,7 +369,7 @@ export async function claimClickUpItemForProcessor(
     p_lease_seconds: 90,
   });
   if (error) throwDb(error, "Não foi possível reivindicar o item da importação.");
-  return data as Record<string, unknown> | null;
+  return claimedComposite(data);
 }
 
 export async function finishClickUpItem(
@@ -531,7 +538,7 @@ export async function claimClickUpAsset(db: Db, workerId: string) {
     p_lease_seconds: 300,
   });
   if (error) throwDb(error, "Não foi possível reivindicar o anexo ClickUp.");
-  return data as Record<string, unknown> | null;
+  return claimedComposite(data);
 }
 
 export async function heartbeatClickUpAsset(
