@@ -8,6 +8,12 @@ Se você roda o DeskcommCRM numa VPS, **leia a seção da versão para a qual es
 
 ## [Não lançado]
 
+## [1.100.1] — 2026-11-03
+
+### Corrigido
+
+- **Descoberta do ClickUp respeita o limite do workspace** A descoberta da estrutura do ClickUp agora controla a cadência de todas as Lists e espera a janela indicada pelo próprio ClickUp quando o token atinge o limite. Workspaces em planos de 100 requisições por minuto deixam de falhar no meio da prévia com uma mensagem genérica. Os processadores ociosos também deixam de tentar trabalhar com identificadores vazios.
+
 ## [1.100.0] — 2026-11-03
 
 ### ⚠️ Requer atenção
@@ -14091,7 +14097,8 @@ Primeira versão marcada do DeskcommCRM. O projeto vinha sendo desenvolvido publ
 
 - **Node 22 é obrigatório para desenvolvimento.** A suíte de invariantes instancia o cliente do Supabase, que exige o `WebSocket` global — nativo apenas a partir do Node 22. Isso não afeta quem apenas hospeda: a VPS roda a imagem pronta.
 
-[Não lançado]: https://github.com/melgarafael/DeskcommCRM/compare/v1.100.0...HEAD
+[Não lançado]: https://github.com/melgarafael/DeskcommCRM/compare/v1.100.1...HEAD
+[1.100.1]: https://github.com/melgarafael/DeskcommCRM/compare/v1.100.0...v1.100.1
 [1.100.0]: https://github.com/melgarafael/DeskcommCRM/compare/v1.99.0...v1.100.0
 [1.99.0]: https://github.com/melgarafael/DeskcommCRM/compare/v1.98.0...v1.99.0
 [1.98.0]: https://github.com/melgarafael/DeskcommCRM/compare/v1.97.0...v1.98.0
