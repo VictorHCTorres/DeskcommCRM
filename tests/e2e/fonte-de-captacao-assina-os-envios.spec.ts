@@ -182,7 +182,7 @@ test.describe("fonte de captação — assinatura pela tela", () => {
       await page.keyboard.press("Escape");
       await cardOf(page.getByText(SOURCE_NAME, { exact: true })).click();
       const reaberto = page.getByRole("dialog").filter({ hasText: SOURCE_NAME });
-      await expect(reaberto.getByText("Ligada")).toBeVisible();
+      await expect(reaberto.getByText("Ligada", { exact: true })).toBeVisible();
       await expect(reaberto.getByText(segredo)).toHaveCount(0);
       await expect(
         reaberto.getByText("Guarde agora. Ele não será mostrado de novo."),
