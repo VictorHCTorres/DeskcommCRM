@@ -8,6 +8,12 @@ Se você roda o DeskcommCRM numa VPS, **leia a seção da versão para a qual es
 
 ## [Não lançado]
 
+## [1.100.3] — 2026-11-03
+
+### Corrigido
+
+- **A prévia do ClickUp usa lotes menores em tarefas com descrições pesadas** Além de dividir a prévia, o importador limita cada lote a 25 itens e 128 KB, inclusive quando uma única tarefa é muito extensa. O banco também recusa corpos acima de 256 KB, mesmo se outro cliente interno tentar enviá-los. Isso dá margem para o custo de índices e contadores sem voltar ao envio monolítico. Crédito: @VictorHCTorres.
+
 ## [1.100.2] — 2026-11-03
 
 ### Corrigido
@@ -14103,7 +14109,8 @@ Primeira versão marcada do DeskcommCRM. O projeto vinha sendo desenvolvido publ
 
 - **Node 22 é obrigatório para desenvolvimento.** A suíte de invariantes instancia o cliente do Supabase, que exige o `WebSocket` global — nativo apenas a partir do Node 22. Isso não afeta quem apenas hospeda: a VPS roda a imagem pronta.
 
-[Não lançado]: https://github.com/melgarafael/DeskcommCRM/compare/v1.100.2...HEAD
+[Não lançado]: https://github.com/melgarafael/DeskcommCRM/compare/v1.100.3...HEAD
+[1.100.3]: https://github.com/melgarafael/DeskcommCRM/compare/v1.100.2...v1.100.3
 [1.100.2]: https://github.com/melgarafael/DeskcommCRM/compare/v1.100.1...v1.100.2
 [1.100.1]: https://github.com/melgarafael/DeskcommCRM/compare/v1.100.0...v1.100.1
 [1.100.0]: https://github.com/melgarafael/DeskcommCRM/compare/v1.99.0...v1.100.0
