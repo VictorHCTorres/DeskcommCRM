@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+import { clickupCrmMappingConfigSchema } from "@/lib/clickup/crm/contrato";
+
 export const clickupSourceTypeSchema = z.enum([
   "workspace",
   "space",
@@ -20,7 +22,7 @@ export const clickupContentAccessSchema = z.enum(["none", "metadata_only", "full
 const jsonRecordSchema = z.record(z.string(), z.unknown());
 const clickupDocumentPayloadSchema = z
   .object({
-    format: z.enum(["text", "markdown", "html"]),
+    format: z.literal("markdown"),
     content: z.string().trim().min(1),
   })
   .strict();
@@ -141,7 +143,9 @@ const clickupMappingConfigSchema = z
             }
           }),
       )
-      .max(5_000),
+      .max(5_000)
+      .default([]),
+    crm: clickupCrmMappingConfigSchema.optional(),
   })
   .strict();
 
@@ -154,7 +158,7 @@ export const clickupMappingSchema = z
 
 export const clickupExecuteSchema = z
   .object({
-    dry_run: z.literal(true).default(true),
+    dry_run: z.boolean().default(true),
     expected_preview_revision: z.number().int().positive(),
     expected_snapshot_hash: z.string().regex(/^[0-9a-f]{64}$/),
     expected_mapping_hash: z
@@ -162,7 +166,16 @@ export const clickupExecuteSchema = z
       .regex(/^[0-9a-f]{64}$/)
       .nullable(),
   })
-  .strict();
+  .strict()
+  .superRefine((input, context) => {
+    if (!input.dry_run && !input.expected_mapping_hash) {
+      context.addIssue({
+        code: "custom",
+        path: ["expected_mapping_hash"],
+        message: "Execução real exige mapping validado.",
+      });
+    }
+  });
 
 export const clickupRunIdSchema = z.string().uuid();
 

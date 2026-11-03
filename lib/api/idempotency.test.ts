@@ -31,6 +31,7 @@ import {
   hashDoCorpo,
   hashLido,
   JANELA_DA_RESERVA_MS,
+  JANELA_LONGA_DA_RESERVA_MS,
   TTL_MS,
 } from "@/lib/api/idempotency";
 
@@ -187,7 +188,11 @@ function duble(opcoes: OpcoesDoDuble = {}) {
     db: {
       from: (tabela: string) =>
         tabela === "idempotency_keys"
-          ? { select: () => selecao(), insert: (l: Linha) => insercao(l), update: (p: Linha) => gravacao(p) }
+          ? {
+              select: () => selecao(),
+              insert: (l: Linha) => insercao(l),
+              update: (p: Linha) => gravacao(p),
+            }
           : {},
     },
     inseridos,
@@ -228,7 +233,10 @@ function reserva(over: Partial<Linha> = {}): Linha {
   return recibo({ status_code: null, response_body: null, expires_at: RESERVA_VIVA, ...over });
 }
 
-function entrada(d: ReturnType<typeof duble>, executar: () => Promise<{ resposta: unknown; status: number }>) {
+function entrada(
+  d: ReturnType<typeof duble>,
+  executar: () => Promise<{ resposta: unknown; status: number }>,
+) {
   return {
     db: d.db as never,
     organizationId: ORG,
@@ -377,6 +385,34 @@ describe("comIdempotencia", () => {
     expect(d.inseridos).toHaveLength(0);
   });
 
+  it("(7b) reserva longa continua em curso depois de 60s e impede takeover", async () => {
+    const depoisDaJanelaPadrao = () => new Date(RELOGIO().getTime() + JANELA_DA_RESERVA_MS + 1_000);
+    const expiraLonga = new Date(RELOGIO().getTime() + JANELA_LONGA_DA_RESERVA_MS).toISOString();
+    const primeira = duble();
+    await expect(
+      comIdempotencia({
+        ...entrada(primeira, async () => {
+          throw new Error("interrompida");
+        }),
+        reservaMs: JANELA_LONGA_DA_RESERVA_MS,
+      }),
+    ).rejects.toThrow("interrompida");
+    expect(primeira.inseridos[0]?.expires_at).toBe(expiraLonga);
+
+    const d = duble({ linhas: [reserva({ expires_at: expiraLonga })] });
+    const executar = vi.fn(async () => ({ resposta: { id: "duplicado" }, status: 201 }));
+
+    const desfecho = await comIdempotencia({
+      ...entrada(d, executar),
+      agora: depoisDaJanelaPadrao,
+      reservaMs: JANELA_LONGA_DA_RESERVA_MS,
+    });
+
+    expect(desfecho).toEqual({ tipo: "em_curso" });
+    expect(executar).not.toHaveBeenCalled();
+    expect(d.inseridos).toHaveLength(0);
+  });
+
   it("(8) duas requisições SIMULTÂNEAS com a mesma chave: o efeito acontece UMA vez", async () => {
     // Este caso era a limitação declarada (as duas executavam). Agora ele é o
     // guarda da decisão: fica vermelho no dia em que alguém reabrir a corrida
@@ -443,7 +479,11 @@ describe("comIdempotencia", () => {
     const falha = new Error("Erro ao criar template.");
 
     await expect(
-      comIdempotencia(entrada(d, async () => { throw falha; })),
+      comIdempotencia(
+        entrada(d, async () => {
+          throw falha;
+        }),
+      ),
     ).rejects.toBe(falha);
 
     // A reserva vence AGORA, filtrada pela mesma trava do recibo terminal.

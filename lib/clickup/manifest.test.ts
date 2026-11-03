@@ -86,13 +86,20 @@ describe("contrato do envelope ClickUp", () => {
     ).toBe(true);
   });
 
-  it("execute exige CAS completo e não aceita apply de domínio na W3.0", () => {
+  it("execute W3.1 aceita apply real, mas mantém CAS completo obrigatório", () => {
     const base = {
       expected_preview_revision: 1,
       expected_snapshot_hash: "a".repeat(64),
       expected_mapping_hash: null,
     };
     expect(clickupExecuteSchema.safeParse({ ...base, dry_run: true }).success).toBe(true);
+    expect(
+      clickupExecuteSchema.safeParse({
+        ...base,
+        dry_run: false,
+        expected_mapping_hash: "b".repeat(64),
+      }).success,
+    ).toBe(true);
     expect(clickupExecuteSchema.safeParse({ ...base, dry_run: false }).success).toBe(false);
     expect(
       clickupExecuteSchema.safeParse({

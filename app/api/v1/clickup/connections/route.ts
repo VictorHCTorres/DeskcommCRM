@@ -20,7 +20,7 @@ export const dynamic = "force-dynamic";
 
 export async function GET(): Promise<Response> {
   const requestId = randomUUID();
-  const authz = await requireRole("admin", {
+  const authz = await requireRole("manager", {
     requestId,
     resource: "clickup_connections",
     allowPlatformAdmin: "leitura",

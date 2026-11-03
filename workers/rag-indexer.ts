@@ -101,10 +101,7 @@ type Resultado =
 // Leitura
 // ---------------------------------------------------------------------------
 
-async function carregarFonte(
-  organizationId: string,
-  sourceId: string,
-): Promise<FonteRow | null> {
+async function carregarFonte(organizationId: string, sourceId: string): Promise<FonteRow | null> {
   const admin = createAdminClient();
   const { data } = await admin
     .from("ai_knowledge_sources")
@@ -415,10 +412,7 @@ async function credenciaisDaLoja(
  * saber. Agora qualquer trecho não gravado derruba a indexação inteira: a
  * versão falha com o motivo e a anterior segue ativa.
  */
-export async function indexarFonte(
-  fonte: FonteRow,
-  chave: ChaveDeEmbedding,
-): Promise<Resultado> {
+export async function indexarFonte(fonte: FonteRow, chave: ChaveDeEmbedding): Promise<Resultado> {
   const tipo = canonizarTipoDeFonte(fonte.source_type);
   if (tipo === null) {
     return { tipo: "erro", detalhe: `tipo_de_material_desconhecido:${fonte.source_type}` };
@@ -688,21 +682,33 @@ async function garantirFonteDeCatalogo(organizationId: string): Promise<FonteRow
 export async function processRagIndexer(row: EventRow): Promise<HandlerResult> {
   const consumerKey = "rag-indexer.v1";
 
-  const lagMs = Date.now() - new Date(String(row.payload["created_at"] ?? row.created_at)).getTime();
+  const lagMs =
+    Date.now() - new Date(String(row.payload["created_at"] ?? row.created_at)).getTime();
   if (Number.isFinite(lagMs) && lagMs > LAG_WARN_MS) {
     console.warn(
       `[rag-indexer] atraso de ${Math.round(lagMs / 1000)}s no evento ${row.id} (${row.event_type})`,
     );
   }
 
-  if (row.event_type !== "knowledge_source.updated" && row.event_type !== "nuvemshop.product_synced") {
-    return { consumer_key: consumerKey, status: "skipped", detail: `evento_nao_tratado:${row.event_type}` };
+  if (
+    row.event_type !== "knowledge_source.updated" &&
+    row.event_type !== "nuvemshop.product_synced"
+  ) {
+    return {
+      consumer_key: consumerKey,
+      status: "skipped",
+      detail: `evento_nao_tratado:${row.event_type}`,
+    };
   }
 
   try {
     const { fonte, motivo } = await fonteDoEvento(row);
     if (!fonte) {
-      return { consumer_key: consumerKey, status: "skipped", detail: motivo ?? "fonte_indisponivel" };
+      return {
+        consumer_key: consumerKey,
+        status: "skipped",
+        detail: motivo ?? "fonte_indisponivel",
+      };
     }
     if (!fonte.is_active || fonte.status === "archived") {
       return { consumer_key: consumerKey, status: "skipped", detail: "fonte_arquivada" };
@@ -710,7 +716,12 @@ export async function processRagIndexer(row: EventRow): Promise<HandlerResult> {
 
     // Debounce por FONTE (antes era por agente): duas edições seguidas do mesmo
     // material coalescem, e materiais diferentes não se atrapalham.
-    const chaveDebounce = `rag:debounce:${row.organization_id}:${fonte.id}:${row.event_type}`;
+    const clickupRevision = String(
+      fonte.source_metadata?.clickup_content_hash ??
+        fonte.source_metadata?.clickup_index_event_id ??
+        "sem-revisao",
+    );
+    const chaveDebounce = `rag:debounce:${row.organization_id}:${fonte.id}:${row.event_type}:${clickupRevision}`;
     if (!(await acquireDebounce(chaveDebounce, DEBOUNCE_TTL_SEC))) {
       return { consumer_key: consumerKey, status: "skipped", detail: "debounced" };
     }
@@ -742,12 +753,19 @@ export async function processRagIndexer(row: EventRow): Promise<HandlerResult> {
       };
     }
 
-    await marcarFonte(row.organization_id, fonte.id, { last_index_status: "indexando" });
+    await marcarFonte(row.organization_id, fonte.id, {
+      // Uma fonte nova/importada continua `building` enquanto os vetores ainda
+      // não foram publicados. Fontes com versão ativa permanecem `ready`, de
+      // modo que uma reindexação nunca derrube o conhecimento anterior.
+      ...(fonte.active_kb_version_id ? {} : { status: "building" }),
+      last_index_status: "indexando",
+    });
 
     const resultado = await indexarFonte(fonte, chave);
 
     if (resultado.tipo === "ok") {
       await marcarFonte(row.organization_id, fonte.id, {
+        status: "ready",
         last_index_status: "success",
         last_index_error: null,
         last_indexed_at: new Date().toISOString(),
@@ -776,6 +794,9 @@ export async function processRagIndexer(row: EventRow): Promise<HandlerResult> {
     }
 
     await marcarFonte(row.organization_id, fonte.id, {
+      // Sem versão anterior não existe conteúdo utilizável; com uma versão
+      // ativa, preservamos `ready` e registramos a falha somente no último job.
+      ...(fonte.active_kb_version_id ? {} : { status: "failed" }),
       last_index_status: "failed",
       last_index_error: resultado.detalhe,
     });

@@ -74,7 +74,10 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
         resourceId: runId.data,
         requestId,
         bypassedRls: true,
-        metadata: { dry_run: true, preview_revision: body.data.expected_preview_revision },
+        metadata: {
+          dry_run: body.data.dry_run,
+          preview_revision: body.data.expected_preview_revision,
+        },
       });
     }
     return ok(data, {

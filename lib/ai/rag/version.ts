@@ -135,13 +135,9 @@ export async function markVersionFailed(
 }
 
 /**
- * Ativa a versão para a FONTE: aponta `ai_knowledge_sources.active_kb_version_id`
- * e desativa a anterior daquela fonte.
- *
- * Escrito em duas instruções e não numa RPC nova porque a única invariante que
- * o banco precisa garantir — uma ativa por fonte — já é o índice único
- * `ai_kbv_uma_ativa_por_fonte`. Desativar a anterior ANTES de ativar a nova é o
- * que impede o índice de recusar a troca.
+ * Ativa a versão para a FONTE numa única transação. A troca atômica mantém a
+ * versão anterior pesquisável até a nova estar `ready`; qualquer falha aborta
+ * também a desativação anterior.
  */
 export async function activateVersion(params: {
   organizationId: string;
@@ -150,54 +146,15 @@ export async function activateVersion(params: {
 }): Promise<void> {
   const admin = createAdminClient();
 
-  // Pré-checagem de tenant: o admin client bypassa RLS, então conferir aqui é
-  // obrigatório e não paranoia.
-  const { data: versionRow, error: checkErr } = await admin
-    .from("ai_knowledge_versions")
-    .select("id")
-    .eq("id", params.versionId)
-    .eq("knowledge_source_id", params.knowledgeSourceId)
-    .eq("organization_id", params.organizationId)
-    .maybeSingle();
-
-  if (checkErr) {
-    throw new Error(`activateVersion: pre-check failed — ${checkErr.message}`);
-  }
-  if (!versionRow) {
+  const { data, error } = await admin.rpc("fn_activate_knowledge_version", {
+    p_organization_id: params.organizationId,
+    p_source_id: params.knowledgeSourceId,
+    p_version_id: params.versionId,
+  });
+  if (error) throw new Error(`activateVersion: troca atômica falhou — ${error.message}`);
+  if (data !== true) {
     throw new Error(
-      `activateVersion: versão ${params.versionId} não pertence à fonte ${params.knowledgeSourceId}`,
+      `activateVersion: versão pronta ${params.versionId} não pertence à fonte ${params.knowledgeSourceId}`,
     );
-  }
-
-  const { error: offErr } = await admin
-    .from("ai_knowledge_versions")
-    .update({ is_active: false })
-    .eq("knowledge_source_id", params.knowledgeSourceId)
-    .eq("organization_id", params.organizationId)
-    .neq("id", params.versionId)
-    .eq("is_active", true);
-
-  if (offErr) {
-    throw new Error(`activateVersion: desativar anterior falhou — ${offErr.message}`);
-  }
-
-  const { error: onErr } = await admin
-    .from("ai_knowledge_versions")
-    .update({ is_active: true, activated_at: new Date().toISOString() })
-    .eq("id", params.versionId)
-    .eq("organization_id", params.organizationId);
-
-  if (onErr) {
-    throw new Error(`activateVersion: ativar falhou — ${onErr.message}`);
-  }
-
-  const { error: ptrErr } = await admin
-    .from("ai_knowledge_sources")
-    .update({ active_kb_version_id: params.versionId })
-    .eq("id", params.knowledgeSourceId)
-    .eq("organization_id", params.organizationId);
-
-  if (ptrErr) {
-    throw new Error(`activateVersion: ponteiro da fonte falhou — ${ptrErr.message}`);
   }
 }

@@ -19,12 +19,10 @@ import {
 } from "@/hooks/ai/useKnowledgeSources";
 import { KnowledgeSourceCard } from "@/components/ai/KnowledgeSourceCard";
 import { NovoMaterialDialog } from "@/components/ai/NovoMaterialDialog";
-import {
-  ChaveDeConhecimento,
-  type EstadoDaChave,
-} from "@/components/ai/ChaveDeConhecimento";
+import { ChaveDeConhecimento, type EstadoDaChave } from "@/components/ai/ChaveDeConhecimento";
 import { StatusDaBase } from "@/components/ai/StatusDaBase";
 import type { AgenteQueUsa } from "@/lib/ai/knowledge/agentes-que-usam";
+import { ImportarClickUpDocs } from "./_clickup-import";
 
 export type { AgenteQueUsa };
 
@@ -32,9 +30,15 @@ interface Props {
   initialSources: SourceRow[];
   initialChave: EstadoDaChave;
   agentes: AgenteQueUsa[];
+  podeImportarPrivados: boolean;
 }
 
-export function AcervoClient({ initialSources, initialChave, agentes }: Props) {
+export function AcervoClient({
+  initialSources,
+  initialChave,
+  agentes,
+  podeImportarPrivados,
+}: Props) {
   const t = useT();
   const qc = useQueryClient();
   const [novoAberto, setNovoAberto] = useState(false);
@@ -80,6 +84,7 @@ export function AcervoClient({ initialSources, initialChave, agentes }: Props) {
             : `${lista.length} ${lista.length === 1 ? t("material") : t("materiais")} ${t("no acervo.")}`}
         </p>
         <div className="flex flex-wrap items-center gap-2">
+          <ImportarClickUpDocs podeImportarPrivados={podeImportarPrivados} />
           {lista.length > 0 ? (
             <Button
               variant="outline"
@@ -143,8 +148,7 @@ export function AcervoClient({ initialSources, initialChave, agentes }: Props) {
       {arquivados.length > 0 ? (
         <details className="rounded-lg border border-border p-4" data-testid="acervo-arquivados">
           <summary className="cursor-pointer text-sm font-medium">
-            {arquivados.length}{" "}
-            {arquivados.length === 1 ? t("arquivado") : t("arquivados")}
+            {arquivados.length} {arquivados.length === 1 ? t("arquivado") : t("arquivados")}
           </summary>
           <p className="mt-2 text-xs text-text-muted">
             {t(

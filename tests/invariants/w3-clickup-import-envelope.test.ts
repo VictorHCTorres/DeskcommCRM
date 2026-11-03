@@ -606,6 +606,30 @@ describe("W3.0 — envelope de importação ClickUp", () => {
     sql(`update public.organizations set status = 'active' where id = '${OUTRA_ORG}';`);
   });
 
+  it("contabiliza warning durável de anexos e restringe o resultado reconciliado", () => {
+    const before = Number(
+      sql(`select warnings_count from public.clickup_import_runs where id = '${RUN}';`),
+    );
+    sql(`insert into public.clickup_import_items
+      (organization_id, run_id, workspace_id, entity_type, external_id, source_hash,
+       source_metadata, status)
+      values ('${GOV_ORG}', '${RUN}', 'wk-1', 'task', 'task-com-anexo', '${HASH}',
+        '{"attachment_status":"skipped_not_imported","attachment_count":2}', 'ready');`);
+    expect(sql(`select warnings_count from public.clickup_import_runs where id = '${RUN}';`)).toBe(
+      String(before + 1),
+    );
+    expect(() =>
+      sql(`update public.clickup_import_items set result_kind = 'falso_sucesso'
+        where run_id = '${RUN}' and external_id = 'task-com-anexo';`),
+    ).toThrow();
+    sql(`update public.clickup_import_items set result_kind = 'unchanged'
+      where run_id = '${RUN}' and external_id = 'task-com-anexo';`);
+    expect(
+      sql(`select result_kind from public.clickup_import_items
+        where run_id = '${RUN}' and external_id = 'task-com-anexo';`),
+    ).toBe("unchanged");
+  });
+
   it("não concede escrita direta nem DELETE a authenticated e preserva histórico ao revogar conexão", () => {
     expect(
       sql(`select count(*) from information_schema.role_table_grants

@@ -1,6 +1,10 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 
 import type { ClickUpManifest } from "@/lib/clickup/contrato";
+import {
+  clickupCrmMappingConfigSchema,
+  validateEveryListIsMapped,
+} from "@/lib/clickup/crm/contrato";
 import { encryptClickUpToken } from "@/lib/clickup/crypto";
 import { clickupHash, discoveredObjectToStaging, manifestHash } from "@/lib/clickup/manifest";
 
@@ -28,7 +32,7 @@ export const CLICKUP_CONNECTION_SAFE_COLUMNS =
 export const CLICKUP_RUN_SAFE_COLUMNS =
   "id, organization_id, connection_id, workspace_id, source, scope, status, dry_run, manifest_version, snapshot_hash, source_revision, preview_revision, mapping_revision, mapping_hash, attempt, max_attempts, checkpoint, total_items, applicable_items, warnings_count, conflicts_count, succeeded_items, failed_items, skipped_items, error_code, cancel_requested_at, started_at, finished_at, created_by, created_at, updated_at";
 export const CLICKUP_ITEM_SAFE_COLUMNS =
-  "id, organization_id, run_id, workspace_id, entity_type, external_id, parent_external_id, source_revision, source_hash, source_metadata, content_access, execution_blocked, blocked_reason, status, attempts, max_attempts, next_attempt_at, error_code, error_message, payload_purged_at, created_at, updated_at";
+  "id, organization_id, run_id, workspace_id, entity_type, external_id, parent_external_id, source_revision, source_hash, source_metadata, content_access, execution_blocked, blocked_reason, status, result_kind, attempts, max_attempts, next_attempt_at, error_code, error_message, payload_purged_at, created_at, updated_at";
 
 async function loadRunSafe(db: Db, organizationId: string, runId: string) {
   const { data, error } = await db
@@ -99,7 +103,13 @@ export async function loadClickUpConnectionSecret(
 
 export async function getClickUpImportPage(
   db: Db,
-  input: { organizationId: string; runId: string; afterId?: string; limit: number },
+  input: {
+    organizationId: string;
+    runId: string;
+    afterId?: string;
+    limit: number;
+    entityTypes?: string[];
+  },
 ) {
   const { data: run, error: runError } = await db
     .from("clickup_import_runs")
@@ -118,15 +128,30 @@ export async function getClickUpImportPage(
     .order("id")
     .limit(input.limit + 1);
   if (input.afterId) query = query.gt("id", input.afterId);
+  if (input.entityTypes?.length) query = query.in("entity_type", input.entityTypes);
   const { data: rows, error: itemsError } = await query;
   if (itemsError) throwDb(itemsError, "Não foi possível carregar os itens da importação.");
   const all = rows ?? [];
   const hasMore = all.length > input.limit;
   const items = hasMore ? all.slice(0, input.limit) : all;
   const last = items.at(-1);
+  const tipos = ["list", "task", "custom_field"] as const;
+  const contagens = await Promise.all(
+    tipos.map(async (entityType) => {
+      const { count, error } = await db
+        .from("clickup_import_items")
+        .select("id", { count: "exact", head: true })
+        .eq("organization_id", input.organizationId)
+        .eq("run_id", input.runId)
+        .eq("entity_type", entityType);
+      if (error) throwDb(error, "Não foi possível resumir a prévia do ClickUp.");
+      return [entityType, count ?? 0] as const;
+    }),
+  );
   return {
     run,
     items,
+    summary: Object.fromEntries(contagens) as Record<(typeof tipos)[number], number>,
     cursor: hasMore && last ? String(last.id) : null,
     hasMore,
   };
@@ -177,6 +202,70 @@ export async function updateClickUpMapping(
     mapping: Record<string, unknown>;
   },
 ) {
+  const { data: run, error: runError } = await db
+    .from("clickup_import_runs")
+    .select("scope")
+    .eq("organization_id", input.organizationId)
+    .eq("id", input.runId)
+    .maybeSingle();
+  if (runError) throwDb(runError, "Não foi possível validar a importação.");
+  if (!run) throw new ClickUpStoreError("not_found", "Importação do ClickUp não encontrada.");
+  if (run.scope === "crm" || run.scope === "all") {
+    const crm = clickupCrmMappingConfigSchema.safeParse(input.mapping.crm);
+    if (!crm.success) {
+      throw new ClickUpStoreError("invalid_state", "O mapeamento CRM está incompleto.");
+    }
+    const { data: lists, error: listError } = await db
+      .from("clickup_import_items")
+      .select("external_id")
+      .eq("organization_id", input.organizationId)
+      .eq("run_id", input.runId)
+      .eq("entity_type", "list");
+    if (listError) throwDb(listError, "Não foi possível validar as Lists do ClickUp.");
+    const coverage = validateEveryListIsMapped(
+      (lists ?? []).map((list) => String(list.external_id)),
+      crm.data,
+    );
+    if (!coverage.ok) {
+      throw new ClickUpStoreError(
+        "invalid_state",
+        `Toda List exige destino explícito; faltam ${coverage.missing.length}.`,
+      );
+    }
+    const { data: bindings, error: bindingError } = await db
+      .from("clickup_import_items")
+      .select("entity_type, external_id, parent_external_id, source_metadata")
+      .eq("organization_id", input.organizationId)
+      .eq("run_id", input.runId)
+      .in("entity_type", ["status", "custom_field"]);
+    if (bindingError) throwDb(bindingError, "Não foi possível validar status e campos.");
+    for (const binding of bindings ?? []) {
+      const metadata =
+        binding.source_metadata && typeof binding.source_metadata === "object"
+          ? (binding.source_metadata as Record<string, unknown>)
+          : {};
+      const listId = String(metadata.list_id ?? binding.parent_external_id ?? "");
+      const sourceId = String(
+        binding.entity_type === "status"
+          ? (metadata.source_status_id ?? binding.external_id)
+          : (metadata.source_field_id ?? binding.external_id),
+      );
+      const list = crm.data.lists.find((candidate) => candidate.list_id === listId);
+      if (!list || list.mode === "ignore") continue;
+      const decided =
+        binding.entity_type === "status"
+          ? list.statuses.some((status) => status.status_id === sourceId)
+          : list.fields.some((field) => field.field_id === sourceId);
+      if (!decided) {
+        throw new ClickUpStoreError(
+          "invalid_state",
+          binding.entity_type === "status"
+            ? "Todo status exige resultado explícito open/won/lost."
+            : "Todo campo exige ação explícita native/text/ignore.",
+        );
+      }
+    }
+  }
   const { data, error } = await db.rpc("fn_update_clickup_import_mapping", {
     p_organization_id: input.organizationId,
     p_run_id: input.runId,
@@ -194,7 +283,7 @@ export async function queueClickUpRun(
   input: {
     organizationId: string;
     runId: string;
-    dryRun: true;
+    dryRun: boolean;
     expectedPreviewRevision: number;
     expectedSnapshotHash: string;
     expectedMappingHash: string | null;
@@ -240,4 +329,112 @@ export async function cancelClickUpRun(db: Db, organizationId: string, runId: st
       "A importação não pode ser cancelada neste estado.",
     );
   return loadRunSafe(db, organizationId, runId);
+}
+
+/** APIs internas do worker. Os composites contêm lease/payload e nunca devem
+ * ser devolvidos por uma rota autenticada. */
+export async function claimClickUpRunForProcessor(
+  db: Db,
+  workerId: string,
+  processor: "crm" | "docs",
+) {
+  const { data, error } = await db.rpc("fn_claim_clickup_import_run_for_scope", {
+    p_worker_id: workerId,
+    p_processor: processor,
+    p_lease_seconds: 90,
+  });
+  if (error) throwDb(error, "Não foi possível reivindicar a importação.");
+  return data as Record<string, unknown> | null;
+}
+
+export async function claimClickUpItemForProcessor(
+  db: Db,
+  organizationId: string,
+  runId: string,
+  processor: "crm" | "docs",
+) {
+  const { data, error } = await db.rpc("fn_claim_clickup_import_item_for_scope", {
+    p_organization_id: organizationId,
+    p_run_id: runId,
+    p_processor: processor,
+    p_lease_seconds: 90,
+  });
+  if (error) throwDb(error, "Não foi possível reivindicar o item da importação.");
+  return data as Record<string, unknown> | null;
+}
+
+export async function finishClickUpItem(
+  db: Db,
+  input: {
+    organizationId: string;
+    itemId: string;
+    claimToken: string;
+    outcome: "succeeded" | "skipped" | "failed" | "retry_wait";
+    retryAt?: string;
+    errorCode?: string;
+    errorMessage?: string;
+  },
+) {
+  const { data, error } = await db.rpc("fn_finish_clickup_import_item", {
+    p_organization_id: input.organizationId,
+    p_item_id: input.itemId,
+    p_claim_token: input.claimToken,
+    p_outcome: input.outcome,
+    p_retry_at: input.retryAt ?? null,
+    p_error_code: input.errorCode ?? null,
+    p_error_message: input.errorMessage ?? null,
+  });
+  if (error) throwDb(error, "Não foi possível concluir o item da importação.");
+  return data === true;
+}
+
+export async function heartbeatClickUpItem(db: Db, itemId: string, claimToken: string) {
+  const { data, error } = await db.rpc("fn_heartbeat_clickup_import_item", {
+    p_item_id: itemId,
+    p_claim_token: claimToken,
+    p_lease_seconds: 300,
+  });
+  if (error) throwDb(error, "Não foi possível renovar o lease do item.");
+  return data === true;
+}
+
+export async function heartbeatClickUpProcessor(
+  db: Db,
+  input: {
+    runId: string;
+    processor: "crm" | "docs";
+    workerId: string;
+    leaseToken: string;
+    checkpoint?: Record<string, unknown>;
+  },
+) {
+  const { data, error } = await db.rpc("fn_heartbeat_clickup_import_processor", {
+    p_run_id: input.runId,
+    p_processor: input.processor,
+    p_worker_id: input.workerId,
+    p_lease_token: input.leaseToken,
+    p_checkpoint: input.checkpoint ?? null,
+    p_lease_seconds: 300,
+  });
+  if (error) throwDb(error, "Não foi possível renovar o lease do processador.");
+  return data === true;
+}
+
+export async function markClickUpItemResult(
+  db: Db,
+  input: {
+    organizationId: string;
+    itemId: string;
+    claimToken: string;
+    resultKind: "created" | "updated" | "unchanged" | "skipped" | "conflict" | "validated";
+  },
+) {
+  const { data, error } = await db.rpc("fn_mark_clickup_import_item_result", {
+    p_organization_id: input.organizationId,
+    p_item_id: input.itemId,
+    p_claim_token: input.claimToken,
+    p_result_kind: input.resultKind,
+  });
+  if (error) throwDb(error, "Não foi possível registrar o resultado do item.");
+  return data === true;
 }

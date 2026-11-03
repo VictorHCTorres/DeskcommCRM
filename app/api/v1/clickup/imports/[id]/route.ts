@@ -15,7 +15,12 @@ interface RouteContext {
 
 const querySchema = z.object({
   after: z.string().uuid().optional(),
-  limit: z.coerce.number().int().min(1).max(100).default(50),
+  limit: z.coerce.number().int().min(1).max(250).default(50),
+  entity_types: z
+    .string()
+    .transform((value) => value.split(","))
+    .pipe(z.array(z.enum(["list", "status", "custom_field"])).max(3))
+    .optional(),
 });
 
 export async function GET(request: Request, context: RouteContext): Promise<Response> {
@@ -31,6 +36,7 @@ export async function GET(request: Request, context: RouteContext): Promise<Resp
   const query = querySchema.safeParse({
     after: url.searchParams.get("after") ?? undefined,
     limit: url.searchParams.get("limit") ?? undefined,
+    entity_types: url.searchParams.get("entity_types") ?? undefined,
   });
   if (!runId.success || !query.success) {
     return fail("validation_failed", "Consulta da importação inválida.", 422, { requestId });
@@ -41,9 +47,10 @@ export async function GET(request: Request, context: RouteContext): Promise<Resp
       runId: runId.data,
       afterId: query.data.after,
       limit: query.data.limit,
+      entityTypes: query.data.entity_types,
     });
     return ok(
-      { run: page.run, items: page.items },
+      { run: page.run, items: page.items, summary: page.summary },
       {
         requestId,
         meta: { cursor: page.cursor, has_more: page.hasMore },

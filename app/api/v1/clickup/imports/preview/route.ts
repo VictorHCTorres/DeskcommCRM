@@ -4,7 +4,12 @@ import { fail, ok } from "@/lib/api/wrappers";
 import { chaveDaRequisicao, comIdempotencia } from "@/lib/api/idempotency";
 import { audit } from "@/lib/audit";
 import { requireRole } from "@/lib/auth/require-role";
+import { escreveComoPlatformAdmin, roleAtLeast } from "@/lib/auth/types";
 import { clickupManifestSchema, clickupRunIdSchema } from "@/lib/clickup/contrato";
+import {
+  AVISO_DOC_PRIVADO_CLICKUP,
+  estadoDaPrivacidadeDosDocs,
+} from "@/lib/clickup/docs/privacidade";
 import { canonicalizeClickUpManifest } from "@/lib/clickup/manifest";
 import { stageClickUpPreview } from "@/lib/clickup/store";
 import { requireSupportWrite } from "@/lib/impersonate/support";
@@ -32,6 +37,24 @@ export async function POST(request: Request): Promise<Response> {
       requestId,
       details: parsed.error.flatten(),
     });
+  }
+  const privacidade = estadoDaPrivacidadeDosDocs(parsed.data);
+  if (
+    privacidade.temPrivado &&
+    !roleAtLeast(authz.org.role, "admin") &&
+    !escreveComoPlatformAdmin(authz.user)
+  ) {
+    return fail("forbidden_role", "Somente administradores podem incluir Docs privados.", 403, {
+      requestId,
+    });
+  }
+  if (privacidade.temPrivado && !privacidade.inclusaoExplicita) {
+    return fail(
+      "validation_failed",
+      "Confirme explicitamente que Docs privados ficarão visíveis para toda a organização.",
+      422,
+      { requestId },
+    );
   }
   try {
     const db = createAdminClient();
@@ -78,11 +101,14 @@ export async function POST(request: Request): Promise<Response> {
         },
       });
     }
-    return ok(data, {
-      status: 201,
-      requestId,
-      headers: outcome.tipo === "replay" ? { "Idempotency-Replayed": "true" } : undefined,
-    });
+    return ok(
+      privacidade.temPrivado ? { ...data, privacy_warning: AVISO_DOC_PRIVADO_CLICKUP } : data,
+      {
+        status: 201,
+        requestId,
+        headers: outcome.tipo === "replay" ? { "Idempotency-Replayed": "true" } : undefined,
+      },
+    );
   } catch (error) {
     return clickupFailure(error, requestId);
   }
