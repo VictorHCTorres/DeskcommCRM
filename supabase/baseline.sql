@@ -60713,29 +60713,8 @@ alter table public.crm_lead_attachments enable row level security;
 -- arquivo é um segmento só (sem barra e sem começar por ponto), e a chave do
 -- campo segue a régua do funil (`customFieldSchema.key`). O `case` fixa a
 -- ordem: a chave é conferida antes de entrar na expressão regular.
--- Bloco DO: o `update.sh` roda sem ON_ERROR_STOP, e um `drop` solto seguido de
--- um `add` que falhasse deixaria a tabela sem a guarda. A linha que não cabe
--- na régua só pode ter vindo de escrita direta (a rota nunca a produziu, e a
--- tabela não saiu em versão nenhuma): sai antes da restrição entrar.
-do $$
-begin
-  delete from public.crm_lead_attachments
-   where not (case
-     when field_key ~ '^[A-Za-z][A-Za-z0-9_]{0,39}$'
-       then storage_path ~ ('^' || organization_id::text || '/leads/' || lead_id::text || '/'
-                            || field_key || '/[A-Za-z0-9_-][A-Za-z0-9._-]*$')
-     else false
-   end);
-  alter table public.crm_lead_attachments
-    drop constraint if exists crm_lead_attachments_storage_path_check;
-  alter table public.crm_lead_attachments
-    add constraint crm_lead_attachments_storage_path_check check (case
-      when field_key ~ '^[A-Za-z][A-Za-z0-9_]{0,39}$'
-        then storage_path ~ ('^' || organization_id::text || '/leads/' || lead_id::text || '/'
-                             || field_key || '/[A-Za-z0-9_-][A-Za-z0-9._-]*$')
-      else false
-    end);
-end $$;
+-- A constraint final é declarada uma única vez no bloco ClickUp (9097), que
+-- preserva esta forma manual e acrescenta o caminho determinístico importado.
 
 -- Depois de gravado, o caminho não muda (nenhuma rota o altera).
 create or replace function public.fn_crm_lead_attachments_caminho_imutavel()
@@ -74576,17 +74555,12 @@ create policy crm_task_comments_select on public.crm_task_comments for select to
     where t.organization_id = crm_task_comments.organization_id and t.id = crm_task_comments.task_id)
 );
 drop policy if exists clickup_comment_receipts_service_only on public.clickup_comment_receipts;
-create policy clickup_comment_receipts_service_only on public.clickup_comment_receipts using (false);
 
 -- Staging, quarantine e receipts não têm leitura/escrita direta pelo browser.
 drop policy if exists clickup_asset_sidecars_service_only on public.clickup_asset_sidecars;
-create policy clickup_asset_sidecars_service_only on public.clickup_asset_sidecars using (false);
 drop policy if exists clickup_asset_uploads_service_only on public.clickup_asset_uploads;
-create policy clickup_asset_uploads_service_only on public.clickup_asset_uploads using (false);
 drop policy if exists clickup_asset_items_service_only on public.clickup_asset_items;
-create policy clickup_asset_items_service_only on public.clickup_asset_items using (false);
 drop policy if exists clickup_asset_receipts_service_only on public.clickup_asset_receipts;
-create policy clickup_asset_receipts_service_only on public.clickup_asset_receipts using (false);
 
 revoke all on table public.crm_task_attachments from public, anon, authenticated, service_role;
 revoke all on table public.ai_knowledge_source_attachments from public, anon, authenticated, service_role;
@@ -74602,11 +74576,11 @@ grant select on table public.crm_task_comments to authenticated;
 grant select, insert, update, delete on table public.crm_task_attachments to service_role;
 grant select, insert, update, delete on table public.ai_knowledge_source_attachments to service_role;
 grant select, insert, update, delete on table public.crm_task_comments to service_role;
-grant select, insert, update, delete on table public.clickup_comment_receipts to service_role;
-grant select, insert, update, delete on table public.clickup_asset_sidecars to service_role;
-grant select, insert, update, delete on table public.clickup_asset_uploads to service_role;
-grant select, insert, update, delete on table public.clickup_asset_items to service_role;
-grant select, insert, update, delete on table public.clickup_asset_receipts to service_role;
+grant select, insert, update on table public.clickup_comment_receipts to service_role;
+grant select, insert, update on table public.clickup_asset_sidecars to service_role;
+grant select, insert, update on table public.clickup_asset_uploads to service_role;
+grant select, insert, update on table public.clickup_asset_items to service_role;
+grant select, insert, update on table public.clickup_asset_receipts to service_role;
 
 revoke execute on function public.fn_claim_clickup_asset(uuid,integer)
   from public, anon, authenticated;
@@ -74630,6 +74604,10 @@ revoke execute on function public.fn_queue_clickup_quarantine_cleanup(uuid,uuid)
   from public, anon, authenticated;
 revoke execute on function public.fn_reconcile_clickup_asset_orphans(integer)
   from public, anon, authenticated;
+revoke execute on function public.fn_guard_clickup_attachment_quota()
+  from public, anon, authenticated;
+revoke execute on function public.fn_queue_clickup_asset_delete()
+  from public, anon, authenticated;
 grant execute on function public.fn_claim_clickup_asset(uuid,integer) to service_role;
 grant execute on function public.fn_stage_clickup_asset_sidecar(uuid,uuid,uuid,jsonb)
   to service_role;
@@ -74646,6 +74624,8 @@ grant execute on function public.fn_commit_clickup_asset(uuid,uuid,uuid,text,uui
 grant execute on function public.fn_queue_clickup_asset_orphan(uuid,text) to service_role;
 grant execute on function public.fn_queue_clickup_quarantine_cleanup(uuid,uuid) to service_role;
 grant execute on function public.fn_reconcile_clickup_asset_orphans(integer) to service_role;
+grant execute on function public.fn_guard_clickup_attachment_quota() to service_role;
+grant execute on function public.fn_queue_clickup_asset_delete() to service_role;
 
 drop trigger if exists trg_crm_task_attachments_updated_at on public.crm_task_attachments;
 drop trigger if exists trg_ai_knowledge_source_attachments_updated_at on public.ai_knowledge_source_attachments;
@@ -74931,6 +74911,47 @@ revoke execute on function public.fn_stage_clickup_asset_sidecar(uuid,uuid,uuid,
 revoke execute on function public.fn_commit_clickup_asset(uuid,uuid,uuid,text,uuid,uuid,text,bigint,text)
   from public, anon, authenticated;
 
+-- Referência viva cancela somente a fila de retenção sem pedido LGPD (9101).
+create or replace function public.fn_cancel_clickup_asset_delete_on_insert()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_bucket text;
+begin
+  v_bucket := case
+    when tg_table_name = 'crm_lead_attachments' and new.source_attachment_id is null
+      then 'internal-media'
+    else 'clickup-assets'
+  end;
+
+  delete from public.storage_redaction_queue
+   where bucket = v_bucket
+     and object_path = new.storage_path
+     and request_id is null;
+  return new;
+end;
+$$;
+
+revoke execute on function public.fn_cancel_clickup_asset_delete_on_insert()
+  from public, anon, authenticated;
+grant execute on function public.fn_cancel_clickup_asset_delete_on_insert() to service_role;
+
+drop trigger if exists trg_clickup_lead_attachment_revive on public.crm_lead_attachments;
+create trigger trg_clickup_lead_attachment_revive
+  after insert on public.crm_lead_attachments for each row
+  execute function public.fn_cancel_clickup_asset_delete_on_insert();
+drop trigger if exists trg_clickup_task_attachment_revive on public.crm_task_attachments;
+create trigger trg_clickup_task_attachment_revive
+  after insert on public.crm_task_attachments for each row
+  execute function public.fn_cancel_clickup_asset_delete_on_insert();
+drop trigger if exists trg_clickup_knowledge_attachment_revive on public.ai_knowledge_source_attachments;
+create trigger trg_clickup_knowledge_attachment_revive
+  after insert on public.ai_knowledge_source_attachments for each row
+  execute function public.fn_cancel_clickup_asset_delete_on_insert();
+
 -- ---- VARREDURA anon: função nova nasce exposta em quem ATUALIZA (migration 0116) ----
 --
 -- ⚠️ DE PROPÓSITO, NENHUMA FUNÇÃO É CRIADA DEPOIS DESTE BLOCO. Apêndice que cria
@@ -74992,89 +75013,3 @@ grant execute on function public.fn_decrypt_oauth(bytea) to service_role;
 grant execute on function public.fn_encrypt_oauth(text) to service_role;
 grant execute on function public.fn_lgpd_cascade_redact_contact(uuid, uuid, uuid) to service_role;
 grant execute on function public.fn_update_budget_consumption() to service_role;
-
--- ---- ClickUp: ACL interna e referência viva de anexo (migration 9101) ----
-drop policy if exists clickup_comment_receipts_service_only on public.clickup_comment_receipts;
-drop policy if exists clickup_asset_sidecars_service_only on public.clickup_asset_sidecars;
-drop policy if exists clickup_asset_uploads_service_only on public.clickup_asset_uploads;
-drop policy if exists clickup_asset_items_service_only on public.clickup_asset_items;
-drop policy if exists clickup_asset_receipts_service_only on public.clickup_asset_receipts;
-
-revoke delete on table public.clickup_comment_receipts from public, anon, authenticated, service_role;
-revoke delete on table public.clickup_asset_sidecars from public, anon, authenticated, service_role;
-revoke delete on table public.clickup_asset_uploads from public, anon, authenticated, service_role;
-revoke delete on table public.clickup_asset_items from public, anon, authenticated, service_role;
-revoke delete on table public.clickup_asset_receipts from public, anon, authenticated, service_role;
-
-revoke execute on function public.fn_guard_clickup_attachment_quota()
-  from public, anon, authenticated;
-revoke execute on function public.fn_queue_clickup_asset_delete()
-  from public, anon, authenticated;
-grant execute on function public.fn_guard_clickup_attachment_quota() to service_role;
-grant execute on function public.fn_queue_clickup_asset_delete() to service_role;
-
-do $$
-begin
-  if not exists (
-    select 1 from pg_constraint
-     where conrelid = 'public.crm_lead_attachments'::regclass
-       and conname = 'crm_lead_attachments_storage_path_check'
-  ) then
-    alter table public.crm_lead_attachments
-      add constraint crm_lead_attachments_storage_path_check check (
-        case
-          when source_attachment_id is null then
-            field_key ~ '^[A-Za-z][A-Za-z0-9_]{0,39}$'
-            and storage_path ~ (
-              '^' || organization_id::text || '/leads/' || lead_id::text || '/' || field_key ||
-              '/[A-Za-z0-9_-][A-Za-z0-9._-]*$'
-            )
-          else
-            storage_path ~ (
-              '^' || organization_id::text || '/[A-Za-z0-9._-]+/leads/' || lead_id::text ||
-              '/[0-9a-f]{64}\\.[a-z0-9]+$'
-            )
-        end
-      );
-  end if;
-end $$;
-
-create or replace function public.fn_cancel_clickup_asset_delete_on_insert()
-returns trigger
-language plpgsql
-security definer
-set search_path = public, pg_temp
-as $$
-declare
-  v_bucket text;
-begin
-  v_bucket := case
-    when tg_table_name = 'crm_lead_attachments' and new.source_attachment_id is null
-      then 'internal-media'
-    else 'clickup-assets'
-  end;
-
-  delete from public.storage_redaction_queue
-   where bucket = v_bucket
-     and object_path = new.storage_path
-     and request_id is null;
-  return new;
-end;
-$$;
-
-revoke execute on function public.fn_cancel_clickup_asset_delete_on_insert()
-  from public, anon, authenticated;
-grant execute on function public.fn_cancel_clickup_asset_delete_on_insert() to service_role;
-
-drop trigger if exists trg_clickup_lead_attachment_revive on public.crm_lead_attachments;
-create trigger trg_clickup_lead_attachment_revive
-  after insert on public.crm_lead_attachments for each row
-  execute function public.fn_cancel_clickup_asset_delete_on_insert();
-drop trigger if exists trg_clickup_task_attachment_revive on public.crm_task_attachments;
-create trigger trg_clickup_task_attachment_revive
-  after insert on public.crm_task_attachments for each row
-  execute function public.fn_cancel_clickup_asset_delete_on_insert();
-drop trigger if exists trg_clickup_knowledge_attachment_revive on public.ai_knowledge_source_attachments;
-create trigger trg_clickup_knowledge_attachment_revive
-  after insert on public.ai_knowledge_source_attachments for each row
-  execute function public.fn_cancel_clickup_asset_delete_on_insert();
