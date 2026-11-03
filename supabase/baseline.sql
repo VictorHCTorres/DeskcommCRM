@@ -71171,7 +71171,6 @@ create index if not exists avisos_org_publicar_idx
 alter table public.avisos enable row level security;
 revoke all on public.avisos from public, anon, authenticated;
 grant select, insert, update, delete on public.avisos to service_role;
-
 -- ---- cor da fila de atendimento (migration 9084) ----
 -- manifest: attendant_sectors.color — a cor de identificação da fila (`#rrggbb`) ou nula; o CHECK recusa fora do formato, então a forma vale mesmo fora da rota
 --
@@ -71184,6 +71183,7 @@ alter table public.attendant_sectors
 comment on column public.attendant_sectors.color is
   'Cor de identificação da fila (migration 9084): #rrggbb, ou NULL = sem cor. O CHECK guarda a FORMA; a paleta é a da tela (PALETA_DE_ETIQUETAS) e não se valida no banco. Lida por GET /api/v1/attendants/sectors e gravada por PATCH /api/v1/attendants/sectors/[id] (manager+).';
 
+-- ---- hierarquia Área > Grupo > Funil (migration 9094) ----
 -- manifest: Organiza funis em Áreas e Grupos sem mover nem apagar negócios; vínculos compostos garantem que toda relação permaneça dentro da organização.
 
 create table if not exists public.crm_pipeline_groups (
