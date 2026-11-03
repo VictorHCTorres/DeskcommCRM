@@ -22,9 +22,9 @@ export class ClickUpStoreError extends Error {
   }
 }
 
-export const CLICKUP_STAGE_BATCH_MAX_ROWS = 100;
-export const CLICKUP_STAGE_BATCH_MAX_BYTES = 512 * 1024;
-export const CLICKUP_STAGE_MAX_SINGLE_ROW_BYTES = 2 * 1024 * 1024;
+export const CLICKUP_STAGE_BATCH_MAX_ROWS = 25;
+export const CLICKUP_STAGE_BATCH_MAX_BYTES = 128 * 1024;
+export const CLICKUP_STAGE_MAX_SINGLE_ROW_BYTES = CLICKUP_STAGE_BATCH_MAX_BYTES - 2;
 
 type ClickUpStagingRow = ReturnType<typeof discoveredObjectToStaging>;
 
@@ -32,7 +32,10 @@ type ClickUpStagingRow = ReturnType<typeof discoveredObjectToStaging>;
  * O snapshot real pode passar de 14 MiB. PostgREST converte o JSON inteiro antes
  * de chamar a função SQL e, nesse volume, o statement_timeout do banco encerra
  * uma RPC monolítica. Os lotes limitam simultaneamente cardinalidade e bytes;
- * uma linha individual maior que o teto segue sozinha para não truncar dados.
+ * uma linha individual também respeita o teto absoluto, sem truncar dados.
+ * Em produção, um lote de 501 KiB encontrou descrições mais caras de indexar e
+ * ainda atingiu o timeout; 25 itens/128 KiB mantém folga para o custo dos
+ * triggers, não apenas para o transporte do JSON.
  */
 export function splitClickUpStagingRows(
   rows: ClickUpStagingRow[],
@@ -49,7 +52,8 @@ export function splitClickUpStagingRows(
   let batchBytes = 2; // colchetes do array JSON
   for (const row of rows) {
     const rowBytes = Buffer.byteLength(JSON.stringify(row), "utf8");
-    if (rowBytes > CLICKUP_STAGE_MAX_SINGLE_ROW_BYTES) {
+    const maxSingleRowBytes = Math.min(CLICKUP_STAGE_MAX_SINGLE_ROW_BYTES, maxBytes - 2);
+    if (rowBytes > maxSingleRowBytes) {
       throw new ClickUpStoreError(
         "invalid_state",
         `O item ${row.external_id} excede o limite seguro da prévia do ClickUp.`,

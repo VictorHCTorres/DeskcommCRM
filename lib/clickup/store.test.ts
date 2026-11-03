@@ -100,7 +100,33 @@ describe("store do ClickUp", () => {
     }
   });
 
-  it("mantém uma linha individual acima do teto em lote próprio sem truncar conteúdo", () => {
+  it("divide o corpo de 501 KiB que atingiu o timeout em produção", () => {
+    const rows = Array.from({ length: 12 }, (_, index) => ({
+      entity_type: "task" as const,
+      external_id: `production-timeout-${index}`,
+      parent_external_id: null,
+      source_revision: null,
+      source_hash: "a".repeat(64),
+      source_metadata: { description: "x".repeat(45_000) },
+      source_payload: null,
+      payload_expires_at: null,
+      content_access: "none" as const,
+      status: "ready" as const,
+      execution_blocked: false,
+      blocked_reason: null,
+    }));
+
+    expect(Buffer.byteLength(JSON.stringify(rows), "utf8")).toBeGreaterThan(501 * 1024);
+    const batches = splitClickUpStagingRows(rows);
+    expect(batches.length).toBeGreaterThan(1);
+    for (const batch of batches) {
+      expect(Buffer.byteLength(JSON.stringify(batch), "utf8")).toBeLessThanOrEqual(
+        CLICKUP_STAGE_BATCH_MAX_BYTES,
+      );
+    }
+  });
+
+  it("recusa uma linha individual acima do teto configurado sem truncar conteúdo", () => {
     const oversized = {
       entity_type: "task" as const,
       external_id: "task-oversized",
@@ -116,9 +142,9 @@ describe("store do ClickUp", () => {
       blocked_reason: null,
     };
 
-    expect(splitClickUpStagingRows([oversized], { maxRows: 10, maxBytes: 100 })).toEqual([
-      [oversized],
-    ]);
+    expect(() =>
+      splitClickUpStagingRows([oversized], { maxRows: 10, maxBytes: 100 }),
+    ).toThrow(/task-oversized/);
   });
 
   it("recusa uma única linha grande demais antes de abrir a prévia", () => {
@@ -150,8 +176,10 @@ describe("store do ClickUp", () => {
     });
 
     expect(run.id).toEqual(expect.any(String));
-    expect(fake.itemBatches.map((batch) => batch.length)).toEqual([100, 100, 5]);
-    expect(fake.rpc).toHaveBeenCalledTimes(5);
+    expect(fake.itemBatches.map((batch) => batch.length)).toEqual([
+      25, 25, 25, 25, 25, 25, 25, 25, 5,
+    ]);
+    expect(fake.rpc).toHaveBeenCalledTimes(11);
     expect(fake.rpc).toHaveBeenCalledWith(
       "fn_finalize_clickup_import_preview",
       expect.objectContaining({ p_expected_items: 205 }),
