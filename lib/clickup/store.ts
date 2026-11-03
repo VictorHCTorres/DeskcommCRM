@@ -1,6 +1,8 @@
+import { randomUUID } from "node:crypto";
 import type { SupabaseClient } from "@supabase/supabase-js";
 
 import type { ClickUpManifest } from "@/lib/clickup/contrato";
+import type { ClickUpSidecar } from "@/lib/clickup/sidecar-contrato";
 import {
   clickupCrmMappingConfigSchema,
   validateEveryListIsMapped,
@@ -436,5 +438,140 @@ export async function markClickUpItemResult(
     p_result_kind: input.resultKind,
   });
   if (error) throwDb(error, "Não foi possível registrar o resultado do item.");
+  return data === true;
+}
+
+export async function prepareClickUpAssetUpload(
+  db: Db,
+  input: {
+    organizationId: string;
+    userId: string;
+    runId: string;
+    kind: "sidecar" | "asset";
+    attachmentId?: string;
+    sha256: string;
+    declaredSize: number;
+  },
+) {
+  const { data: run, error: runError } = await db
+    .from("clickup_import_runs")
+    .select("id, workspace_id, snapshot_hash, status, cancel_requested_at")
+    .eq("organization_id", input.organizationId)
+    .eq("id", input.runId)
+    .in("status", ["preview", "ready"])
+    .is("cancel_requested_at", null)
+    .maybeSingle();
+  if (runError) throwDb(runError, "Não foi possível validar a importação.");
+  if (!run) throw new ClickUpStoreError("not_found", "Importação do ClickUp não encontrada.");
+  const uploadId = randomUUID();
+  const path = `quarantine/${input.organizationId}/${input.runId}/${run.snapshot_hash}/${uploadId}/${input.sha256}`;
+  const { data, error } = await db
+    .from("clickup_asset_uploads")
+    .insert({
+      id: uploadId,
+      organization_id: input.organizationId,
+      run_id: input.runId,
+      workspace_id: run.workspace_id,
+      snapshot_hash: run.snapshot_hash,
+      kind: input.kind,
+      attachment_id: input.kind === "asset" ? input.attachmentId : null,
+      sha256: input.sha256,
+      declared_size: input.declaredSize,
+      storage_path: path,
+      state: "prepared",
+      created_by: input.userId,
+      expires_at: new Date(Date.now() + 24 * 60 * 60 * 1_000).toISOString(),
+    })
+    .select("id, storage_path, expires_at")
+    .single();
+  if (error || !data) throwDb(error, "Não foi possível preparar o upload privado.");
+  return data;
+}
+
+export async function loadClickUpAssetUpload(
+  db: Db,
+  input: { organizationId: string; userId: string; runId: string; uploadId: string; kind?: string },
+) {
+  let query = db
+    .from("clickup_asset_uploads")
+    .select(
+      "id, organization_id, run_id, workspace_id, snapshot_hash, kind, attachment_id, sha256, declared_size, storage_path, state, expires_at",
+    )
+    .eq("organization_id", input.organizationId)
+    .eq("run_id", input.runId)
+    .eq("id", input.uploadId)
+    .eq("created_by", input.userId)
+    .gt("expires_at", new Date().toISOString());
+  if (input.kind) query = query.eq("kind", input.kind);
+  const { data, error } = await query.maybeSingle();
+  if (error) throwDb(error, "Não foi possível validar o upload privado.");
+  if (!data) throw new ClickUpStoreError("not_found", "Upload privado não encontrado.");
+  return data;
+}
+
+export async function stageClickUpAssetSidecar(
+  db: Db,
+  input: { organizationId: string; userId: string; runId: string; sidecar: ClickUpSidecar },
+) {
+  const { data, error } = await db.rpc("fn_stage_clickup_asset_sidecar", {
+    p_organization_id: input.organizationId,
+    p_run_id: input.runId,
+    p_created_by: input.userId,
+    p_sidecar: input.sidecar,
+  });
+  if (error || typeof data !== "string") {
+    throwDb(error, "Não foi possível gravar o sidecar de anexos.");
+  }
+  return data;
+}
+
+export async function claimClickUpAsset(db: Db, workerId: string) {
+  const { data, error } = await db.rpc("fn_claim_clickup_asset", {
+    p_worker_id: workerId,
+    p_lease_seconds: 300,
+  });
+  if (error) throwDb(error, "Não foi possível reivindicar o anexo ClickUp.");
+  return data as Record<string, unknown> | null;
+}
+
+export async function heartbeatClickUpAsset(
+  db: Db,
+  input: { organizationId: string; assetId: string; claimToken: string },
+) {
+  const { data, error } = await db.rpc("fn_heartbeat_clickup_asset", {
+    p_organization_id: input.organizationId,
+    p_asset_id: input.assetId,
+    p_claim_token: input.claimToken,
+    p_lease_seconds: 300,
+  });
+  if (error) throwDb(error, "Não foi possível renovar o lease do anexo.");
+  return data === true;
+}
+
+export async function finishClickUpAsset(
+  db: Db,
+  input: {
+    organizationId: string;
+    assetId: string;
+    claimToken: string;
+    outcome:
+      "promoted" | "unchanged" | "skipped" | "conflict" | "failed" | "retry_wait" | "cancelled";
+    retryAt?: string;
+    errorCode?: string;
+    errorMessage?: string;
+    finalStoragePath?: string;
+  },
+) {
+  const { data, error } = await db.rpc("fn_finish_clickup_asset", {
+    p_organization_id: input.organizationId,
+    p_asset_id: input.assetId,
+    p_claim_token: input.claimToken,
+    p_outcome: input.outcome,
+    p_retry_at: input.retryAt ?? null,
+    p_error_code: input.errorCode ?? null,
+    p_error_message: input.errorMessage ?? null,
+    p_final_storage_path: input.finalStoragePath ?? null,
+  });
+  if (error) throwDb(error, "Não foi possível concluir o anexo ClickUp.");
   return data === true;
 }

@@ -14,8 +14,10 @@ import { NextResponse, type NextRequest } from "next/server";
 
 import { fail } from "@/lib/api/wrappers";
 import { requireRole } from "@/lib/auth/require-role";
+import { isClickUpAssetFinalPathOwnedBy } from "@/lib/clickup/assets/paths";
 import { traduzir } from "@/lib/i18n/dicionario";
 import { logger } from "@/lib/logger";
+import { cabecalhoDeDownload } from "@/lib/messaging/media/download-com-nome";
 import { isLeadAttachmentPathOwnedBy } from "@/lib/messaging/media/upload-validation";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { createClient } from "@/lib/supabase/server";
@@ -55,7 +57,7 @@ export async function GET(_req: NextRequest, ctx: RouteCtx): Promise<Response> {
   // Busca o anexo na tabela crm_lead_attachments
   const { data: anexo, error: anexoErr } = await supabase
     .from("crm_lead_attachments")
-    .select("id, storage_path")
+    .select("id, storage_path, file_name, file_size, mime_type, source_attachment_id")
     .eq("id", attachmentId)
     .eq("lead_id", leadId)
     .eq("organization_id", org.orgId)
@@ -65,13 +67,41 @@ export async function GET(_req: NextRequest, ctx: RouteCtx): Promise<Response> {
   if (!anexo || !anexo.storage_path) {
     return fail("not_found", t("Anexo não encontrado."), 404, { requestId });
   }
+  const admin = createAdminClient();
+  if (anexo.source_attachment_id) {
+    if (!isClickUpAssetFinalPathOwnedBy(anexo.storage_path, org.orgId, "leads", lead.id)) {
+      logger.warn("[leads/attachments] caminho ClickUp fora do negócio", {
+        attachmentId,
+        requestId,
+      });
+      return fail("not_found", t("Anexo não encontrado."), 404, { requestId });
+    }
+    const { data: blob, error: downloadError } = await admin.storage
+      .from("clickup-assets")
+      .download(anexo.storage_path);
+    if (downloadError || !blob) {
+      return fail("not_found", t("Anexo não encontrado."), 404, { requestId });
+    }
+    return new Response(blob, {
+      headers: {
+        "X-Request-Id": requestId,
+        "Cache-Control": "private, no-store",
+        "Content-Type": anexo.mime_type || "application/octet-stream",
+        "Content-Length": String(anexo.file_size),
+        "Content-Disposition": cabecalhoDeDownload(anexo.file_name),
+        "X-Content-Type-Options": "nosniff",
+      },
+    });
+  }
   // O link sai com o cliente admin: só assina o que mora sob o prefixo deste negócio.
   if (!isLeadAttachmentPathOwnedBy(anexo.storage_path, org.orgId, lead.id)) {
-    logger.warn("[leads/attachments] caminho fora do negócio; link não assinado", { attachmentId, requestId });
+    logger.warn("[leads/attachments] caminho fora do negócio; link não assinado", {
+      attachmentId,
+      requestId,
+    });
     return fail("not_found", t("Anexo não encontrado."), 404, { requestId });
   }
 
-  const admin = createAdminClient();
   const { data: signed, error: signErr } = await admin.storage
     .from(BUCKET)
     .createSignedUrl(anexo.storage_path, SIGNED_URL_TTL_S);

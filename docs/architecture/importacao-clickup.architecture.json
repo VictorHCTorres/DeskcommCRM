@@ -76,6 +76,27 @@
       "col": 6,
       "type": "database",
       "label": "Fonte building até versão RAG pronta"
+    },
+    {
+      "id": "sidecar",
+      "lane": "api",
+      "col": 1,
+      "type": "api",
+      "label": "Sidecar v1 + uploads privados vinculados ao run"
+    },
+    {
+      "id": "assets",
+      "lane": "worker",
+      "col": 5,
+      "type": "worker",
+      "label": "Quarantine › sniff/SHA › promoção idempotente"
+    },
+    {
+      "id": "history",
+      "lane": "db",
+      "col": 6,
+      "type": "database",
+      "label": "Anexos e comentários históricos tenant-safe"
     }
   ],
   "edges": [
@@ -86,6 +107,9 @@
     { "id": "e5", "from": "leases", "to": "crm", "label": "claim CRM" },
     { "id": "e6", "from": "leases", "to": "docs", "label": "claim Docs paralelo" },
     { "id": "e7", "from": "crm", "to": "domain", "label": "IDs determinísticos + receipts" },
-    { "id": "e8", "from": "docs", "to": "rag", "label": "evento deduplicado" }
+    { "id": "e8", "from": "docs", "to": "rag", "label": "evento deduplicado" },
+    { "id": "e9", "from": "preview", "to": "sidecar", "label": "run/snapshot/hash" },
+    { "id": "e10", "from": "sidecar", "to": "assets", "label": "receipt privado + claim CAS" },
+    { "id": "e11", "from": "assets", "to": "history", "label": "MIME/SHA + receipt create-only" }
   ]
 }

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { SupabaseClient } from "@supabase/supabase-js";
 
 import { temChaveDeEmbedding } from "@/lib/ai/embeddings/chave";
@@ -83,5 +84,43 @@ export async function aplicarDocClickUp(
     { onConflict: "organization_id,workspace_id,entity_type,external_id" },
   );
   if (error) throw new Error(`clickup_doc_mapping:${error.message}`);
+  const pageIds = [...new Set(lista(metadata.page_ids).map(String).filter(Boolean))].sort();
+  if (pageIds.length) {
+    const { error: pagesError } = await db.from("clickup_object_mappings").upsert(
+      pageIds.map((pageId) => ({
+        organization_id: organizationId,
+        connection_id: run.connection_id,
+        workspace_id: run.workspace_id,
+        entity_type: "doc_page",
+        external_id: pageId,
+        source_revision: item.source_revision ?? null,
+        source_hash: createHash("sha256")
+          .update(`${String(item.source_hash)}\0${pageId}`)
+          .digest("hex"),
+        knowledge_source_id: resultado.sourceId,
+        mapping_revision: run.mapping_revision,
+        created_by: run.created_by,
+      })),
+      {
+        onConflict: "organization_id,workspace_id,entity_type,external_id",
+        ignoreDuplicates: true,
+      },
+    );
+    if (pagesError) throw new Error(`clickup_doc_page_mapping:${pagesError.message}`);
+    const { data: persisted, error: readPagesError } = await db
+      .from("clickup_object_mappings")
+      .select("external_id, knowledge_source_id")
+      .eq("organization_id", organizationId)
+      .eq("workspace_id", String(run.workspace_id))
+      .eq("entity_type", "doc_page")
+      .in("external_id", pageIds);
+    if (readPagesError) throw new Error(`clickup_doc_page_mapping_read:${readPagesError.message}`);
+    const byId = new Map(
+      (persisted ?? []).map((row) => [String(row.external_id), String(row.knowledge_source_id)]),
+    );
+    if (pageIds.some((pageId) => byId.get(pageId) !== resultado.sourceId)) {
+      throw new Error("clickup_doc_page_mapping_conflict");
+    }
+  }
   return "succeeded";
 }

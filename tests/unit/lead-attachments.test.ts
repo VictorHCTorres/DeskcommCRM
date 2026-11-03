@@ -26,8 +26,10 @@ interface Consulta {
   not: (...args: unknown[]) => Consulta;
   eq: (coluna: string, valor: unknown) => Consulta;
   in: (coluna: string, valores: unknown[]) => Consulta;
+  or: (filtro: string) => Consulta;
   insert: (linha: Linha) => Consulta;
   upsert: (linha: Linha, opcoes?: unknown) => Consulta;
+  update: (linha: Linha) => Consulta;
   delete: () => Consulta;
   maybeSingle: () => Promise<Resultado>;
   single: () => Promise<Resultado>;
@@ -41,7 +43,7 @@ const h = vi.hoisted(() => {
   function consulta(tabela: string): Consulta {
     const filtros: ((l: Linha) => boolean)[] = [];
     const nomes: string[] = [];
-    let op: "select" | "insert" | "upsert" | "delete" = "select";
+    let op: "select" | "insert" | "upsert" | "update" | "delete" = "select";
     let nova: Linha | null = null;
     const linhas = () => (db[tabela] ?? []).filter((l) => filtros.every((f) => f(l)));
     const executa = (): Resultado => {
@@ -55,6 +57,10 @@ const h = vi.hoisted(() => {
         const fora = new Set(linhas());
         db[tabela] = (db[tabela] ?? []).filter((l) => !fora.has(l));
         return { data: null, error: null };
+      }
+      if (op === "update" && nova) {
+        for (const linha of linhas()) Object.assign(linha, nova);
+        return { data: linhas(), error: null };
       }
       return { data: linhas(), error: null };
     };
@@ -77,6 +83,20 @@ const h = vi.hoisted(() => {
         filtros.push((l) => valores.includes(l[coluna]));
         return b;
       },
+      or: (filtro) => {
+        const partes = filtro.split(/,(?=[a-z_]+\.)/i);
+        filtros.push((linha) =>
+          partes.some((parte) => {
+            const igual = parte.match(/^([a-z_]+)\.eq\.(.+)$/i);
+            if (igual) return String(linha[igual[1]!]) === igual[2];
+            const em = parte.match(/^([a-z_]+)\.in\.\((.*)\)$/i);
+            if (!em) return false;
+            const valores = em[2]!.split(",").map((valor) => valor.replace(/^"|"$/g, ""));
+            return valores.includes(String(linha[em[1]!]));
+          }),
+        );
+        return b;
+      },
       insert: (linha) => {
         op = "insert";
         nova = linha;
@@ -84,6 +104,11 @@ const h = vi.hoisted(() => {
       },
       upsert: (linha) => {
         op = "upsert";
+        nova = linha;
+        return b;
+      },
+      update: (linha) => {
+        op = "update";
         nova = linha;
         return b;
       },
@@ -131,6 +156,7 @@ vi.mock("@/lib/supabase/admin", () => ({
 
 import { DELETE, POST } from "@/app/api/v1/leads/[id]/attachments/route";
 import { GET as GET_MIDIA } from "@/app/api/v1/leads/[id]/attachments/[attachmentId]/media/route";
+import { clickUpAssetFinalPath } from "@/lib/clickup/assets/paths";
 import { cascadeRedactContact } from "@/lib/lgpd/redact-cascade";
 import { camposComAnexo, validaCamposExigidos } from "@/lib/leads/campos-exigidos";
 
@@ -151,6 +177,7 @@ const ANEXO_FORA = "88888888-8888-4888-8888-000000000003";
 // Negócio que o usuário não enxerga (no falso: não está em `crm_leads`).
 const LEAD_INVISIVEL = "22222222-2222-4222-8222-000000000003";
 const ANEXO_INVISIVEL = "88888888-8888-4888-8888-000000000004";
+const TAREFA_DIRETA = "99999999-9999-4999-8999-999999999999";
 
 const CAMPOS = [
   { key: "comprovante", label: "Comprovante", type: "file", obrigatorio_em: { etapas: [ETAPA] } },
@@ -176,8 +203,16 @@ const ctx = (id: string) => ({ params: Promise.resolve({ id }) });
 function postArquivo(lead: string, fieldKey: string): NextRequest {
   const form = new FormData();
   form.append("field_key", fieldKey);
-  form.append("file", new File([new Uint8Array([0x25, 0x50, 0x44, 0x46])], "voucher.pdf", { type: "application/pdf" }));
-  return new NextRequest(`http://localhost/api/v1/leads/${lead}/attachments`, { method: "POST", body: form });
+  form.append(
+    "file",
+    new File([new Uint8Array([0x25, 0x50, 0x44, 0x46])], "voucher.pdf", {
+      type: "application/pdf",
+    }),
+  );
+  return new NextRequest(`http://localhost/api/v1/leads/${lead}/attachments`, {
+    method: "POST",
+    body: form,
+  });
 }
 
 function deleteAnexo(lead: string, attachmentId: string): NextRequest {
@@ -206,9 +241,14 @@ beforeEach(() => {
   h.db.contacts = [{ id: CONTATO, organization_id: ORG, avatar_storage_path: null }];
   h.upload.mockReset().mockResolvedValue({ error: null });
   h.remove.mockReset().mockResolvedValue({ error: null });
-  h.assinar.mockReset().mockResolvedValue({ data: { signedUrl: "https://storage.local/assinado" }, error: null });
+  h.assinar
+    .mockReset()
+    .mockResolvedValue({ data: { signedUrl: "https://storage.local/assinado" }, error: null });
   h.audit.mockReset().mockResolvedValue(undefined);
-  h.rpc.mockReset().mockResolvedValue({ data: { already_anonymized: false, counts: {}, media_paths: [] }, error: null });
+  h.rpc.mockReset().mockResolvedValue({
+    data: { already_anonymized: false, counts: {}, media_paths: [] },
+    error: null,
+  });
 });
 
 describe("GET da mídia do anexo", () => {
@@ -266,7 +306,9 @@ describe("POST do anexo", () => {
     expect(caminho.startsWith(`${ORG}/leads/${LEAD}/comprovante/`)).toBe(true);
     const nova = h.db.crm_lead_attachments?.find((l) => l.storage_path === caminho);
     expect(nova).toMatchObject({ organization_id: ORG, lead_id: LEAD, field_key: "comprovante" });
-    expect(h.audit).toHaveBeenCalledWith(expect.objectContaining({ action: "lead.attachment_uploaded" }));
+    expect(h.audit).toHaveBeenCalledWith(
+      expect.objectContaining({ action: "lead.attachment_uploaded" }),
+    );
   });
 });
 
@@ -310,10 +352,17 @@ describe("cascata de anonimização (LGPD)", () => {
     await cascadeRedactContact({ organizationId: ORG, contactId: CONTATO, requestId: "pedido-1" });
 
     expect(h.db.storage_redaction_queue).toEqual([
-      expect.objectContaining({ organization_id: ORG, bucket: "internal-media", object_path: CAMINHO }),
+      expect.objectContaining({
+        organization_id: ORG,
+        bucket: "internal-media",
+        object_path: CAMINHO,
+      }),
     ]);
     expect(h.db.crm_lead_attachments?.map((l) => l.id)).toEqual([ANEXO_OUTRA]);
-    expect(h.deletes).toContainEqual({ tabela: "crm_lead_attachments", filtros: ["organization_id", "lead_id"] });
+    expect(h.deletes).toContainEqual({
+      tabela: "crm_lead_attachments",
+      filtros: ["organization_id", "lead_id"],
+    });
   });
 
   it("caminho fora do prefixo do negócio não vai para a fila de remoção", async () => {
@@ -322,9 +371,55 @@ describe("cascata de anonimização (LGPD)", () => {
 
     // controle positivo: o anexo legítimo do mesmo negócio entra.
     expect(h.db.storage_redaction_queue).toEqual([
-      expect.objectContaining({ organization_id: ORG, bucket: "internal-media", object_path: CAMINHO }),
+      expect.objectContaining({
+        organization_id: ORG,
+        bucket: "internal-media",
+        object_path: CAMINHO,
+      }),
     ]);
     expect(h.db.crm_lead_attachments?.map((l) => l.id)).toEqual([ANEXO_OUTRA]);
+  });
+
+  it("apaga asset e redige comentário de task contact-only sem lead", async () => {
+    const caminho = clickUpAssetFinalPath({
+      organizationId: ORG,
+      workspaceId: "wk-1",
+      targetKind: "tasks",
+      targetId: TAREFA_DIRETA,
+      sha256: "a".repeat(64),
+      extension: "pdf",
+    });
+    h.db.crm_tasks = [
+      { id: TAREFA_DIRETA, organization_id: ORG, contact_id: CONTATO, lead_id: null },
+    ];
+    h.db.crm_task_attachments = [
+      {
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        organization_id: ORG,
+        task_id: TAREFA_DIRETA,
+        storage_path: caminho,
+      },
+    ];
+    h.db.crm_task_comments = [
+      {
+        id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        organization_id: ORG,
+        task_id: TAREFA_DIRETA,
+        source_user_id: "user-1",
+        author_display_name: "Pessoa",
+        body_markdown: "Dado pessoal",
+      },
+    ];
+    await cascadeRedactContact({ organizationId: ORG, contactId: CONTATO, requestId: "pedido-3" });
+    expect(h.db.crm_task_attachments).toEqual([]);
+    expect(h.db.crm_task_comments?.[0]).toMatchObject({
+      source_user_id: "redacted",
+      author_display_name: "Pessoa anonimizada",
+      body_markdown: "[conteúdo anonimizado]",
+    });
+    expect(h.db.storage_redaction_queue).toContainEqual(
+      expect.objectContaining({ bucket: "clickup-assets", object_path: caminho }),
+    );
   });
 });
 
@@ -346,8 +441,12 @@ describe("régua de etapa — campo de arquivo conta a tabela, não `custom_fiel
     const comAnexo = await camposComAnexo(supabase, settings, ORG, LEAD);
     expect([...comAnexo]).toEqual(["comprovante"]);
     expect(
-      validaCamposExigidos({ lead: { custom_fields: {} }, settingsDoFunil: settings, destino, camposComAnexo: comAnexo })
-        .faltando,
+      validaCamposExigidos({
+        lead: { custom_fields: {} },
+        settingsDoFunil: settings,
+        destino,
+        camposComAnexo: comAnexo,
+      }).faltando,
     ).toEqual([]);
   });
 

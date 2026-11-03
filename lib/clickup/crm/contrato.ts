@@ -3,6 +3,7 @@ import { z } from "zod";
 
 export const CLICKUP_CRM_BATCH_SIZE = 40;
 export const CLICKUP_CRM_MAX_FIELDS_PER_PIPELINE = 50;
+export const CLICKUP_CRM_IMPORTED_FIELDS_WITH_ASSETS = CLICKUP_CRM_MAX_FIELDS_PER_PIPELINE;
 
 export const clickupCrmListModeSchema = z.enum(["crm_leads", "crm_tasks", "ignore"]);
 export const clickupCrmTerminalSchema = z.enum(["open", "won", "lost"]);
@@ -114,7 +115,7 @@ export const clickupCrmListMappingSchema = z
         }
       }
       const imported = mapping.fields.filter((field) => field.action !== "ignore");
-      if (imported.length > CLICKUP_CRM_MAX_FIELDS_PER_PIPELINE) {
+      if (imported.length > CLICKUP_CRM_IMPORTED_FIELDS_WITH_ASSETS) {
         context.addIssue({
           code: "custom",
           path: ["fields"],
@@ -189,13 +190,13 @@ export const clickupCrmMappingConfigSchema = z
     }
     if (
       [...fieldsByPipeline.values()].some(
-        (fields) => fields.size > CLICKUP_CRM_MAX_FIELDS_PER_PIPELINE,
+        (fields) => fields.size > CLICKUP_CRM_IMPORTED_FIELDS_WITH_ASSETS,
       )
     ) {
       context.addIssue({
         code: "custom",
         path: ["lists"],
-        message: "Lists do mesmo funil somam mais de 50 campos importados.",
+        message: "Lists do mesmo funil somam mais de 50 campos.",
       });
     }
   });

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { SupabaseClient } from "@supabase/supabase-js";
 
+import { applyClickUpCommentItem } from "@/lib/clickup/comments/worker";
 import { applyClickUpCrmItem } from "@/lib/clickup/crm/aplicar";
 import { CLICKUP_CRM_BATCH_SIZE } from "@/lib/clickup/crm/contrato";
 import {
@@ -20,6 +21,16 @@ export interface ClickUpCrmWorkerResult {
   validated: number;
   conflicts: number;
   failed: number;
+}
+
+export function applyClickUpCrmWorkerItem(
+  db: SupabaseClient,
+  run: Record<string, unknown>,
+  item: Record<string, unknown>,
+) {
+  return item.entity_type === "comment"
+    ? applyClickUpCommentItem(db, run, item)
+    : applyClickUpCrmItem(db, run, item);
 }
 
 export async function runClickUpCrmWorker(
@@ -57,7 +68,7 @@ export async function runClickUpCrmWorker(
     const itemAlive = await heartbeatClickUpItem(db, itemId, claimToken);
     if (!itemAlive) break;
     try {
-      const outcome = await applyClickUpCrmItem(db, run, item);
+      const outcome = await applyClickUpCrmWorkerItem(db, run, item);
       const resultKind = outcome === "succeeded" ? "created" : outcome;
       if (
         !(await markClickUpItemResult(db, {

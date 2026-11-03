@@ -8,10 +8,7 @@
 
 import { createAdminClient } from "@/lib/supabase/admin";
 import { agenteAtende } from "@/lib/ai/agents/no-ar";
-import {
-  art15DoControlador,
-  type Art15DoControlador,
-} from "@/lib/legal/art15";
+import { art15DoControlador, type Art15DoControlador } from "@/lib/legal/art15";
 import {
   citacaoDaLei,
   PAIS_PADRAO,
@@ -20,8 +17,13 @@ import {
   type PerfilDoPais,
 } from "@/lib/legal/perfil-do-pais";
 import { logger } from "@/lib/logger";
+import { filtroDeTarefasDoTitular } from "./task-scope";
 import { textoLegivelDeMencao } from "@/lib/notifications/mentions";
-import { camposLegiveis, perguntasDosGrafos, type CampoLegivel } from "@/lib/lgpd/campos-personalizados";
+import {
+  camposLegiveis,
+  perguntasDosGrafos,
+  type CampoLegivel,
+} from "@/lib/lgpd/campos-personalizados";
 import { maskPhone } from "@/lib/lgpd/mask";
 import { phoneLookupVariants } from "@/lib/channels/phone-variants";
 import type { Json } from "@/lib/database.types";
@@ -885,6 +887,21 @@ export interface ExportPayload {
     file_size: number;
     created_at: string;
   }>;
+  task_attachments?: Array<{
+    id: string;
+    task_id: string;
+    file_name: string;
+    mime_type: string;
+    file_size: number;
+    created_at: string;
+  }>;
+  task_comments?: Array<{
+    id: string;
+    task_id: string;
+    author_display_name: string;
+    body_markdown: string;
+    source_created_at: string;
+  }>;
   lead_notes?: Array<{
     id: string;
     headline: string | null;
@@ -1155,7 +1172,8 @@ export async function collectExportData(args: CollectArgs): Promise<ExportPayloa
   // Sai em todo país (`corpoDaCopiaCompleta`, doc 110, 2A).
   const secoes_no_limite: string[] = [];
   const conferirTeto = (secao: string, linhas: readonly unknown[] | null, teto: number) => {
-    if ((linhas?.length ?? 0) >= teto && !secoes_no_limite.includes(secao)) secoes_no_limite.push(secao);
+    if ((linhas?.length ?? 0) >= teto && !secoes_no_limite.includes(secao))
+      secoes_no_limite.push(secao);
   };
 
   // Contact snapshot (PII intentionally retained — this report is the data
@@ -1179,7 +1197,9 @@ export async function collectExportData(args: CollectArgs): Promise<ExportPayloa
     }
     if (data) {
       const customFields =
-        data.custom_fields && typeof data.custom_fields === "object" && !Array.isArray(data.custom_fields)
+        data.custom_fields &&
+        typeof data.custom_fields === "object" &&
+        !Array.isArray(data.custom_fields)
           ? (data.custom_fields as Record<string, unknown>)
           : {};
       // Os rótulos vêm das perguntas dos roteiros que o contato percorreu. Duas
@@ -1194,7 +1214,9 @@ export async function collectExportData(args: CollectArgs): Promise<ExportPayloa
         .order("started_at", { ascending: false })
         .limit(50);
       const versaoIds = [
-        ...new Set((inscricoes ?? []).flatMap((r) => (r.version_id ? [r.version_id as string] : []))),
+        ...new Set(
+          (inscricoes ?? []).flatMap((r) => (r.version_id ? [r.version_id as string] : [])),
+        ),
       ];
       if (versaoIds.length > 0 && !inscricoesErr) {
         const { data: versoes, error: versoesErr } = await admin
@@ -1203,7 +1225,10 @@ export async function collectExportData(args: CollectArgs): Promise<ExportPayloa
           .eq("organization_id", organizationId)
           .in("id", versaoIds);
         if (versoesErr) {
-          logger.warn("[lgpd-export-worker] roteiros load failed", { request_id: requestId, error: versoesErr.message });
+          logger.warn("[lgpd-export-worker] roteiros load failed", {
+            request_id: requestId,
+            error: versoesErr.message,
+          });
         }
         const porId = new Map((versoes ?? []).map((v) => [v.id as string, v.graph]));
         for (const id of versaoIds) grafos.push(porId.get(id)); // o mais recente primeiro
@@ -1377,7 +1402,9 @@ export async function collectExportData(args: CollectArgs): Promise<ExportPayloa
 
     const { data, error } = await admin
       .from("messages")
-      .select("id, conversation_id, direction, type, status, body, media_url, media_derived_text, sent_at, created_at")
+      .select(
+        "id, conversation_id, direction, type, status, body, media_url, media_derived_text, sent_at, created_at",
+      )
       .eq("organization_id", organizationId)
       .eq("contact_id", contactId)
       .order("created_at", { ascending: false })
@@ -1748,7 +1775,11 @@ export async function collectExportData(args: CollectArgs): Promise<ExportPayloa
       .from("import_rows")
       .select("id, batch_id, row_number, status, raw_data, normalized_data, error, created_at")
       .eq("organization_id", organizationId)
-      .or(personId ? `contact_id.eq.${contactId},person_id.eq.${personId}` : `contact_id.eq.${contactId}`)
+      .or(
+        personId
+          ? `contact_id.eq.${contactId},person_id.eq.${personId}`
+          : `contact_id.eq.${contactId}`,
+      )
       .order("created_at", { ascending: false })
       .limit(500);
     if (eL) throw eL;
@@ -1765,11 +1796,12 @@ export async function collectExportData(args: CollectArgs): Promise<ExportPayloa
   // pedido de acesso tem de entregá-lo.
   let tasks: TaskRow[] = [];
   if (contactId) {
+    const filtroDasTarefas = filtroDeTarefasDoTitular(contactId, leadIds);
     const { data, error } = await admin
       .from("crm_tasks")
       .select("id, title, description, due_date, status, priority")
       .eq("organization_id", organizationId)
-      .eq("contact_id", contactId)
+      .or(filtroDasTarefas)
       .order("due_date", { ascending: false })
       .limit(500);
     if (error) {
@@ -1780,6 +1812,43 @@ export async function collectExportData(args: CollectArgs): Promise<ExportPayloa
     } else if (data) {
       conferirTeto("tasks", data, 500);
       tasks = data;
+    }
+  }
+  let task_attachments: NonNullable<ExportPayload["task_attachments"]> = [];
+  let task_comments: NonNullable<ExportPayload["task_comments"]> = [];
+  if (tasks.length > 0) {
+    const taskIds = tasks.map((task) => task.id);
+    const { data: attachments, error: attachmentsError } = await admin
+      .from("crm_task_attachments")
+      .select("id,task_id,file_name,mime_type,file_size,created_at")
+      .eq("organization_id", organizationId)
+      .in("task_id", taskIds)
+      .order("created_at", { ascending: true })
+      .limit(500);
+    if (attachmentsError) {
+      logger.warn("[lgpd-export-worker] task attachments load failed", {
+        request_id: requestId,
+        error: attachmentsError.message,
+      });
+    } else {
+      conferirTeto("task_attachments", attachments, 500);
+      task_attachments = attachments ?? [];
+    }
+    const { data: comments, error: commentsError } = await admin
+      .from("crm_task_comments")
+      .select("id,task_id,author_display_name,body_markdown,source_created_at")
+      .eq("organization_id", organizationId)
+      .in("task_id", taskIds)
+      .order("source_created_at", { ascending: true })
+      .limit(500);
+    if (commentsError) {
+      logger.warn("[lgpd-export-worker] task comments load failed", {
+        request_id: requestId,
+        error: commentsError.message,
+      });
+    } else {
+      conferirTeto("task_comments", comments, 500);
+      task_comments = comments ?? [];
     }
   }
 
@@ -1904,7 +1973,9 @@ export async function collectExportData(args: CollectArgs): Promise<ExportPayloa
     if (!busca) continue;
     const { data, error } = await admin
       .from("messages")
-      .select("id, conversation_id, direction, type, status, body, media_url, media_derived_text, sent_at, created_at")
+      .select(
+        "id, conversation_id, direction, type, status, body, media_url, media_derived_text, sent_at, created_at",
+      )
       .eq("organization_id", organizationId)
       .in(busca.campo, busca.valores)
       .order("created_at", { ascending: false })
@@ -1932,7 +2003,9 @@ export async function collectExportData(args: CollectArgs): Promise<ExportPayloa
       });
     }
   }
-  const group_messages_authored = [...porId.values()].sort((a, b) => b.created_at.localeCompare(a.created_at));
+  const group_messages_authored = [...porId.values()].sort((a, b) =>
+    b.created_at.localeCompare(a.created_at),
+  );
 
   // Captação por webhook — a MESMA classe do bloco acima, achada pelo gate.
   let webhook_captures: CaptureRow[] = [];
@@ -2085,10 +2158,7 @@ export async function collectExportData(args: CollectArgs): Promise<ExportPayloa
     // parâmetro: `tests/unit/lgpd-exporta-o-que-redige.test.ts` só reconhece a
     // tabela exportada pelo literal, e um `.from(tabela)` a deixava invisível.
     const lePaginado = async (
-      pagina: (
-        de: number,
-        ate: number,
-      ) => PromiseLike<{ data: unknown[] | null; error: unknown }>,
+      pagina: (de: number, ate: number) => PromiseLike<{ data: unknown[] | null; error: unknown }>,
     ): Promise<Record<string, unknown>[]> => {
       const linhas: Record<string, unknown>[] = [];
       for (let offset = 0; ; offset += 500) {
@@ -2270,7 +2340,9 @@ export async function collectExportData(args: CollectArgs): Promise<ExportPayloa
         // UM literal, sem concatenação: o supabase-js lê a lista de colunas do
         // TIPO da string para inferir a linha, e `"a" + "b"` vira `string` —
         // a linha volta como `GenericStringError` e o `push` não compila.
-        .select("id, conversation_id, caso_id, motor, origem, motivo_codigo, title, body, notes, content, tentativas, cliente_avisado, aviso_motivo_codigo, criado_em, reconhecido_em")
+        .select(
+          "id, conversation_id, caso_id, motor, origem, motivo_codigo, title, body, notes, content, tentativas, cliente_avisado, aviso_motivo_codigo, criado_em, reconhecido_em",
+        )
         .eq("organization_id", organizationId)
         .eq("contact_id", contactId)
         .order("id")
@@ -2317,7 +2389,9 @@ export async function collectExportData(args: CollectArgs): Promise<ExportPayloa
           // Literal, sem concatenação: o supabase-js lê as colunas do TIPO da
           // string para inferir a linha, e string montada volta como
           // `GenericStringError` e não compila (mesma pegadinha logo acima).
-          .select("id, conversation_id, body, media_storage_path, media_mime, media_size_bytes, created_at, created_by_name")
+          .select(
+            "id, conversation_id, body, media_storage_path, media_mime, media_size_bytes, created_at, created_by_name",
+          )
           .eq("organization_id", organizationId)
           .in("conversation_id", conversationIds.slice(batch, batch + refBatchSize))
           .order("id")
@@ -2325,7 +2399,9 @@ export async function collectExportData(args: CollectArgs): Promise<ExportPayloa
         if (error) throw error;
         // Corpo legível: o token de menção (#2372) leva o UUID do atendente,
         // que não é dado do titular.
-        conversation_notes.push(...(data ?? []).map((n) => ({ ...n, body: textoLegivelDeMencao(n.body) })));
+        conversation_notes.push(
+          ...(data ?? []).map((n) => ({ ...n, body: textoLegivelDeMencao(n.body) })),
+        );
         if (!data || data.length < pageSize) break;
       }
     }
@@ -2501,6 +2577,8 @@ export async function collectExportData(args: CollectArgs): Promise<ExportPayloa
     conversation_notes,
     contact_field_proposals,
     lead_attachments,
+    task_attachments,
+    task_comments,
     lead_notes,
     ai_agent_runs,
     lead_state,
@@ -2567,8 +2645,7 @@ async function descreveDecisoesAutomatizadas(
   if (noAr.length === 0) {
     return "Não há assistente de IA a responder às suas mensagens nesta organização.";
   }
-  const nomes = (modo: string) =>
-    noAr.filter((a) => a.operation_mode === modo).map((a) => a.name);
+  const nomes = (modo: string) => noAr.filter((a) => a.operation_mode === modo).map((a) => a.name);
   const automaticos = nomes("automatic");
   const assistidos = nomes("assisted");
   const frases: string[] = [];

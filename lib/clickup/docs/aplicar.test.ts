@@ -5,9 +5,19 @@ import { aplicarDocClickUp } from "./aplicar";
 import type { PortaKnowledgeClickUp } from "./ingestao";
 
 function banco() {
-  const upsert = vi.fn(async () => ({ error: null }));
+  let pageRows: Array<Record<string, unknown>> = [];
+  const upsert = vi.fn(async (value: unknown) => {
+    if (Array.isArray(value)) pageRows = value;
+    return { error: null };
+  });
+  const query = {
+    upsert,
+    select: vi.fn(() => query),
+    eq: vi.fn(() => query),
+    in: vi.fn(async () => ({ data: pageRows, error: null })),
+  };
   return {
-    db: { from: vi.fn(() => ({ upsert })) } as unknown as SupabaseClient,
+    db: { from: vi.fn(() => query) } as unknown as SupabaseClient,
     upsert,
   };
 }
@@ -35,7 +45,7 @@ const item = {
   external_id: "doc",
   source_hash: "hash",
   source_payload: { format: "markdown", content: "# Conteúdo" },
-  source_metadata: { name: "Manual", attachment_manifest: [] },
+  source_metadata: { name: "Manual", attachment_manifest: [], page_ids: ["page-2", "page-1"] },
 };
 
 describe("aplicação do item Doc", () => {
@@ -54,6 +64,16 @@ describe("aplicação do item Doc", () => {
         knowledge_source_id: expect.any(String),
       }),
       { onConflict: "organization_id,workspace_id,entity_type,external_id" },
+    );
+    expect(upsert).toHaveBeenCalledWith(
+      [
+        expect.objectContaining({ entity_type: "doc_page", external_id: "page-1" }),
+        expect.objectContaining({ entity_type: "doc_page", external_id: "page-2" }),
+      ],
+      {
+        onConflict: "organization_id,workspace_id,entity_type,external_id",
+        ignoreDuplicates: true,
+      },
     );
   });
 

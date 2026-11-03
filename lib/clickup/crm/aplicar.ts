@@ -246,28 +246,7 @@ async function aplicarLista(
     parent_id: areaId,
     position: 1000,
   });
-  const importedFields = allMappings
-    .filter((candidate) => candidate.pipeline_key === mapping.pipeline_key)
-    .flatMap((candidate) => candidate.fields)
-    .filter((field) => field.action !== "ignore")
-    .filter(
-      (field, index, all) =>
-        all.findIndex((candidate) => candidate.field_id === field.field_id) === index,
-    );
-  const fields = importedFields.map((field) => ({
-    key: clickupCustomFieldKey(field.field_id),
-    label: field.label,
-    type: field.action === "text" ? "text" : fieldType(field.target_type ?? "text"),
-    required: false,
-    ...(field.target_type === "dropdown" || field.target_type === "labels"
-      ? {
-          options: (field.options ?? []).map((option) => ({
-            value: option.id,
-            label: option.label,
-          })),
-        }
-      : {}),
-  }));
+  const fields = buildClickUpPipelineFields(allMappings, mapping.pipeline_key!);
   await upsert(db, "crm_pipelines", {
     id: pipelineId,
     organization_id: org,
@@ -297,6 +276,43 @@ async function aplicarLista(
     await receipt(db, run, item, "list", String(item.external_id), { pipeline_id: pipelineId });
   }
   return "succeeded" as const;
+}
+
+export function buildClickUpPipelineFields(
+  allMappings: ClickUpCrmListMapping[],
+  pipelineKey: string,
+) {
+  const importedFields = allMappings
+    .filter((candidate) => candidate.pipeline_key === pipelineKey)
+    .flatMap((candidate) => candidate.fields)
+    .filter((field) => field.action !== "ignore")
+    .filter(
+      (field, index, all) =>
+        all.findIndex((candidate) => candidate.field_id === field.field_id) === index,
+    );
+  const fields = importedFields.map((field) => ({
+    key: clickupCustomFieldKey(field.field_id),
+    label: field.label,
+    type: field.action === "text" ? "text" : fieldType(field.target_type ?? "text"),
+    required: false,
+    ...(field.target_type === "dropdown" || field.target_type === "labels"
+      ? {
+          options: (field.options ?? []).map((option) => ({
+            value: option.id,
+            label: option.label,
+          })),
+        }
+      : {}),
+  }));
+  if (fields.length < 50) {
+    fields.push({
+      key: "Anexos_ClickUp",
+      label: "Anexos ClickUp",
+      type: "file",
+      required: false,
+    });
+  }
+  return fields;
 }
 
 async function aplicarBinding(

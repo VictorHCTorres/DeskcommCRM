@@ -27,6 +27,8 @@ import {
   UserCircle,
 } from "@/lib/ui/icons";
 import { cn } from "@/lib/utils";
+import { ComentariosImportados } from "./ComentariosImportados";
+import { AssetsImportados } from "./AssetsImportados";
 
 interface Props {
   tarefas: Tarefa[];
@@ -168,6 +170,8 @@ function Linha({
             </Link>
           ) : null}
         </div>
+        <ComentariosImportados taskId={tarefa.id} />
+        <AssetsImportados taskId={tarefa.id} />
       </div>
 
       {podeEditar ? (

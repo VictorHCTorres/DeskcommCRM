@@ -28,6 +28,7 @@ const {
   redirectMock,
   notFoundMock,
   lerMock,
+  assetsMock,
 } = vi.hoisted(() => ({
   requireAuthMock: vi.fn(),
   resolveActiveOrgMock: vi.fn(),
@@ -35,6 +36,7 @@ const {
   redirectMock: vi.fn(),
   notFoundMock: vi.fn(),
   lerMock: vi.fn(),
+  assetsMock: vi.fn(),
 }));
 
 vi.mock("@/lib/auth/server", () => ({
@@ -49,6 +51,9 @@ vi.mock("next/link", () => ({
   ),
 }));
 vi.mock("@/lib/ai/knowledge/conteudo-do-material", () => ({ lerConteudoDoMaterial: lerMock }));
+vi.mock("@/lib/clickup/docs/assets-do-material", () => ({
+  listarAssetsDoMaterialClickUp: assetsMock,
+}));
 
 import MaterialPage from "./page";
 
@@ -88,6 +93,7 @@ beforeEach(() => {
   });
   resolveActiveOrgMock.mockResolvedValue({ orgId: ORG_ID, role: "manager" });
   lerMock.mockResolvedValue({ ok: true, material: MATERIAL_BASE });
+  assetsMock.mockResolvedValue([]);
 });
 
 describe("ler o material na tela (#3059)", () => {
@@ -123,6 +129,23 @@ describe("ler o material na tela (#3059)", () => {
     const resposta = html.indexOf("Resposta");
     expect(pergunta).toBeGreaterThan(-1);
     expect(resposta).toBeGreaterThan(pergunta);
+  });
+
+  it("mostra os assets históricos do ClickUp como somente leitura", async () => {
+    assetsMock.mockResolvedValue([
+      {
+        id: "a1",
+        file_name: "manual.pdf",
+        file_size: 1024,
+        mime_type: "application/pdf",
+        media_href: `/api/v1/ai/knowledge/sources/${FONTE}/attachments/a1/media`,
+      },
+    ]);
+    const html = await renderizar();
+    expect(html).toContain("Anexos importados do ClickUp");
+    expect(html).toContain("manual.pdf");
+    expect(html).toContain("somente leitura");
+    expect(html).toContain(`/api/v1/ai/knowledge/sources/${FONTE}/attachments/a1/media`);
   });
 
   it("papel abaixo de manager é mandado para /403, e a leitura nem acontece", async () => {

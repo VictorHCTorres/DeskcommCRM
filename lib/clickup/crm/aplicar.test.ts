@@ -4,6 +4,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 
 import {
   applyClickUpCrmItem,
+  buildClickUpPipelineFields,
   clickupDeterministicId,
   convertClickUpFieldValue,
   loadClickUpMemberDirectory,
@@ -12,6 +13,24 @@ import {
 } from "./aplicar";
 
 describe("aplicação CRM do ClickUp", () => {
+  it("preserva o teto de 50 campos sem forçar o campo reservado de anexos", () => {
+    const mapping = [
+      {
+        pipeline_key: "pipeline-50",
+        fields: Array.from({ length: 50 }, (_, index) => ({
+          field_id: `field-${index}`,
+          label: `Campo ${index}`,
+          source_type: "text",
+          action: "text",
+          target_type: "text",
+        })),
+      },
+    ] as Parameters<typeof buildClickUpPipelineFields>[0];
+    const fields = buildClickUpPipelineFields(mapping, "pipeline-50");
+    expect(fields).toHaveLength(50);
+    expect(fields.some((field) => field.key === "Anexos_ClickUp")).toBe(false);
+  });
+
   it("mantém identidade por external id, sem depender de nome ou rename", () => {
     const beforeRename = clickupDeterministicId("org", "clickup-pipeline", "pipeline-key-1");
     const afterRename = clickupDeterministicId("org", "clickup-pipeline", "pipeline-key-1");
@@ -165,6 +184,12 @@ describe("aplicação CRM do ClickUp", () => {
           { value: "opt-2", label: "Anúncio" },
         ],
       }),
+      {
+        key: "Anexos_ClickUp",
+        label: "Anexos ClickUp",
+        type: "file",
+        required: false,
+      },
     ]);
     expect(rows.has("event_log")).toBe(false);
     expect(rows.has("capi_events")).toBe(false);

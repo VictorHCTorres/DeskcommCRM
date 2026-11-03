@@ -1429,6 +1429,8 @@ export const AUDIT_ACTIONS = [
   "clickup.import_queued",
   "clickup.import_retried",
   "clickup.import_cancelled",
+  "clickup.asset_upload_prepared",
+  "clickup.assets_staged",
 ] as const;
 
 /** Um código de auditoria. Derivado de `AUDIT_ACTIONS` — não redigite a lista. */

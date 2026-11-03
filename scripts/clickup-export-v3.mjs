@@ -215,8 +215,10 @@ export async function exportarClickUpV3(opcoes, deps = {}) {
     );
     const secoes = [];
     const anexos = [];
+    const pageIds = [];
     for (const resumo of achatarPaginas(estrutura)) {
       const pageId = texto(resumo.id ?? resumo.page_id);
+      pageIds.push(pageId);
       const pagina = registro(
         await requisitar(
           fetchImpl,
@@ -260,6 +262,7 @@ export async function exportarClickUpV3(opcoes, deps = {}) {
         private: doc.private,
         private_scope_explicit: doc.private && opcoes.includePrivate,
         content_sha256: hash(content),
+        page_ids: [...new Set(pageIds)].sort(),
         attachment_manifest: anexos.sort(
           (a, b) => a.page_id.localeCompare(b.page_id) || a.id.localeCompare(b.id),
         ),

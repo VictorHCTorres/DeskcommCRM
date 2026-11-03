@@ -138,6 +138,7 @@ describe("exportador ClickUp v3", () => {
     expect(resultado.manifest.objects[0]?.metadata).toMatchObject({
       attachment_import_status: "skipped_not_imported",
       attachments_skipped_count: 1,
+      page_ids: ["p1"],
       attachment_manifest: [expect.objectContaining({ import_status: "skipped_not_imported" })],
     });
   });

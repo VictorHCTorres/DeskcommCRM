@@ -8,6 +8,7 @@ import { traduzir } from "@/lib/i18n/dicionario";
 import { lerConteudoDoMaterial } from "@/lib/ai/knowledge/conteudo-do-material";
 import { TIPO_DE_FONTE_POR_ID } from "@/lib/ai/rag/tipos-de-fonte";
 import { createClient } from "@/lib/supabase/server";
+import { listarAssetsDoMaterialClickUp } from "@/lib/clickup/docs/assets-do-material";
 
 export const dynamic = "force-dynamic";
 
@@ -61,6 +62,10 @@ export default async function MaterialPage({ params }: { params: Promise<{ id: s
 
   const material = leitura.material;
   const meta = TIPO_DE_FONTE_POR_ID.get(material.tipo);
+  const assets = await listarAssetsDoMaterialClickUp(supabase, {
+    organizationId: activeOrg.orgId,
+    sourceId,
+  }).catch(() => []);
 
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-6 p-6">
@@ -127,6 +132,38 @@ export default async function MaterialPage({ params }: { params: Promise<{ id: s
           </p>
         ) : null}
       </div>
+
+      {assets.length > 0 ? (
+        <section className="space-y-3" aria-labelledby="assets-clickup-title">
+          <div>
+            <h2 id="assets-clickup-title" className="text-lg font-semibold">
+              {t("Anexos importados do ClickUp")}
+            </h2>
+            <p className="text-xs text-text-muted">
+              {t("Arquivos históricos vinculados ao material — somente leitura.")}
+            </p>
+          </div>
+          <ul className="divide-y rounded-lg border border-border bg-surface">
+            {assets.map((asset) => (
+              <li key={asset.id} className="flex items-center justify-between gap-4 p-3 text-sm">
+                <a
+                  href={asset.media_href}
+                  className="min-w-0 truncate underline-offset-2 hover:underline focus-visible:underline"
+                >
+                  {asset.file_name}
+                </a>
+                <span className="shrink-0 text-xs text-text-muted">
+                  {new Intl.NumberFormat(user.idioma, {
+                    style: "unit",
+                    unit: "byte",
+                    unitDisplay: "narrow",
+                  }).format(asset.file_size)}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
     </div>
   );
 }
