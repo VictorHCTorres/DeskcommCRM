@@ -210,6 +210,12 @@ const SITES: { arquivo: string; fronteira: string; papel?: "gerador" | "validado
   // do nome nem da URL) e o `org`/`produto` são uuids já resolvidos. Nenhum
   // texto da planilha entra na chave — a URL do cliente só escolhe o conteúdo.
   { arquivo: "lib/catalogo/fotos-por-url.ts", fronteira: "storage.chave-de-objeto" },
+  // Importação ClickUp: os anexos usam caminhos derivados de UUIDs da organização,
+  // execução e item; nome e extensão já passaram pela validação do sidecar.
+  { arquivo: "lib/clickup/assets/aplicar.ts", fronteira: "storage.chave-de-objeto" },
+  // Documentos ClickUp: a porta recebe o caminho validado pelo contrato de importação
+  // e só o entrega ao Storage com `upsert: false`.
+  { arquivo: "lib/clickup/docs/porta-supabase.ts", fronteira: "storage.chave-de-objeto" },
   // Chave de idempotência: os geradores (manda UUID) e os validadores (exige UUID).
   { arquivo: "app/onboarding/connect-whatsapp/_client.tsx", fronteira: "api.idempotency-key", papel: "gerador" },
   { arquivo: "components/extensions/ExtensionsManager.tsx", fronteira: "api.idempotency-key", papel: "gerador" },
@@ -217,6 +223,12 @@ const SITES: { arquivo: string; fronteira: string; papel?: "gerador" | "validado
   { arquivo: "hooks/ai/useSkills.ts", fronteira: "api.idempotency-key", papel: "gerador" },
   { arquivo: "hooks/contacts/useImportContacts.ts", fronteira: "api.idempotency-key", papel: "gerador" },
   { arquivo: "hooks/contacts/useSyncPhoneContacts.ts", fronteira: "api.idempotency-key", papel: "gerador" },
+  { arquivo: "hooks/clickup/useClickUpDocsImport.ts", fronteira: "api.idempotency-key", papel: "gerador" },
+  {
+    arquivo: "app/app/settings/tenant/pipelines/_clickup-import.tsx",
+    fronteira: "api.idempotency-key",
+    papel: "gerador",
+  },
   { arquivo: "lib/api/client.ts", fronteira: "api.idempotency-key", papel: "gerador" },
   { arquivo: "lib/api/idempotency.ts", fronteira: "api.idempotency-key", papel: "validador" },
   { arquivo: "lib/extensions/http.ts", fronteira: "api.idempotency-key", papel: "validador" },
