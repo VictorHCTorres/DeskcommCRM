@@ -137,11 +137,39 @@ export async function resolveClickUpTaskAncestry(
   throw new Error("clickup_parent_chain_too_deep");
 }
 
-async function upsert(db: SupabaseClient, table: string, value: Row) {
+async function upsertPipelineGroup(db: SupabaseClient, value: Row) {
   const { error } = await db
-    .from(table)
+    .from("crm_pipeline_groups")
     .upsert(value, { onConflict: "id", ignoreDuplicates: true });
-  if (error) throw new Error(`${table}: ${error.message}`);
+  if (error) throw new Error(`crm_pipeline_groups: ${error.message}`);
+}
+
+async function upsertPipeline(db: SupabaseClient, value: Row) {
+  const { error } = await db
+    .from("crm_pipelines")
+    .upsert(value, { onConflict: "id", ignoreDuplicates: true });
+  if (error) throw new Error(`crm_pipelines: ${error.message}`);
+}
+
+async function upsertStage(db: SupabaseClient, value: Row) {
+  const { error } = await db
+    .from("crm_stages")
+    .upsert(value, { onConflict: "id", ignoreDuplicates: true });
+  if (error) throw new Error(`crm_stages: ${error.message}`);
+}
+
+async function upsertTask(db: SupabaseClient, value: Row) {
+  const { error } = await db
+    .from("crm_tasks")
+    .upsert(value, { onConflict: "id", ignoreDuplicates: true });
+  if (error) throw new Error(`crm_tasks: ${error.message}`);
+}
+
+async function upsertLead(db: SupabaseClient, value: Row) {
+  const { error } = await db
+    .from("crm_leads")
+    .upsert(value, { onConflict: "id", ignoreDuplicates: true });
+  if (error) throw new Error(`crm_leads: ${error.message}`);
 }
 
 async function receipt(
@@ -239,14 +267,14 @@ async function aplicarLista(
     mapping.folder_id ?? `__root__:${mapping.space_id}`,
   );
   const pipelineId = clickupDeterministicId(org, "clickup-pipeline", mapping.pipeline_key!);
-  await upsert(db, "crm_pipeline_groups", {
+  await upsertPipelineGroup(db, {
     id: areaId,
     organization_id: org,
     name: mapping.area_name,
     kind: "area",
     position: 1000,
   });
-  await upsert(db, "crm_pipeline_groups", {
+  await upsertPipelineGroup(db, {
     id: groupId,
     organization_id: org,
     name: mapping.group_name,
@@ -255,7 +283,7 @@ async function aplicarLista(
     position: 1000,
   });
   const fields = buildClickUpPipelineFields(allMappings, mapping.pipeline_key!);
-  await upsert(db, "crm_pipelines", {
+  await upsertPipeline(db, {
     id: pipelineId,
     organization_id: org,
     group_id: groupId,
@@ -265,7 +293,7 @@ async function aplicarLista(
     settings: { fields, canonical_tags: [], lost_reasons: ["Importado do ClickUp"] },
   });
   for (const [position, status] of mapping.statuses.entries()) {
-    await upsert(db, "crm_stages", {
+    await upsertStage(db, {
       id: clickupDeterministicId(org, "clickup-stage", mapping.pipeline_key!, status.status_id),
       organization_id: org,
       pipeline_id: pipelineId,
@@ -417,7 +445,7 @@ async function aplicarTask(
         .maybeSingle();
       if (!parent) throw new Error("clickup_parent_task_not_applied");
     }
-    await upsert(db, "crm_tasks", {
+    await upsertTask(db, {
       id: taskId,
       organization_id: org,
       parent_task_id: parentTaskId,
@@ -484,7 +512,7 @@ async function aplicarTask(
         .maybeSingle();
       if (!parentTask) throw new Error("clickup_parent_task_not_applied");
     }
-    await upsert(db, "crm_tasks", {
+    await upsertTask(db, {
       id: taskId,
       organization_id: org,
       lead_id: leadId,
@@ -538,7 +566,7 @@ async function aplicarTask(
       )
     : {};
   const leadId = clickupDeterministicId(org, "clickup-lead", externalId);
-  await upsert(db, "crm_leads", {
+  await upsertLead(db, {
     id: leadId,
     organization_id: org,
     pipeline_id: pipelineId,
