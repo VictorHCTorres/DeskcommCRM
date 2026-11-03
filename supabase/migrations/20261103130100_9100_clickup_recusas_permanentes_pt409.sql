@@ -521,3 +521,18 @@ begin
   return jsonb_build_object('result','promoted','attachment_id',p_attachment_row_id);
 end;
 $$;
+
+-- CREATE OR REPLACE preserva grants atuais, mas a migration repete a cerca
+-- explicitamente para não depender de proteção implícita da cadeia anterior.
+revoke execute on function public.fn_execute_clickup_import_run(uuid,uuid,integer,text,text,boolean)
+  from public, anon, authenticated;
+revoke execute on function public.fn_update_clickup_import_mapping(uuid,uuid,integer,jsonb,text)
+  from public, anon, authenticated;
+revoke execute on function public.fn_apply_clickup_lead_comment(uuid,text,text,uuid,text,timestamptz,timestamptz,text,text,text,text)
+  from public, anon, authenticated;
+revoke execute on function public.fn_apply_clickup_task_comment(uuid,text,text,uuid,text,text,text,text,text,timestamptz,timestamptz)
+  from public, anon, authenticated;
+revoke execute on function public.fn_stage_clickup_asset_sidecar(uuid,uuid,uuid,jsonb)
+  from public, anon, authenticated;
+revoke execute on function public.fn_commit_clickup_asset(uuid,uuid,uuid,text,uuid,uuid,text,bigint,text)
+  from public, anon, authenticated;

@@ -74909,6 +74909,21 @@ grant execute on function public.fn_stage_clickup_import_preview(
   uuid, uuid, text, text, text, integer, text, text, uuid, jsonb
 ) to service_role;
 
+-- Espelho da cerca explícita da migration 9100. CREATE OR REPLACE preserva ACLs,
+-- mas estas revogações deixam instalação nova e atualização com a mesma prova.
+revoke execute on function public.fn_execute_clickup_import_run(uuid,uuid,integer,text,text,boolean)
+  from public, anon, authenticated;
+revoke execute on function public.fn_update_clickup_import_mapping(uuid,uuid,integer,jsonb,text)
+  from public, anon, authenticated;
+revoke execute on function public.fn_apply_clickup_lead_comment(uuid,text,text,uuid,text,timestamptz,timestamptz,text,text,text,text)
+  from public, anon, authenticated;
+revoke execute on function public.fn_apply_clickup_task_comment(uuid,text,text,uuid,text,text,text,text,text,timestamptz,timestamptz)
+  from public, anon, authenticated;
+revoke execute on function public.fn_stage_clickup_asset_sidecar(uuid,uuid,uuid,jsonb)
+  from public, anon, authenticated;
+revoke execute on function public.fn_commit_clickup_asset(uuid,uuid,uuid,text,uuid,uuid,text,bigint,text)
+  from public, anon, authenticated;
+
 -- ---- VARREDURA anon: função nova nasce exposta em quem ATUALIZA (migration 0116) ----
 --
 -- ⚠️ DE PROPÓSITO, NENHUMA FUNÇÃO É CRIADA DEPOIS DESTE BLOCO. Apêndice que cria
