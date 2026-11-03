@@ -9,6 +9,7 @@ import {
 } from "@/lib/api/idempotency";
 import { audit } from "@/lib/audit";
 import { requireRole } from "@/lib/auth/require-role";
+import { escreveComoPlatformAdmin } from "@/lib/auth/types";
 import { clickupRunIdSchema } from "@/lib/clickup/contrato";
 import {
   assertCompleteClickUpFullCoverage,
@@ -117,7 +118,7 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
         if (
           sidecar.assets.some((asset) => asset.parent_type === "doc_page") &&
           authz.org.role !== "admin" &&
-          !authz.user.is_platform_admin
+          !escreveComoPlatformAdmin(authz.user)
         ) {
           throw new Error("clickup_docs_asset_admin_consent_required");
         }
@@ -149,12 +150,13 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
     if (outcome.tipo === "em_curso")
       return fail("idempotency_in_progress", "Sidecar em processamento.", 409, { requestId });
     if (outcome.tipo === "executou") {
+      const sidecarId = outcome.resposta.sidecar_id;
       void audit({
         action: "clickup.assets_staged",
         actorUserId: authz.user.id,
         organizationId: authz.org.orgId,
         resourceType: "clickup_asset_sidecar",
-        resourceId: String(outcome.resposta.sidecar_id),
+        resourceId: sidecarId,
         requestId,
         bypassedRls: true,
         metadata: { run_id: runId.data },

@@ -28,12 +28,13 @@ export async function POST(_request: Request, context: RouteContext): Promise<Re
   if (!runId.success) return fail("validation_failed", "Importação inválida.", 422, { requestId });
   try {
     const data = await retryClickUpRun(createAdminClient(), authz.org.orgId, runId.data);
+    const importRunId = runId.data;
     void audit({
       action: "clickup.import_retried",
       actorUserId: authz.user.id,
       organizationId: authz.org.orgId,
       resourceType: "clickup_import_run",
-      resourceId: runId.data,
+      resourceId: importRunId,
       requestId,
       bypassedRls: true,
       metadata: { attempt: data.attempt },

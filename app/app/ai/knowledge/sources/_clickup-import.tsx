@@ -15,6 +15,7 @@ import {
 } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import { useClickUpDocsExecute, useClickUpDocsPreview } from "@/hooks/clickup/useClickUpDocsImport";
+import { useT } from "@/hooks/i18n/useT";
 
 function registro(valor: unknown): Record<string, unknown> {
   return valor && typeof valor === "object" && !Array.isArray(valor)
@@ -23,6 +24,7 @@ function registro(valor: unknown): Record<string, unknown> {
 }
 
 export function ImportarClickUpDocs({ podeImportarPrivados }: { podeImportarPrivados: boolean }) {
+  const t = useT();
   const [aberto, setAberto] = useState(false);
   const [manifest, setManifest] = useState<Record<string, unknown> | null>(null);
   const [temPrivados, setTemPrivados] = useState(false);
@@ -64,18 +66,19 @@ export function ImportarClickUpDocs({ podeImportarPrivados }: { podeImportarPriv
       <DialogTrigger asChild>
         <Button variant="outline">
           <Upload className="mr-2 h-4 w-4" aria-hidden />
-          Importar ClickUp
+          {t("Importar ClickUp")}
         </Button>
       </DialogTrigger>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Importar Docs do ClickUp</DialogTitle>
+          <DialogTitle>{t("Importar Docs do ClickUp")}</DialogTitle>
           <DialogDescription>
-            Selecione o manifesto v3 gerado pelo exportador. Primeiro mostramos a prévia; nada é
-            gravado no acervo antes da confirmação.
+            {t(
+              "Selecione o manifesto v3 gerado pelo exportador. Primeiro mostramos a prévia; nada é gravado no acervo antes da confirmação.",
+            )}
           </DialogDescription>
         </DialogHeader>
-        <Label htmlFor="clickup-docs-manifest">Manifesto JSON</Label>
+        <Label htmlFor="clickup-docs-manifest">{t("Manifesto JSON")}</Label>
         <input
           id="clickup-docs-manifest"
           type="file"
@@ -84,7 +87,11 @@ export function ImportarClickUpDocs({ podeImportarPrivados }: { podeImportarPriv
         />
         {temPrivados ? (
           <div className="rounded-md border border-warning/40 bg-warning/10 p-3 text-sm">
-            <p>Docs privados/restritos ficarão disponíveis no Knowledge para toda a organização.</p>
+            <p>
+              {t(
+                "Docs privados/restritos ficarão disponíveis no Knowledge para toda a organização.",
+              )}
+            </p>
             {podeImportarPrivados ? (
               <div className="mt-2 flex items-center gap-2">
                 <input
@@ -94,19 +101,19 @@ export function ImportarClickUpDocs({ podeImportarPrivados }: { podeImportarPriv
                   onChange={(event) => setConfirmouPrivados(event.target.checked)}
                   className="h-4 w-4"
                 />
-                <Label htmlFor="clickup-private-confirm">Confirmo a inclusão org-wide</Label>
+                <Label htmlFor="clickup-private-confirm">{t("Confirmo a inclusão org-wide")}</Label>
               </div>
             ) : (
               <p className="mt-2 font-medium">
-                Somente um administrador pode confirmar esta inclusão.
+                {t("Somente um administrador pode confirmar esta inclusão.")}
               </p>
             )}
           </div>
         ) : null}
         {preview.data ? (
           <p className="text-sm" role="status">
-            Inventário: {preview.data.total_items}. Aplicáveis: {preview.data.applicable_items}.
-            Avisos: {preview.data.warnings_count}.
+            {t("Inventário")}: {preview.data.total_items}. {t("Aplicáveis")}:{" "}
+            {preview.data.applicable_items}. {t("Avisos")}: {preview.data.warnings_count}.
           </p>
         ) : null}
         {(preview.error ?? execute.error) ? (
@@ -116,7 +123,7 @@ export function ImportarClickUpDocs({ podeImportarPrivados }: { podeImportarPriv
         ) : null}
         {execute.isSuccess ? (
           <p className="text-sm text-success" role="status">
-            Importação enfileirada. O acervo atualizará quando a indexação terminar.
+            {t("Importação enfileirada. O acervo atualizará quando a indexação terminar.")}
           </p>
         ) : null}
         <DialogFooter>
@@ -129,14 +136,14 @@ export function ImportarClickUpDocs({ podeImportarPrivados }: { podeImportarPriv
               }
               onClick={() => manifest && preview.mutate(manifestoConfirmado())}
             >
-              Ver prévia
+              {t("Ver prévia")}
             </Button>
           ) : (
             <Button
               disabled={execute.isPending || execute.isSuccess}
               onClick={() => execute.mutate(preview.data)}
             >
-              Confirmar importação
+              {t("Confirmar importação")}
             </Button>
           )}
         </DialogFooter>

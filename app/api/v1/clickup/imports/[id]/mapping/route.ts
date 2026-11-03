@@ -36,12 +36,13 @@ export async function PATCH(request: Request, context: RouteContext): Promise<Re
       expectedRevision: body.data.expected_revision,
       mapping: body.data.mapping,
     });
+    const importRunId = runId.data;
     void audit({
       action: "clickup.import_mapping_updated",
       actorUserId: authz.user.id,
       organizationId: authz.org.orgId,
       resourceType: "clickup_import_run",
-      resourceId: runId.data,
+      resourceId: importRunId,
       requestId,
       bypassedRls: true,
       metadata: {

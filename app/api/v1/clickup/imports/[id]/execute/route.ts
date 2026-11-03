@@ -134,12 +134,13 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
     }
     const data = outcome.resposta;
     if (outcome.tipo === "executou") {
+      const importRunId = runId.data;
       void audit({
         action: "clickup.import_queued",
         actorUserId: authz.user.id,
         organizationId: authz.org.orgId,
         resourceType: "clickup_import_run",
-        resourceId: runId.data,
+        resourceId: importRunId,
         requestId,
         bypassedRls: true,
         metadata: {

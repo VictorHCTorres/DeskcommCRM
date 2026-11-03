@@ -1,6 +1,7 @@
 "use client";
 
 import { useMutation } from "@tanstack/react-query";
+import { randomId } from "@/lib/random-id";
 
 interface PreviewClickUpDocs {
   id: string;
@@ -25,7 +26,7 @@ export function useClickUpDocsPreview() {
       resposta<PreviewClickUpDocs>(
         await fetch("/api/v1/clickup/imports/preview", {
           method: "POST",
-          headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() },
+          headers: { "Content-Type": "application/json", "Idempotency-Key": randomId() },
           body: JSON.stringify(manifest),
         }),
       ),
@@ -38,7 +39,7 @@ export function useClickUpDocsExecute() {
       resposta<{ id: string; status: string }>(
         await fetch(`/api/v1/clickup/imports/${preview.id}/execute`, {
           method: "POST",
-          headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() },
+          headers: { "Content-Type": "application/json", "Idempotency-Key": randomId() },
           body: JSON.stringify({
             dry_run: false,
             expected_preview_revision: preview.preview_revision,

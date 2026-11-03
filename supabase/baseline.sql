@@ -17039,15 +17039,9 @@ alter table public.ai_knowledge_sources
   add constraint ai_knowledge_sources_arquivada_nao_e_ativa
   check (not is_active or status <> 'archived');
 
--- Os dois estados que o produto JÁ produz e a tela não sabia mostrar.
--- Reconstruído em UM bloco só (lição do #159). Aditivo.
-alter table public.ai_knowledge_sources
-  drop constraint if exists ai_knowledge_sources_last_index_status_check;
-alter table public.ai_knowledge_sources
-  add constraint ai_knowledge_sources_last_index_status_check
-  check (last_index_status is null or last_index_status = any (array[
-    'success', 'partial', 'failed', 'indexando', 'sem_credencial'
-  ]));
+-- A versão final de `ai_knowledge_sources_last_index_status_check` vive no
+-- bloco ClickUp e inclui `indexing_pending`. Não reconstruir aqui um
+-- vocabulário intermediário durante update sobre acervo.
 
 alter table public.ai_knowledge_sources
   add column if not exists active_kb_version_id uuid;
@@ -60734,13 +60728,6 @@ begin
    end);
   alter table public.crm_lead_attachments
     drop constraint if exists crm_lead_attachments_storage_path_check;
-  alter table public.crm_lead_attachments
-    add constraint crm_lead_attachments_storage_path_check check (case
-      when field_key ~ '^[A-Za-z][A-Za-z0-9_]{0,39}$'
-        then storage_path ~ ('^' || organization_id::text || '/leads/' || lead_id::text || '/'
-                             || field_key || '/[A-Za-z0-9_-][A-Za-z0-9._-]*$')
-      else false
-    end);
 end $$;
 
 -- Depois de gravado, o caminho não muda (nenhuma rota o altera).
@@ -66741,83 +66728,6 @@ $$;
 REVOKE EXECUTE ON FUNCTION public.fn_can_view_lead(uuid,uuid), public.fn_can_view_conversation(uuid,uuid) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION public.fn_can_view_lead(uuid,uuid), public.fn_can_view_conversation(uuid,uuid) TO authenticated, service_role;
 
--- ---- VARREDURA anon: função nova nasce exposta em quem ATUALIZA (migration 0116) ----
---
--- ⚠️ DE PROPÓSITO, NENHUMA FUNÇÃO É CRIADA DEPOIS DESTE BLOCO. Apêndice que cria
--- função entra ANTES dele — quem o empurrar para o meio desarma a cura para tudo
--- que vier depois. (O último bloco do arquivo é a chamada das travas do suporte,
--- migration 0274, que não cria função.)
--- Vigiado por `tests/unit/varredura-anon-e-o-ultimo-bloco.test.ts`.
---
--- A 0108 revogou anon numa LISTA de 8 funções, medida num banco instalado do
--- ZERO. Quem ATUALIZA tem outro estado: o `ALTER DEFAULT PRIVILEGES ... GRANT
--- ALL ON FUNCTIONS TO anon` do corpo deste arquivo grava uma entrada em
--- `pg_default_acl` que fica no catálogo PARA SEMPRE, e a partir daí toda função
--- criada em `public` nasce com EXECUTE para anon — inclusive as deste apêndice.
---
--- Medido numa VPS real (2026-08-07), comparando com o que um install fresco
--- produz: 6 definer expostas a anon e 5 a authenticated, entre elas
--- `fn_decrypt_oauth` — alcançável pela anon key, que vai para o browser.
---
--- Lista conserta o estoque e reabre no próximo `create function`. Esta varredura
--- é auto-curativa e roda DEPOIS de tudo que cria função, então cura no mesmo run
--- em que o defeito nasceria. Desfazer o ALTER DEFAULT PRIVILEGES não serve: ele
--- vem do `pg_dump` do Supabase e é reescrito a cada re-aplicação.
---
--- As duas origens de EXECUTE (a mesma lição da 0108): grant DIRETO a anon, que
--- `revoke from public` não remove; e grant a PUBLIC, do qual anon HERDA, que
--- `revoke from anon` não remove. O privilégio EFETIVO de authenticated e
--- service_role é medido ANTES e devolvido depois — tira anon sem tirar leitura.
-do $$
-declare
-  f record;
-  tinha_auth boolean;
-  tinha_service boolean;
-begin
-  if to_regrole('anon') is null then
-    return;
-  end if;
-
-  for f in
-    select p.oid, p.oid::regprocedure as assinatura
-      from pg_proc p
-      join pg_namespace n on n.oid = p.pronamespace
-     where n.nspname = 'public'
-       and p.prosecdef
-  loop
-    tinha_auth := to_regrole('authenticated') is not null
-                  and has_function_privilege('authenticated', f.oid, 'EXECUTE');
-    tinha_service := to_regrole('service_role') is not null
-                     and has_function_privilege('service_role', f.oid, 'EXECUTE');
-
-    execute format('revoke execute on function %s from public, anon', f.assinatura);
-
-    if tinha_auth then
-      execute format('grant execute on function %s to authenticated', f.assinatura);
-    end if;
-    if tinha_service then
-      execute format('grant execute on function %s to service_role', f.assinatura);
-    end if;
-  end loop;
-end $$;
-
--- regra 2 (authenticated): as 5 que o update abriu e o install não abre. Aqui não
--- cabe varredura — `authenticated` PRECISA de EXECUTE nos helpers de RLS e em
--- `retrieve_top_k_chunks` (num install fresco ele tem). É julgamento por função,
--- e o alvo de cada linha é o valor que um install fresco produz, medido.
-revoke execute on function public.fn_audit_log_row() from authenticated;
-revoke execute on function public.fn_decrypt_oauth(bytea) from authenticated;
-revoke execute on function public.fn_encrypt_oauth(text) from authenticated;
-revoke execute on function public.fn_lgpd_cascade_redact_contact(uuid, uuid, uuid) from authenticated;
-revoke execute on function public.fn_update_budget_consumption() from authenticated;
-
-grant execute on function public.fn_audit_log_row() to service_role;
-grant execute on function public.fn_decrypt_oauth(bytea) to service_role;
-grant execute on function public.fn_encrypt_oauth(text) to service_role;
-grant execute on function public.fn_lgpd_cascade_redact_contact(uuid, uuid, uuid) to service_role;
-grant execute on function public.fn_update_budget_consumption() to service_role;
-
-
 -- ---- Criador provisório sai na entrega (migration 0237) ----
 -- As duas funções acima já saíram com a regra; aqui fica só a COLUNA, que é
 -- o dado que faltava. Idempotente. NÃO há expurgo retroativo, de propósito:
@@ -71232,31 +71142,7 @@ create policy crm_pipeline_groups_select on public.crm_pipeline_groups
 
 drop policy if exists crm_pipeline_groups_manager_write on public.crm_pipeline_groups;
 drop policy if exists crm_pipeline_groups_manager_insert on public.crm_pipeline_groups;
-create policy crm_pipeline_groups_manager_insert on public.crm_pipeline_groups
-  for insert with check (
-    public.fn_is_platform_admin()
-    or (
-      organization_id in (select public.fn_user_org_ids())
-      and public.fn_role_at_least(organization_id, 'manager')
-    )
-  );
-
 drop policy if exists crm_pipeline_groups_manager_update on public.crm_pipeline_groups;
-create policy crm_pipeline_groups_manager_update on public.crm_pipeline_groups
-  for update using (
-    public.fn_is_platform_admin()
-    or (
-      organization_id in (select public.fn_user_org_ids())
-      and public.fn_role_at_least(organization_id, 'manager')
-    )
-  )
-  with check (
-    public.fn_is_platform_admin()
-    or (
-      organization_id in (select public.fn_user_org_ids())
-      and public.fn_role_at_least(organization_id, 'manager')
-    )
-  );
 
 revoke all on table public.crm_pipeline_groups from public, anon, authenticated, service_role;
 grant select, insert, update on table public.crm_pipeline_groups to authenticated;
@@ -72419,7 +72305,7 @@ begin
      and mapping_revision = p_expected_mapping_revision
    returning * into run_row;
   if not found then
-    raise exception 'clickup_import_mapping_revision_conflict' using errcode = '40001';
+    raise exception 'clickup_import_mapping_revision_conflict' using errcode = 'PT409';
   end if;
   return run_row.id;
 end;
@@ -73012,7 +72898,7 @@ begin
      or run_row.preview_revision <> p_preview_revision
      or run_row.snapshot_hash is distinct from p_snapshot_hash
      or run_row.mapping_hash is distinct from p_mapping_hash then
-    raise exception 'clickup_import_run_revision_conflict' using errcode = '40001';
+    raise exception 'clickup_import_run_revision_conflict' using errcode = 'PT409';
   end if;
   if not p_dry_run and run_row.scope in ('crm', 'all') then
     if jsonb_typeof(run_row.mapping_config->'crm'->'lists') is distinct from 'array' then
@@ -73446,13 +73332,8 @@ on conflict (id) do update set public=false,file_size_limit=excluded.file_size_l
 -- entra em source_payload: ele fica no bucket privado e é referenciado por upload_id.
 alter table public.clickup_import_items
   drop constraint if exists clickup_import_items_entity_type_check;
-alter table public.clickup_import_items
-  add constraint clickup_import_items_entity_type_check check (
-    entity_type in (
-      'workspace','space','folder','list','task','doc','doc_page','user','status','custom_field',
-      'comment','attachment'
-    )
-  );
+-- A versão final, incluindo `task_relation`, vive no bloco 9098. Não
+-- reconstruir aqui um vocabulário intermediário durante update sobre acervo.
 
 alter table public.clickup_object_mappings
   drop constraint if exists clickup_object_mappings_entity_type_check;
@@ -73691,7 +73572,7 @@ begin
      and source_comment_id = p_comment_id for update;
   if found then
     if existing.source_hash <> p_source_hash then
-      raise exception 'clickup_comment_create_only_conflict' using errcode = '40001';
+      raise exception 'clickup_comment_create_only_conflict' using errcode = 'PT409';
     end if;
     return jsonb_build_object('result','unchanged','activity_id',existing.lead_activity_id);
   end if;
@@ -73735,7 +73616,7 @@ begin
      and source_comment_id = p_comment_id for update;
   if found then
     if existing.source_hash <> p_source_hash then
-      raise exception 'clickup_comment_create_only_conflict' using errcode = '40001';
+      raise exception 'clickup_comment_create_only_conflict' using errcode = 'PT409';
     end if;
     return jsonb_build_object('result','unchanged','task_comment_id',existing.task_comment_id);
   end if;
@@ -73912,7 +73793,7 @@ begin
   if p_sidecar->>'run_id' <> p_run_id::text
      or p_sidecar->>'workspace_id' <> run_row.workspace_id
      or p_sidecar->>'snapshot_hash' <> run_row.snapshot_hash then
-    raise exception 'clickup_asset_sidecar_binding_conflict' using errcode = '40001';
+    raise exception 'clickup_asset_sidecar_binding_conflict' using errcode = 'PT409';
   end if;
   if staged_mode = 'full' and (
     (p_sidecar#>>'{coverage,tasks_expected}')::integer <> (
@@ -74010,10 +73891,10 @@ begin
      )) or (run_row.scope = 'docs' and exists (
        select 1 from jsonb_array_elements(p_sidecar->'assets') a where a->>'parent_type' = 'task'
      )) then
-    raise exception 'clickup_asset_sidecar_scope_conflict' using errcode = '40001';
+    raise exception 'clickup_asset_sidecar_scope_conflict' using errcode = 'PT409';
   end if;
   if run_row.scope = 'docs' and jsonb_array_length(p_sidecar->'comments') > 0 then
-    raise exception 'clickup_comment_sidecar_scope_conflict' using errcode = '40001';
+    raise exception 'clickup_comment_sidecar_scope_conflict' using errcode = 'PT409';
   end if;
   if exists (
     select 1 from jsonb_array_elements(p_sidecar->'assets') asset
@@ -74026,7 +73907,7 @@ begin
                where attachment_id.value=asset->>'attachment_id')
         ))
   ) then
-    raise exception 'clickup_asset_comment_binding_conflict' using errcode = '40001';
+    raise exception 'clickup_asset_comment_binding_conflict' using errcode = 'PT409';
   end if;
   insert into public.clickup_asset_sidecars (
     organization_id, run_id, workspace_id, snapshot_hash, sidecar_version,
@@ -74043,7 +73924,7 @@ begin
     and clickup_asset_sidecars.coverage = excluded.coverage
   returning id into staged_sidecar_id;
   if staged_sidecar_id is null then
-    raise exception 'clickup_asset_sidecar_create_only_conflict' using errcode = '40001';
+    raise exception 'clickup_asset_sidecar_create_only_conflict' using errcode = 'PT409';
   end if;
   insert into public.clickup_asset_items (
     organization_id, sidecar_id, run_id, workspace_id, attachment_id,
@@ -74078,7 +73959,7 @@ begin
         or coalesce(i.source_revision, '') <> coalesce(asset->>'source_revision', '')
         or (staged_mode = 'full' and i.upload_id is distinct from (asset->>'blob_ref')::uuid)
   ) then
-    raise exception 'clickup_asset_create_only_conflict' using errcode = '40001';
+    raise exception 'clickup_asset_create_only_conflict' using errcode = 'PT409';
   end if;
   if staged_mode = 'full' and exists (
     select 1 from public.clickup_asset_items i
@@ -74090,7 +73971,7 @@ begin
      or u.state not in ('prepared','uploaded') or u.expires_at <= clock_timestamp()
    )
   ) then
-    raise exception 'clickup_asset_upload_binding_conflict' using errcode = '40001';
+    raise exception 'clickup_asset_upload_binding_conflict' using errcode = 'PT409';
   end if;
   insert into public.clickup_import_items (
     organization_id, run_id, workspace_id, entity_type, external_id,
@@ -74113,7 +73994,7 @@ begin
      where i.id is null
         or i.source_hash <> encode(extensions.digest(comment::text, 'sha256'), 'hex')
   ) then
-    raise exception 'clickup_comment_create_only_conflict' using errcode = '40001';
+    raise exception 'clickup_comment_create_only_conflict' using errcode = 'PT409';
   end if;
   if staged_mode='full' and not exists (
     select 1 from public.clickup_asset_items where sidecar_id=staged_sidecar_id
@@ -74514,7 +74395,7 @@ begin
    where ai.organization_id=p_organization_id and ai.id=p_item_id and ai.status='processing'
      and ai.claim_token=p_claim_token and ai.claimed_until>=clock_timestamp()
      and r.status='running' and r.cancel_requested_at is null for update of ai,r;
-  if not found then raise exception 'clickup_asset_lease_lost' using errcode='40001'; end if;
+  if not found then raise exception 'clickup_asset_lease_lost' using errcode='PT409'; end if;
   if p_target_kind not in ('lead','task','knowledge') or p_file_size <> i.declared_size then
     raise exception 'clickup_asset_commit_shape_invalid' using errcode='22023';
   end if;
@@ -74544,7 +74425,7 @@ begin
   select * into existing from public.clickup_asset_receipts where organization_id=p_organization_id
     and workspace_id=i.workspace_id and attachment_id=i.attachment_id for update;
   if found then
-    if existing.source_sha256<>i.source_sha256 then raise exception 'clickup_asset_create_only_conflict' using errcode='40001'; end if;
+    if existing.source_sha256<>i.source_sha256 then raise exception 'clickup_asset_create_only_conflict' using errcode='PT409'; end if;
     return jsonb_build_object('result','unchanged');
   end if;
   if p_target_kind='lead' then
@@ -74554,7 +74435,7 @@ begin
       i.source_sha256,i.source_revision,i.comment_id,i.file_name,p_file_size,p_mime_type,p_storage_path)
     on conflict do nothing;
     select source_sha256 into actual_hash from public.crm_lead_attachments where organization_id=p_organization_id and id=p_attachment_row_id;
-    if actual_hash is distinct from i.source_sha256 then raise exception 'clickup_asset_create_only_conflict' using errcode='40001'; end if;
+    if actual_hash is distinct from i.source_sha256 then raise exception 'clickup_asset_create_only_conflict' using errcode='PT409'; end if;
     insert into public.clickup_asset_receipts(organization_id,workspace_id,attachment_id,source_sha256,lead_attachment_id)
       values(p_organization_id,i.workspace_id,i.attachment_id,i.source_sha256,p_attachment_row_id);
   elsif p_target_kind='task' then
@@ -74563,7 +74444,7 @@ begin
     values(p_attachment_row_id,p_organization_id,p_target_id,i.workspace_id,i.attachment_id,i.source_sha256,
       i.source_revision,i.comment_id,i.file_name,p_file_size,p_mime_type,p_storage_path) on conflict do nothing;
     select source_sha256 into actual_hash from public.crm_task_attachments where organization_id=p_organization_id and id=p_attachment_row_id;
-    if actual_hash is distinct from i.source_sha256 then raise exception 'clickup_asset_create_only_conflict' using errcode='40001'; end if;
+    if actual_hash is distinct from i.source_sha256 then raise exception 'clickup_asset_create_only_conflict' using errcode='PT409'; end if;
     insert into public.clickup_asset_receipts(organization_id,workspace_id,attachment_id,source_sha256,task_attachment_id)
       values(p_organization_id,i.workspace_id,i.attachment_id,i.source_sha256,p_attachment_row_id);
   else
@@ -74572,7 +74453,7 @@ begin
     values(p_attachment_row_id,p_organization_id,p_target_id,i.workspace_id,i.attachment_id,i.source_sha256,
       i.source_revision,i.comment_id,i.file_name,p_file_size,p_mime_type,p_storage_path) on conflict do nothing;
     select source_sha256 into actual_hash from public.ai_knowledge_source_attachments where organization_id=p_organization_id and id=p_attachment_row_id;
-    if actual_hash is distinct from i.source_sha256 then raise exception 'clickup_asset_create_only_conflict' using errcode='40001'; end if;
+    if actual_hash is distinct from i.source_sha256 then raise exception 'clickup_asset_create_only_conflict' using errcode='PT409'; end if;
     insert into public.clickup_asset_receipts(organization_id,workspace_id,attachment_id,source_sha256,knowledge_attachment_id)
       values(p_organization_id,i.workspace_id,i.attachment_id,i.source_sha256,p_attachment_row_id);
   end if;
@@ -75027,3 +74908,65 @@ revoke execute on function public.fn_stage_clickup_import_preview(
 grant execute on function public.fn_stage_clickup_import_preview(
   uuid, uuid, text, text, text, integer, text, text, uuid, jsonb
 ) to service_role;
+
+-- ---- VARREDURA anon: função nova nasce exposta em quem ATUALIZA (migration 0116) ----
+--
+-- ⚠️ DE PROPÓSITO, NENHUMA FUNÇÃO É CRIADA DEPOIS DESTE BLOCO. Apêndice que cria
+-- função entra ANTES dele — quem o empurrar para o meio desarma a cura para tudo
+-- que vier depois. Vigiado por
+-- `tests/unit/varredura-anon-e-o-ultimo-bloco.test.ts`.
+--
+-- A 0108 revogou anon numa LISTA de 8 funções, medida num banco instalado do
+-- ZERO. Quem ATUALIZA tem outro estado: o `ALTER DEFAULT PRIVILEGES ... GRANT
+-- ALL ON FUNCTIONS TO anon` do corpo deste arquivo grava uma entrada em
+-- `pg_default_acl` que fica no catálogo PARA SEMPRE, e a partir daí toda função
+-- criada em `public` nasce com EXECUTE para anon — inclusive as deste apêndice.
+--
+-- As duas origens de EXECUTE: grant DIRETO a anon e grant a PUBLIC, do qual anon
+-- herda. O privilégio efetivo de authenticated e service_role é medido antes e
+-- devolvido depois — tira anon sem tirar leitura.
+do $$
+declare
+  f record;
+  tinha_auth boolean;
+  tinha_service boolean;
+begin
+  if to_regrole('anon') is null then
+    return;
+  end if;
+
+  for f in
+    select p.oid, p.oid::regprocedure as assinatura
+      from pg_proc p
+      join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'public'
+       and p.prosecdef
+  loop
+    tinha_auth := to_regrole('authenticated') is not null
+                  and has_function_privilege('authenticated', f.oid, 'EXECUTE');
+    tinha_service := to_regrole('service_role') is not null
+                     and has_function_privilege('service_role', f.oid, 'EXECUTE');
+
+    execute format('revoke execute on function %s from public, anon', f.assinatura);
+
+    if tinha_auth then
+      execute format('grant execute on function %s to authenticated', f.assinatura);
+    end if;
+    if tinha_service then
+      execute format('grant execute on function %s to service_role', f.assinatura);
+    end if;
+  end loop;
+end $$;
+
+-- Regra 2 (authenticated): as cinco que o update abriu e o install não abre.
+revoke execute on function public.fn_audit_log_row() from authenticated;
+revoke execute on function public.fn_decrypt_oauth(bytea) from authenticated;
+revoke execute on function public.fn_encrypt_oauth(text) from authenticated;
+revoke execute on function public.fn_lgpd_cascade_redact_contact(uuid, uuid, uuid) from authenticated;
+revoke execute on function public.fn_update_budget_consumption() from authenticated;
+
+grant execute on function public.fn_audit_log_row() to service_role;
+grant execute on function public.fn_decrypt_oauth(bytea) to service_role;
+grant execute on function public.fn_encrypt_oauth(text) to service_role;
+grant execute on function public.fn_lgpd_cascade_redact_contact(uuid, uuid, uuid) to service_role;
+grant execute on function public.fn_update_budget_consumption() to service_role;

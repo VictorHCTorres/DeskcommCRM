@@ -15,6 +15,7 @@ import {
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
 import { createClient } from "@/lib/supabase/browser";
+import { randomId } from "@/lib/random-id";
 import {
   clickUpCoverageBlocksExecution,
   type ClickUpPreviewCoverage,
@@ -242,7 +243,7 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
       const created = await data<Connection>(
         await fetch("/api/v1/clickup/connections", {
           method: "POST",
-          headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() },
+          headers: { "Content-Type": "application/json", "Idempotency-Key": randomId() },
           body: JSON.stringify({ workspace_id: workspaceId, workspace_name: workspaceName, token }),
         }),
       );
@@ -262,7 +263,7 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
       const result = await data<{ run: Run }>(
         await fetch("/api/v1/clickup/discovery", {
           method: "POST",
-          headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() },
+          headers: { "Content-Type": "application/json", "Idempotency-Key": randomId() },
           body: JSON.stringify({ connection_id: connectionId }),
         }),
       );
@@ -325,7 +326,7 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
       const staged = await data<{ run: Run }>(
         await fetch("/api/v1/clickup/imports/bundle", {
           method: "POST",
-          headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() },
+          headers: { "Content-Type": "application/json", "Idempotency-Key": randomId() },
           body: JSON.stringify({ action: "stage", path: prepared.path }),
         }),
       );
@@ -371,7 +372,7 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
         await data<Run>(
           await fetch(`/api/v1/clickup/imports/${run.id}/execute`, {
             method: "POST",
-            headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() },
+            headers: { "Content-Type": "application/json", "Idempotency-Key": randomId() },
             body: JSON.stringify({
               dry_run: false,
               expected_preview_revision: run.preview_revision,
@@ -390,44 +391,44 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
   }
   const hasBlockingCoverage = coverage ? clickUpCoverageBlocksExecution(coverage) : false;
   const coverageLabels: Record<string, string> = {
-    priority: "Prioridade",
-    tags: "Tags",
-    start_date: "Data de início",
-    time_estimate: "Estimativa",
-    links: "Relações",
-    checklists: "Checklists",
-    watchers: "Watchers",
-    dependencies: "Dependências",
-    locations: "Localizações",
-    archived: "Arquivadas",
-    time_spent: "Tempo gasto",
+    priority: t("Prioridade"),
+    tags: t("Tags"),
+    start_date: t("Data de início"),
+    time_estimate: t("Estimativa"),
+    links: t("Relações"),
+    checklists: t("Checklists"),
+    watchers: t("Watchers"),
+    dependencies: t("Dependências"),
+    locations: t("Localizações"),
+    archived: t("Arquivadas"),
+    time_spent: t("Tempo gasto"),
   };
   const classificationLabels: Record<Coverage["dimensions"][number]["classification"], string> = {
-    native: "Nativo",
-    provenance: "Proveniência",
-    unsupported: "Não suportado",
+    native: t("Nativo"),
+    provenance: t("Proveniência"),
+    unsupported: t("Não suportado"),
   };
   return (
     <Dialog>
       <DialogTrigger asChild>
         <Button variant="outline">
           <Upload className="mr-2 h-4 w-4" aria-hidden />
-          Importar ClickUp
+          {t("Importar ClickUp")}
         </Button>
       </DialogTrigger>
       <DialogContent className="max-h-[90vh] max-w-5xl overflow-y-auto">
         <DialogHeader>
-          <DialogTitle>Importar ClickUp para o CRM</DialogTitle>
+          <DialogTitle>{t("Importar ClickUp para o CRM")}</DialogTitle>
           <DialogDescription>
-            Uma decisão explícita por List. Won/lost nunca é inferido de “closed”.
+            {t("Uma decisão explícita por List. Won/lost nunca é inferido de “closed”.")}
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4">
           <div className="rounded-md border p-3">
-            <p className="mb-2 text-sm font-medium">Conexão do ClickUp</p>
+            <p className="mb-2 text-sm font-medium">{t("Conexão do ClickUp")}</p>
             {connections.length > 0 ? (
               <div className="flex flex-wrap items-center gap-2">
-                <Label htmlFor="clickup-connection">Workspace</Label>
+                <Label htmlFor="clickup-connection">{t("Workspace")}</Label>
                 <select
                   id="clickup-connection"
                   className="rounded border p-2"
@@ -441,28 +442,28 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
                   ))}
                 </select>
                 <Button disabled={!connectionId || busy} onClick={() => void discover()}>
-                  Descobrir estrutura
+                  {t("Descobrir estrutura")}
                 </Button>
               </div>
             ) : podeCriarConexao ? (
               <div className="grid gap-2 md:grid-cols-4">
                 <Input
-                  aria-label="ID do workspace ClickUp"
-                  placeholder="ID do workspace"
+                  aria-label={t("ID do workspace ClickUp")}
+                  placeholder={t("ID do workspace")}
                   value={workspaceId}
                   onChange={(event) => setWorkspaceId(event.target.value)}
                 />
                 <Input
-                  aria-label="Nome do workspace ClickUp"
-                  placeholder="Nome do workspace"
+                  aria-label={t("Nome do workspace ClickUp")}
+                  placeholder={t("Nome do workspace")}
                   value={workspaceName}
                   onChange={(event) => setWorkspaceName(event.target.value)}
                 />
                 <Input
-                  aria-label="Token do ClickUp"
+                  aria-label={t("Token do ClickUp")}
                   type="password"
                   autoComplete="off"
-                  placeholder="Token"
+                  placeholder={t("Token")}
                   value={token}
                   onChange={(event) => setToken(event.target.value)}
                 />
@@ -470,17 +471,17 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
                   disabled={!workspaceId || !workspaceName || token.length < 8 || busy}
                   onClick={() => void createConnection()}
                 >
-                  Conectar
+                  {t("Conectar")}
                 </Button>
               </div>
             ) : (
               <p className="text-sm text-muted-foreground" role="status">
-                Peça a um administrador para conectar este workspace antes da importação.
+                {t("Peça a um administrador para conectar este workspace antes da importação.")}
               </p>
             )}
           </div>
           <div>
-            <Label htmlFor="clickup-crm-bundle">Ou enviar bundle v3</Label>
+            <Label htmlFor="clickup-crm-bundle">{t("Ou enviar bundle v3")}</Label>
             <input
               id="clickup-crm-bundle"
               type="file"
@@ -489,17 +490,19 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
               onChange={(event) => void uploadBundle(event.target.files?.[0])}
             />
             <p className="text-xs text-muted-foreground">
-              O arquivo vai direto ao storage privado; o navegador recebe apenas o resumo paginado.
+              {t(
+                "O arquivo vai direto ao storage privado; o navegador recebe apenas o resumo paginado.",
+              )}
             </p>
           </div>
           {run ? (
             <div className="rounded-md border p-3 text-sm" role="status">
               <p>
-                {run.total_items} itens; {run.applicable_items} aplicáveis; {run.warnings_count}{" "}
-                avisos.
+                {run.total_items} {t("itens")}; {run.applicable_items} {t("aplicáveis")};{" "}
+                {run.warnings_count} {t("avisos")}.
               </p>
               <p>
-                Snapshot <code>{run.snapshot_hash.slice(0, 12)}</code> · prévia r
+                Snapshot <code>{run.snapshot_hash.slice(0, 12)}</code> · {t("prévia")} r
                 {run.preview_revision} · mapping r{run.mapping_revision}
               </p>
             </div>
@@ -511,11 +514,11 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
             >
               <div>
                 <h3 id="clickup-coverage-title" className="font-medium">
-                  Cobertura da prévia
+                  {t("Cobertura da prévia")}
                 </h3>
                 <p className="text-xs text-muted-foreground">
-                  {coverage.tasks_scanned} Tasks auditadas · cobertura{" "}
-                  {coverage.coverage === "full" ? "completa" : "parcial"}
+                  {coverage.tasks_scanned} {t("Tasks auditadas")} · {t("cobertura")}{" "}
+                  {coverage.coverage === "full" ? t("completa") : t("parcial")}
                 </p>
               </div>
               {coverage.archive_scope === "active_only" ? (
@@ -523,17 +526,18 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
                   className="rounded border border-amber-500/40 bg-amber-500/10 p-2 text-sm"
                   role="alert"
                 >
-                  Importação bloqueada: somente a hierarquia ativa foi auditada. Inclua as Tasks
-                  arquivadas e gere uma cobertura completa antes de continuar.
+                  {t(
+                    "Importação bloqueada: somente a hierarquia ativa foi auditada. Inclua as Tasks arquivadas e gere uma cobertura completa antes de continuar.",
+                  )}
                 </p>
               ) : null}
               <div className="overflow-x-auto">
                 <table className="w-full text-left text-xs">
                   <thead>
                     <tr>
-                      <th className="py-1">Dimensão</th>
-                      <th>Tratamento</th>
-                      <th>Encontrados</th>
+                      <th className="py-1">{t("Dimensão")}</th>
+                      <th>{t("Tratamento")}</th>
+                      <th>{t("Encontrados")}</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -543,7 +547,12 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
                         <td>{classificationLabels[dimension.classification]}</td>
                         <td>
                           {dimension.present}
-                          {dimension.detail !== undefined ? ` · ${dimension.detail} itens` : ""}
+                          {dimension.detail !== undefined ? (
+                            <>
+                              {" "}
+                              · {dimension.detail} {t("itens")}
+                            </>
+                          ) : null}
                         </td>
                       </tr>
                     ))}
@@ -551,16 +560,16 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
                 </table>
               </div>
               <p className="text-sm">
-                Responsáveis: {coverage.assignees.resolved} resolvidos ·{" "}
-                {coverage.assignees.unresolved} não resolvidos · {coverage.assignees.assignments}{" "}
-                atribuições.
+                {t("Responsáveis")}: {coverage.assignees.resolved} {t("resolvidos")} ·{" "}
+                {coverage.assignees.unresolved} {t("não resolvidos")} ·{" "}
+                {coverage.assignees.assignments} {t("atribuições")}.
               </p>
               {coverage.warnings
                 .filter((warning) => warning.blocking)
                 .map((warning) => (
                   <p key={warning.code} className="text-sm text-destructive" role="alert">
-                    Importação bloqueada: {warning.code} ({warning.count}). Atualize o suporte antes
-                    de continuar.
+                    {t("Importação bloqueada")}: {warning.code} ({warning.count}).{" "}
+                    {t("Atualize o suporte antes de continuar.")}
                   </p>
                 ))}
             </section>
@@ -568,15 +577,15 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
           {run && !run.mapping_hash ? (
             <>
               <div>
-                <Label htmlFor="clickup-assignees">Múltiplos responsáveis</Label>
+                <Label htmlFor="clickup-assignees">{t("Múltiplos responsáveis")}</Label>
                 <select
                   id="clickup-assignees"
                   className="ml-2 rounded border p-2"
                   value={assignees}
                   onChange={(event) => setAssignees(event.target.value as typeof assignees)}
                 >
-                  <option value="unassigned">Deixar sem responsável</option>
-                  <option value="first">Usar o primeiro membro ativo</option>
+                  <option value="unassigned">{t("Deixar sem responsável")}</option>
+                  <option value="first">{t("Usar o primeiro membro ativo")}</option>
                 </select>
               </div>
               <div className="space-y-3">
@@ -587,42 +596,42 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
                     </summary>
                     <div className="mt-3 grid gap-3 md:grid-cols-4">
                       <select
-                        aria-label={`Destino de ${list.pipeline_name}`}
+                        aria-label={t("Destino de {nome}").replace("{nome}", list.pipeline_name)}
                         value={list.mode}
                         onChange={(event) =>
                           updateList(index, { mode: event.target.value as ListMap["mode"] })
                         }
                         className="rounded border p-2"
                       >
-                        <option value="crm_leads">Negócios</option>
-                        <option value="crm_tasks">Tarefas operacionais</option>
-                        <option value="ignore">Ignorar</option>
+                        <option value="crm_leads">{t("Negócios")}</option>
+                        <option value="crm_tasks">{t("Tarefas operacionais")}</option>
+                        <option value="ignore">{t("Ignorar")}</option>
                       </select>
                       {list.mode === "crm_leads" ? (
                         <>
                           <Input
-                            aria-label="Área"
+                            aria-label={t("Área")}
                             value={list.area_name}
                             onChange={(event) =>
                               updateList(index, { area_name: event.target.value })
                             }
                           />
                           <Input
-                            aria-label="Grupo"
+                            aria-label={t("Grupo")}
                             value={list.group_name}
                             onChange={(event) =>
                               updateList(index, { group_name: event.target.value })
                             }
                           />
                           <Input
-                            aria-label="Funil"
+                            aria-label={t("Funil")}
                             value={list.pipeline_name}
                             onChange={(event) =>
                               updateList(index, { pipeline_name: event.target.value })
                             }
                           />
                           <Input
-                            aria-label="Chave de agrupamento do funil"
+                            aria-label={t("Chave de agrupamento do funil")}
                             value={list.pipeline_key}
                             onChange={(event) =>
                               updateList(index, { pipeline_key: event.target.value })
@@ -640,13 +649,13 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
                             updateList(index, { import_subtasks: event.target.checked })
                           }
                         />
-                        Importar subtarefas desta List
+                        {t("Importar subtarefas desta List")}
                       </label>
                     ) : null}
                     {list.mode === "crm_leads" ? (
                       <div className="mt-3 grid gap-4 md:grid-cols-2">
                         <div>
-                          <p className="text-sm font-medium">Statuses</p>
+                          <p className="text-sm font-medium">{t("Statuses")}</p>
                           {list.statuses.map((status, statusIndex) => (
                             <div
                               key={status.status_id}
@@ -654,7 +663,7 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
                             >
                               <span>{status.name}</span>
                               <select
-                                aria-label={`Resultado de ${status.name}`}
+                                aria-label={t("Resultado de {nome}").replace("{nome}", status.name)}
                                 className="rounded border p-1"
                                 value={status.terminal}
                                 onChange={(event) =>
@@ -670,15 +679,17 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
                                   })
                                 }
                               >
-                                <option value="open">Aberto</option>
-                                <option value="won">Ganho</option>
-                                <option value="lost">Perdido</option>
+                                <option value="open">{t("Aberto")}</option>
+                                <option value="won">{t("Ganho")}</option>
+                                <option value="lost">{t("Perdido")}</option>
                               </select>
                             </div>
                           ))}
                         </div>
                         <div>
-                          <p className="text-sm font-medium">Campos ({list.fields.length})</p>
+                          <p className="text-sm font-medium">
+                            {t("Campos")} ({list.fields.length})
+                          </p>
                           {list.fields.map((field, fieldIndex) => (
                             <div
                               key={field.field_id}
@@ -688,7 +699,7 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
                                 {field.label} ({field.source_type})
                               </span>
                               <select
-                                aria-label={`Ação de ${field.label}`}
+                                aria-label={t("Ação de {nome}").replace("{nome}", field.label)}
                                 className="rounded border p-1"
                                 value={field.action}
                                 onChange={(event) =>
@@ -710,11 +721,11 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
                               >
                                 <option value="native" disabled={!targetType(field.source_type)}>
                                   {targetType(field.source_type)
-                                    ? "Nativo"
-                                    : "Nativo indisponível para este tipo"}
+                                    ? t("Nativo")
+                                    : t("Nativo indisponível para este tipo")}
                                 </option>
-                                <option value="text">Texto</option>
-                                <option value="ignore">Ignorar</option>
+                                <option value="text">{t("Texto")}</option>
+                                <option value="ignore">{t("Ignorar")}</option>
                               </select>
                             </div>
                           ))}
@@ -733,18 +744,20 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
           ) : null}
           {queued ? (
             <p className="text-sm text-success" role="status">
-              Importação enfileirada no run {run?.id}.
+              {t("Importação enfileirada no run")} {run?.id}.
             </p>
           ) : null}
         </div>
         <DialogFooter>
           {!run ? null : !run.mapping_hash ? (
             <Button disabled={busy || lists.length === 0} onClick={() => void saveMapping()}>
-              Validar mapping
+              {t("Validar mapping")}
             </Button>
           ) : (
             <Button disabled={busy || queued || hasBlockingCoverage} onClick={() => void execute()}>
-              {coverage?.coverage === "partial" ? "Importação bloqueada" : "Confirmar importação"}
+              {coverage?.coverage === "partial"
+                ? t("Importação bloqueada")
+                : t("Confirmar importação")}
             </Button>
           )}
         </DialogFooter>

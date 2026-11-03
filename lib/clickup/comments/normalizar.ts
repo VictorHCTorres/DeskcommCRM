@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 
+import { nomeDoContato } from "@/lib/contacts/rotulo-do-contato";
+
 export interface ComentarioClickUpNormalizado {
   comment_id: string;
   task_id: string;
@@ -73,7 +75,12 @@ function dataIso(valor: unknown): string {
 function autorSeguro(raw: Registro): ComentarioClickUpNormalizado["author"] {
   const user = registro(raw.user ?? raw.author);
   const sourceUserId = texto(user.id ?? user.userid ?? raw.user_id);
-  const nome = texto(user.username ?? user.display_name ?? user.name ?? "Usuário ClickUp")
+  const username = texto(user.username);
+  const displayName = texto(user.display_name);
+  const legacyName = texto(user.name);
+  const nome = (
+    nomeDoContato({ name: username, display_name: displayName || legacyName }) ?? "Usuário ClickUp"
+  )
     .replace(/[\r\n\t]/g, " ")
     .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[e-mail removido]")
     .replace(/\s+/g, " ")

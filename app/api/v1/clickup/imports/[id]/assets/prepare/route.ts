@@ -75,12 +75,13 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
       .from(body.data.kind === "sidecar" ? "clickup-sidecars" : "clickup-assets")
       .createSignedUploadUrl(String(upload.storage_path));
     if (error || !data) throw new Error("clickup_asset_signed_upload_unavailable");
+    const uploadId = String(upload.id);
     void audit({
       action: "clickup.asset_upload_prepared",
       actorUserId: authz.user.id,
       organizationId: authz.org.orgId,
       resourceType: "clickup_asset_upload",
-      resourceId: String(upload.id),
+      resourceId: uploadId,
       requestId,
       bypassedRls: true,
       metadata: {
