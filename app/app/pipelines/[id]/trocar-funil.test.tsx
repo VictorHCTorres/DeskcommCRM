@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
 
 import { PipelinePageClient } from "./_client";
@@ -134,9 +135,14 @@ beforeEach(() => {
   useLeadsPaginados.mockReturnValue({ data: PAGINA, isLoading: false, error: null });
 });
 
+function renderComQuery(ui: Parameters<typeof render>[0]) {
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(<QueryClientProvider client={queryClient}>{ui}</QueryClientProvider>);
+}
+
 describe("troca rápida de funil", () => {
   it("com um funil só, mostra o h1 e nenhum seletor", () => {
-    render(
+    renderComQuery(
       <PipelinePageClient
         pipelineId="p-1"
         initialName="Vendas"
@@ -148,11 +154,11 @@ describe("troca rápida de funil", () => {
     );
 
     expect(screen.getByRole("heading", { name: "Vendas" })).toBeTruthy();
-    expect(screen.queryByRole("combobox")).toBeNull();
+    expect(screen.queryByRole("combobox", { name: /Trocar de funil/ })).toBeNull();
   });
 
   it("com vários funis, o título vira seletor com os funis vivos", async () => {
-    render(
+    renderComQuery(
       <PipelinePageClient
         pipelineId="p-1"
         initialName="Vendas"
@@ -175,7 +181,7 @@ describe("troca rápida de funil", () => {
   });
 
   it("escolher outro funil navega para o quadro dele, sem query string", async () => {
-    render(
+    renderComQuery(
       <PipelinePageClient
         pipelineId="p-1"
         initialName="Vendas"
@@ -194,7 +200,7 @@ describe("troca rápida de funil", () => {
   });
 
   it("escolher o funil atual não navega", async () => {
-    render(
+    renderComQuery(
       <PipelinePageClient
         pipelineId="p-1"
         initialName="Vendas"
@@ -226,7 +232,7 @@ describe("troca rápida de funil", () => {
  */
 describe("a terceira aba do funil (Lista)", () => {
   const montar = (visoes = FUNIS) =>
-    render(
+    renderComQuery(
       <PipelinePageClient
         pipelineId="p-1"
         initialName="Vendas"
@@ -256,7 +262,10 @@ describe("a terceira aba do funil (Lista)", () => {
     expect(screen.getByTestId("lista-do-funil")).toBeTruthy();
     // A página 1 é o que a lista pede ao montar; sem `?page=` a lista não é
     // paginada — é o quadro com outra cara.
-    expect(useLeadsPaginados).toHaveBeenLastCalledWith("p-1", 1, {});
+    expect(useLeadsPaginados).toHaveBeenLastCalledWith("p-1", 1, {}, undefined, {
+      field: "position",
+      direction: "asc",
+    });
     expect(screen.getByText("Negócio A")).toBeTruthy();
     expect(screen.getByText("Negócio B")).toBeTruthy();
   });
@@ -267,7 +276,10 @@ describe("a terceira aba do funil (Lista)", () => {
     await userEvent.click(screen.getByTestId("visao-lista"));
     await userEvent.click(screen.getByRole("button", { name: "Próxima" }));
 
-    expect(useLeadsPaginados).toHaveBeenLastCalledWith("p-1", 2, {});
+    expect(useLeadsPaginados).toHaveBeenLastCalledWith("p-1", 2, {}, undefined, {
+      field: "position",
+      direction: "asc",
+    });
   });
 
   it("⭐ a tela diz a página ATUAL, e não promete um total exato", async () => {
