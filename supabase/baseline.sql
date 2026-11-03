@@ -71295,7 +71295,7 @@ comment on table public.crm_pipeline_groups is
 comment on column public.crm_pipelines.group_id is
   'Grupo visual do funil; NULL mantém o funil em Sem grupo. Arquivar o grupo preserva o vínculo e todos os negócios.';
 
--- ---- visualizações salvas de funil (migration 9092) ----
+-- ---- visualizações salvas de funil (migration 9099) ----
 create unique index if not exists crm_pipelines_org_id_uidx
   on public.crm_pipelines (organization_id, id);
 create table if not exists public.crm_pipeline_views (
