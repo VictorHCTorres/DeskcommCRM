@@ -1421,6 +1421,14 @@ export const AUDIT_ACTIONS = [
   // Aviso escrito pelo admin da empresa e empurrado para a equipe (#1418). O
   // metadata leva só a janela de publicação; título e corpo ficam em `avisos`.
   "aviso.created",
+  // Importador ClickUp: somente ids, escopo, revisões e contagens; nunca token,
+  // payload bruto, nome de tarefa ou conteúdo de Docs.
+  "clickup.connection_created",
+  "clickup.import_previewed",
+  "clickup.import_mapping_updated",
+  "clickup.import_queued",
+  "clickup.import_retried",
+  "clickup.import_cancelled",
 ] as const;
 
 /** Um código de auditoria. Derivado de `AUDIT_ACTIONS` — não redigite a lista. */
