@@ -433,7 +433,7 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
                 <Label htmlFor="clickup-connection">{t("Workspace")}</Label>
                 <select
                   id="clickup-connection"
-                  className="rounded border p-2"
+                  className="rounded-md border p-2"
                   value={connectionId}
                   onChange={(event) => setConnectionId(event.target.value)}
                 >
@@ -525,7 +525,7 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
               </div>
               {coverage.archive_scope === "active_only" ? (
                 <p
-                  className="rounded border border-amber-500/40 bg-amber-500/10 p-2 text-sm"
+                  className="rounded-md border border-amber-500/40 bg-amber-500/10 p-2 text-sm"
                   role="alert"
                 >
                   {t(
@@ -582,7 +582,7 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
                 <Label htmlFor="clickup-assignees">{t("Múltiplos responsáveis")}</Label>
                 <select
                   id="clickup-assignees"
-                  className="ml-2 rounded border p-2"
+                  className="ml-2 rounded-md border p-2"
                   value={assignees}
                   onChange={(event) => setAssignees(event.target.value as typeof assignees)}
                 >
@@ -603,7 +603,7 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
                         onChange={(event) =>
                           updateList(index, { mode: event.target.value as ListMap["mode"] })
                         }
-                        className="rounded border p-2"
+                        className="rounded-md border p-2"
                       >
                         <option value="crm_leads">{t("Negócios")}</option>
                         <option value="crm_tasks">{t("Tarefas operacionais")}</option>
@@ -666,7 +666,7 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
                               <span>{status.name}</span>
                               <select
                                 aria-label={t("Resultado de {nome}").replace("{nome}", status.name)}
-                                className="rounded border p-1"
+                                className="rounded-md border p-1"
                                 value={status.terminal}
                                 onChange={(event) =>
                                   updateList(index, {
@@ -702,7 +702,7 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
                               </span>
                               <select
                                 aria-label={t("Ação de {nome}").replace("{nome}", field.label)}
-                                className="rounded border p-1"
+                                className="rounded-md border p-1"
                                 value={field.action}
                                 onChange={(event) =>
                                   updateList(index, {

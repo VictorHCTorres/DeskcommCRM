@@ -323,7 +323,7 @@ export function ListaDeTarefas({
                       {familia.filhas.length > 0 ? (
                         <button
                           type="button"
-                          className="min-h-11 rounded px-1 text-left hover:text-foreground lg:min-h-0"
+                          className="min-h-11 rounded-md px-1 text-left hover:text-foreground lg:min-h-0"
                           aria-expanded={aberta}
                           onClick={() =>
                             setExpandidas((atuais) => {
@@ -347,7 +347,7 @@ export function ListaDeTarefas({
                       {podeEditar && aoCriarSubtarefa && !familia.orfa ? (
                         <button
                           type="button"
-                          className="flex min-h-11 items-center gap-1 rounded px-1 hover:text-foreground lg:min-h-0"
+                          className="flex min-h-11 items-center gap-1 rounded-md px-1 hover:text-foreground lg:min-h-0"
                           onClick={() => aoCriarSubtarefa(familia.raiz)}
                         >
                           <Plus size={12} aria-hidden /> {t("Adicionar subtarefa")}
@@ -356,7 +356,7 @@ export function ListaDeTarefas({
                       {podeEditar && familia.raiz.recurrence_id && aoCancelarRecorrencia ? (
                         <button
                           type="button"
-                          className="flex min-h-11 items-center gap-1 rounded px-1 hover:text-destructive lg:min-h-0"
+                          className="flex min-h-11 items-center gap-1 rounded-md px-1 hover:text-destructive lg:min-h-0"
                           onClick={() => aoCancelarRecorrencia(familia.raiz)}
                         >
                           <ArrowsClockwise size={12} aria-hidden /> {t("Cancelar série")}

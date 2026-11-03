@@ -265,7 +265,7 @@ export function ListaDoFunil({
                           aria-label={t("Prioridade e tags do ClickUp")}
                         >
                           {prioridade ? (
-                            <span className="rounded border px-1.5 py-0.5 text-muted-foreground">
+                            <span className="rounded-md border px-1.5 py-0.5 text-muted-foreground">
                               {t("Prioridade")}: {prioridade}
                             </span>
                           ) : null}

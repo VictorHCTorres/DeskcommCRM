@@ -68,7 +68,7 @@ function CampoPersonalizado({ campo }: { campo: WebhookFormField }) {
         </Rotulo>
         <select
           {...comum}
-          className="h-10 w-full rounded-sm border border-input bg-background px-3 text-sm text-text outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="h-10 w-full rounded-sm border border-input bg-background px-3 text-sm text-text outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
           defaultValue=""
         >
           <option value="" disabled={campo.required}>
@@ -91,7 +91,7 @@ function CampoPersonalizado({ campo }: { campo: WebhookFormField }) {
           {...comum}
           type="checkbox"
           value="true"
-          className="mt-1 size-4 rounded border-input accent-accent"
+          className="mt-1 size-4 rounded-md border-input accent-accent"
         />
         <Rotulo htmlFor={id} obrigatorio={campo.required} className="leading-5">
           {campo.label}

@@ -340,7 +340,7 @@ export function KanbanCard({
               aria-label={t("Prioridade e tags do ClickUp")}
             >
               {priorityLabel ? (
-                <span className="shrink-0 rounded border border-border px-1.5 py-0.5 text-text-muted">
+                <span className="shrink-0 rounded-md border border-border px-1.5 py-0.5 text-text-muted">
                   {t("Prioridade")}: {priorityLabel}
                 </span>
               ) : null}
