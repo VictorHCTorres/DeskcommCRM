@@ -25,12 +25,14 @@ import { createClient } from "@/lib/supabase/server";
 import { registraAtividadeDaTarefa } from "@/lib/tarefas/atividade";
 import { conferirDemanda } from "@/lib/tarefas/demanda";
 import { conferirResponsavel } from "@/lib/tarefas/responsavel";
+import { COLUNAS_DA_TAREFA } from "@/lib/tarefas/gravar-tarefa";
+import { instanteAposConclusao } from "@/lib/tarefas/recorrencia";
 import { PRIORIDADES_DA_TAREFA, SITUACOES_DA_TAREFA, type Tarefa } from "@/lib/tarefas/tipos";
+import { conferirVinculosDaTarefa } from "@/lib/tarefas/vinculos";
 
 export const dynamic = "force-dynamic";
 
-const COLUNAS =
-  "id, organization_id, title, description, due_date, priority, status, lead_id, contact_id, demanda_id, assigned_to, created_by, created_at, updated_at, lead:crm_leads(id, title)";
+const COLUNAS = COLUNAS_DA_TAREFA;
 
 const edicaoSchema = z
   .object({
@@ -90,6 +92,23 @@ export async function PATCH(req: NextRequest, ctx: Contexto): Promise<Response> 
 
   const supabase = await createClient();
 
+  const vereditoDosVinculos = await conferirVinculosDaTarefa(
+    supabase,
+    authz.org.orgId,
+    parsed.data,
+  );
+  if (vereditoDosVinculos === "falha_na_consulta") {
+    return fail("internal_error", t("Erro ao salvar a tarefa."), 500, { requestId });
+  }
+  if (vereditoDosVinculos === "fora_da_organizacao") {
+    return fail(
+      "validation_failed",
+      t("O negócio, o contato ou a demanda vinculada não existe."),
+      422,
+      { requestId },
+    );
+  }
+
   if (parsed.data.demanda_id) {
     // A chave estrangeira não passa pela RLS: sem esta conferência, a demanda
     // de outra organização gravaria sem erro. A régua está em `lib/tarefas/demanda.ts`.
@@ -98,14 +117,24 @@ export async function PATCH(req: NextRequest, ctx: Contexto): Promise<Response> 
       return fail("internal_error", t("Erro ao salvar a tarefa."), 500, { requestId });
     }
     if (veredito === "fora_da_organizacao") {
-      return fail("validation_failed", t("O negócio, o contato ou a demanda vinculada não existe."), 422, {
-        requestId,
-      });
+      return fail(
+        "validation_failed",
+        t("O negócio, o contato ou a demanda vinculada não existe."),
+        422,
+        {
+          requestId,
+        },
+      );
     }
     if (veredito === "encerrada") {
-      return fail("state_conflict", t("Esta demanda já foi encerrada. Crie a tarefa numa demanda em andamento."), 409, {
-        requestId,
-      });
+      return fail(
+        "state_conflict",
+        t("Esta demanda já foi encerrada. Crie a tarefa numa demanda em andamento."),
+        409,
+        {
+          requestId,
+        },
+      );
     }
   }
 
@@ -114,7 +143,7 @@ export async function PATCH(req: NextRequest, ctx: Contexto): Promise<Response> 
   // timeline do negócio — e a segunda seria mentira.
   const { data: antes } = await supabase
     .from("crm_tasks")
-    .select("status")
+    .select("status, recurrence_id")
     .eq("id", id)
     .eq("organization_id", authz.org.orgId)
     .maybeSingle();
@@ -132,9 +161,14 @@ export async function PATCH(req: NextRequest, ctx: Contexto): Promise<Response> 
       return fail("not_found", t("Tarefa não encontrada."), 404, { requestId });
     }
     if (error.code === "23503") {
-      return fail("validation_failed", t("O negócio, o contato ou a demanda vinculada não existe."), 422, {
-        requestId,
-      });
+      return fail(
+        "validation_failed",
+        t("O negócio, o contato ou a demanda vinculada não existe."),
+        422,
+        {
+          requestId,
+        },
+      );
     }
     return fail("internal_error", t("Erro ao salvar a tarefa."), 500, { requestId });
   }
@@ -160,6 +194,36 @@ export async function PATCH(req: NextRequest, ctx: Contexto): Promise<Response> 
       tipo: "task_completed",
       actor: { type: "user", id: authz.user.id },
     });
+
+    const recurrenceId = (antes as { recurrence_id?: string | null } | null)?.recurrence_id;
+    if (recurrenceId) {
+      const { data: recorrencia } = await supabase
+        .from("crm_task_recurrences" as never)
+        .select("id, frequency, interval, mode, timezone, active, current_task_id" as never)
+        .eq("id", recurrenceId)
+        .eq("organization_id", authz.org.orgId)
+        .maybeSingle();
+      const regra = recorrencia as unknown as {
+        id: string;
+        frequency: "daily" | "weekly" | "monthly";
+        interval: number;
+        mode: "on_schedule" | "after_completion";
+        timezone: string;
+        active: boolean;
+        current_task_id: string | null;
+      } | null;
+      if (regra?.active && regra.mode === "after_completion" && regra.current_task_id === id) {
+        const agora = new Date();
+        const proxima = instanteAposConclusao(agora, regra).toISOString();
+        await supabase
+          .from("crm_task_recurrences" as never)
+          .update({ next_run_at: agora.toISOString(), next_due_at: proxima } as never)
+          .eq("id", regra.id)
+          .eq("organization_id", authz.org.orgId)
+          .eq("current_task_id", id)
+          .is("next_run_at", null);
+      }
+    }
   }
 
   return ok({ task: tarefa }, { requestId });
@@ -177,6 +241,30 @@ export async function DELETE(_req: NextRequest, ctx: Contexto): Promise<Response
   const t = (texto: string) => traduzir(texto, authz.user.idioma);
 
   const supabase = await createClient();
+  const { data: alvo } = await supabase
+    .from("crm_tasks")
+    .select("id, recurrence_id")
+    .eq("id", id)
+    .eq("organization_id", authz.org.orgId)
+    .maybeSingle();
+  if (!alvo) return fail("not_found", t("Tarefa não encontrada."), 404, { requestId });
+  if ((alvo as { recurrence_id?: string | null }).recurrence_id) {
+    const { data: serie } = await supabase
+      .from("crm_task_recurrences" as never)
+      .select("active, current_task_id" as never)
+      .eq("id", (alvo as { recurrence_id: string }).recurrence_id)
+      .eq("organization_id", authz.org.orgId)
+      .maybeSingle();
+    const ativa = serie as unknown as { active: boolean; current_task_id: string | null } | null;
+    if (ativa?.active && ativa.current_task_id === id) {
+      return fail(
+        "state_conflict",
+        t("Cancele a recorrência antes de apagar a ocorrência atual."),
+        409,
+        { requestId },
+      );
+    }
+  }
   // `.select()` no delete para saber se ALGUMA linha saiu. Sem isso, apagar uma
   // tarefa de outra organização devolveria 200 — e a tela sumiria com a linha
   // do próprio usuário na próxima recarga, sem que nada tivesse sido apagado.

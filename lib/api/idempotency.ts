@@ -57,13 +57,16 @@
  * `tests/invariants/idempotencia-reserva-antes-do-efeito.test.ts`.
  *
  * ── Reserva vencida ─────────────────────────────────────────────────────────
- * A reserva vale `JANELA_DA_RESERVA_MS` (60s — o efeito é uma escrita, não um
- * job). Se a requisição morrer antes de gravar o recibo terminal, a reserva
+ * A reserva vale `JANELA_DA_RESERVA_MS` por padrão (60s — adequado às escritas
+ * curtas). Efeitos HTTP limitados, porém mais longos, podem declarar
+ * `reservaMs`; a reserva precisa cobrir o teto inteiro da operação para não
+ * permitir que uma retentativa tome posse enquanto o primeiro efeito ainda
+ * roda. Se a requisição morrer antes de gravar o recibo terminal, a reserva
  * vence e a chave volta a ser de quem chegar depois: a linha vencida é
  * reescrita como reserva nova, em vez de trancar a chave para sempre. O preço
  * é conhecido e está declarado: se o efeito ainda estiver rodando quando a
  * reserva vencer, o novo dono pode executá-lo de novo. É por isso que a janela
- * da reserva (60s) e o TTL do recibo (24h) são números diferentes.
+ * da reserva e o TTL do recibo (24h) são números diferentes.
  *
  * ── Falha ao gravar ─────────────────────────────────────────────────────────
  * Se o efeito já aconteceu e a gravação do recibo falha, o desfecho devolvido
@@ -94,6 +97,9 @@ export const TTL_MS = 24 * 60 * 60 * 1000;
  * Curto de propósito: é o teto do efeito, não a janela da idempotência.
  */
 export const JANELA_DA_RESERVA_MS = 60 * 1000;
+
+/** Janela das rotas ClickUp longas, incluindo retries e backoff limitados. */
+export const JANELA_LONGA_DA_RESERVA_MS = 15 * 60 * 1000;
 
 export type Recibo = {
   /** `bytea` no banco: chega como o literal `\x…` (PostgREST) ou como `Buffer` (`pg`). */
@@ -179,6 +185,8 @@ export type EntradaDaIdempotencia<T> = {
   corpo: unknown;
   /** O efeito. Só é chamado por quem conseguir reservar a chave. */
   executar: () => Promise<{ resposta: T; status: number }>;
+  /** Teto do efeito; operações longas devem cobrir toda a execução. Máximo: TTL do recibo. */
+  reservaMs?: number;
   /** Relógio injetado — o repo testa janela de tempo assim, não com sleep. */
   agora?: () => Date;
 };
@@ -191,6 +199,10 @@ export async function comIdempotencia<T>(
 ): Promise<DesfechoIdempotente<T>> {
   const { db, organizationId, endpoint, chave, corpo, executar } = entrada;
   const agora = entrada.agora ?? (() => new Date());
+  const reservaMs = entrada.reservaMs ?? JANELA_DA_RESERVA_MS;
+  if (!Number.isInteger(reservaMs) || reservaMs < 1_000 || reservaMs > TTL_MS) {
+    throw new Error("invalid_idempotency_reservation_window");
+  }
   const hash = hashDoCorpo(corpo);
 
   /**
@@ -206,9 +218,7 @@ export async function comIdempotencia<T>(
       .eq("organization_id", organizationId)
       .eq("key", chave)
       .eq("endpoint", endpoint);
-    const comJanela = somenteVivo
-      ? consulta.gt("expires_at", agora().toISOString())
-      : consulta;
+    const comJanela = somenteVivo ? consulta.gt("expires_at", agora().toISOString()) : consulta;
     const { data } = await comJanela.maybeSingle();
     return (data as LinhaDaChave | null) ?? null;
   };
@@ -227,7 +237,7 @@ export async function comIdempotencia<T>(
   const anterior = await lerLinha(true);
   if (anterior) return classificar(anterior);
 
-  const expiraEm = new Date(agora().getTime() + JANELA_DA_RESERVA_MS).toISOString();
+  const expiraEm = new Date(agora().getTime() + reservaMs).toISOString();
   const { error: erroDaReserva } = await db.from("idempotency_keys").insert({
     organization_id: organizationId,
     key: chave,

@@ -174,6 +174,8 @@ function projecaoSql(colunas: string, aliasExterno: string): { sql: string; temE
 class ConsultaPg<T> implements PromiseLike<RespostaFalsa<T[]>> {
   /** [operador, coluna, valor] — o operador entra porque `.lt`/`.gt` existem. */
   private filtros: Array<[string, string, unknown]> = [];
+  /** Cada item é um grupo `.or(...)`; os grupos convivem por AND com `.eq()` etc. */
+  private filtrosOu: Array<Array<[string, string, unknown]>> = [];
   private ordem: { coluna: string; asc: boolean } | null = null;
   private teto: number | null = null;
 
@@ -289,6 +291,27 @@ class ConsultaPg<T> implements PromiseLike<RespostaFalsa<T[]>> {
     return this;
   }
 
+  /**
+   * OR textual do PostgREST — a cascata LGPD usa
+   * `contact_id.eq.<id>,lead_id.in.(<ids>)` para alcançar todas as tarefas do
+   * titular. Ignorar esse grupo faria o invariante afirmar anonimização sem
+   * sequer consultar o mesmo conjunto que a produção consulta.
+   */
+  or(filtro: string): this {
+    const grupo = fatiarNoTopo(filtro).map((parte): [string, string, unknown] => {
+      const match = /^([A-Za-z0-9_]+)\.(eq|in)\.([^]*)$/.exec(parte.trim());
+      if (!match) return naoImplementado(`or(${filtro})`);
+      const [, coluna, operador, valor] = match;
+      if (operador === "eq") {
+        return ["=", coluna!, valor!.replace(/^"(.*)"$/, "$1")];
+      }
+      return ["= any", coluna!, listaDoPostgrest(valor)];
+    });
+    if (grupo.length === 0) return naoImplementado("or(vazio)");
+    this.filtrosOu.push(grupo);
+    return this;
+  }
+
   /** Presentes para ESTOURAR: o código que os usar precisa de implementação real. */
   neq(): never {
     return naoImplementado("neq");
@@ -296,7 +319,7 @@ class ConsultaPg<T> implements PromiseLike<RespostaFalsa<T[]>> {
 
   private montar(): { texto: string; valores: unknown[] } {
     const valores: unknown[] = [];
-    const onde = this.filtros.map(([op, c, v]) => {
+    const condicao = ([op, c, v]: [string, string, unknown]) => {
       // `is` não gasta placeholder: a palavra entra inline.
       if (op === "is") return `"${c}" is ${literalDeIs(v)}`;
       if (op === "is not") return `"${c}" is not ${literalDeIs(v)}`;
@@ -306,7 +329,9 @@ class ConsultaPg<T> implements PromiseLike<RespostaFalsa<T[]>> {
       if (op === "= any") return `"${c}" = any($${valores.length})`;
       if (op === "not = any") return `not ("${c}" = any($${valores.length}))`;
       return `"${c}" ${op} $${valores.length}`;
-    });
+    };
+    const onde = this.filtros.map(condicao);
+    onde.push(...this.filtrosOu.map((grupo) => `(${grupo.map(condicao).join(" or ")})`));
     const projecao = projecaoSql(this.colunas, "linha");
     let texto = `select ${projecao.sql} from public."${this.tabela}"`;
     // O alias só entra quando há embed: a subquery precisa apontar para a

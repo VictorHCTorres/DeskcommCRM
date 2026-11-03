@@ -51,7 +51,11 @@ import { type NextRequest } from "next/server";
 import { fail, ok } from "@/lib/api/wrappers";
 import { requireRole } from "@/lib/auth/require-role";
 import { traduzir } from "@/lib/i18n/dicionario";
-import { donoDoFiltro, lerFiltrosDaLista } from "@/lib/kanban/filtros-da-lista";
+import {
+  donoDoFiltro,
+  lerFiltrosDaLista,
+  lerOrdenacaoDaLista,
+} from "@/lib/kanban/filtros-da-lista";
 import { createClient } from "@/lib/supabase/server";
 import type { Lead } from "@/lib/types/leads";
 
@@ -114,6 +118,14 @@ export async function GET(req: NextRequest, ctx: RouteCtx): Promise<Response> {
     });
   }
   const filtros = lidos.filtros;
+  const ordemLida = lerOrdenacaoDaLista(params);
+  if (!ordemLida.ok) {
+    return fail("validation_failed", t("Parâmetros inválidos."), 422, {
+      requestId,
+      details: { [ordemLida.campo]: ["valor desconhecido"] },
+    });
+  }
+  const ordenacao = ordemLida.ordenacao;
 
   const supabase = await createClient();
 
@@ -162,14 +174,23 @@ export async function GET(req: NextRequest, ctx: RouteCtx): Promise<Response> {
         ? consulta.is("owner_user_id", null).is("owner_agent_id", null)
         : consulta.eq(dono.coluna, dono.id);
   }
+  const colunaDaOrdem =
+    ordenacao.field === "title"
+      ? "title"
+      : ordenacao.field === "last_activity"
+        ? "last_activity_at"
+        : "position_in_stage";
   const { data, error } = await consulta
-    .order("position_in_stage")
+    .order(colunaDaOrdem, {
+      ascending: ordenacao.direction === "asc",
+      nullsFirst: false,
+    })
     // O DESEMPATE (`.order("id")`). Sem ele, dois negócios com a MESMA
     // `position_in_stage` — o lote que gravou a mesma posição em N linhas, ou
     // duas etapas que compartilham a posição — saem na ordem que o plano
     // escolher: a página 2 pode repetir um item que já veio na 1 e pular outro.
     // Com o desempate, a mesma URL devolve sempre as mesmas linhas.
-    .order("id")
+    .order("id", { ascending: ordenacao.direction === "asc" })
     .range(de, de + porPagina);
   if (error) {
     return fail("internal_error", error.message, 500, { requestId });

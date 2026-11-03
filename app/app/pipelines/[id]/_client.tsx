@@ -25,6 +25,7 @@ function formatError(err: unknown, t: (texto: string) => string): string {
 import { KanbanBoard } from "@/components/kanban/KanbanBoard";
 import { CalendarioDoFunil } from "@/components/kanban/CalendarioDoFunil";
 import { ListaDoFunil } from "@/components/kanban/ListaDoFunil";
+import { SeletorDeVisoes } from "@/components/kanban/SeletorDeVisoes";
 import { FilterBar } from "@/components/kanban/FilterBar";
 import { BulkActionBar } from "@/components/kanban/BulkActionBar";
 import { NewLeadDialog } from "@/components/kanban/NewLeadDialog";
@@ -32,7 +33,9 @@ import { Button } from "@/components/ui/button";
 import {
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
+  SelectLabel,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
@@ -43,6 +46,16 @@ import type { Pipeline, Stage } from "@/lib/kanban/types";
 import { categoriaDoMotivo } from "@/lib/leads/motivos-de-perda-do-funil";
 import { ROLE_RANK, type Role } from "@/lib/auth/types";
 import { cn } from "@/lib/utils";
+import { gruposPorArea, type GrupoDeFunil } from "@/lib/pipelines/grupos";
+import {
+  configuracaoDoCalendarioSchema,
+  ordenacaoDaListaSchema,
+  paramsDaVisao,
+  assinaturaDaVisao,
+  type ConfiguracaoDoCalendario,
+  type OrdenacaoDaLista,
+  type VisaoSalvaDoFunil,
+} from "@/lib/kanban/visoes-salvas";
 
 /**
  * AS TRÊS VISÕES DO FUNIL (#2770, #3172).
@@ -72,6 +85,7 @@ export function PipelinePageClient({
   initialName,
   role,
   funis,
+  grupos = [],
   funilInicial,
   etapasIniciais,
 }: {
@@ -83,7 +97,9 @@ export function PipelinePageClient({
    * partição da tela de Funis. É o que alimenta o seletor de troca rápida do
    * cabeçalho; sem ele o quadro não sabe que existem outros funis.
    */
-  funis: Array<{ id: string; name: string }>;
+  funis: Array<{ id: string; name: string; group_id?: string | null }>;
+  /** Áreas e grupos ativos que dão contexto ao seletor de troca rápida. */
+  grupos?: GrupoDeFunil[];
   /**
    * O FUNIL, da leitura leve — `crm_pipelines` menos os negócios (#3172, item 4
    * do CR). É dele que a aba Lista tira o `settings` da ficha e o vocabulário,
@@ -111,6 +127,20 @@ export function PipelinePageClient({
   const searchParams = useSearchParams();
   const visaoDaUrl = visaoDoParam(searchParams.get("visao"));
   const [visao, setVisao] = useState<Visao>(visaoDaUrl);
+  const [ordenacaoDaLista, setOrdenacaoDaLista] = useState<OrdenacaoDaLista>({
+    field: "position",
+    direction: "asc",
+  });
+  const [configuracaoDoCalendario, setConfiguracaoDoCalendario] =
+    useState<ConfiguracaoDoCalendario>({
+      mode: "month",
+      date_field: null,
+      end_date_field: null,
+    });
+  const [visaoSalvaAtiva, setVisaoSalvaAtiva] = useState<string | null>(null);
+  const [assinaturaSalva, setAssinaturaSalva] = useState<string | null>(null);
+  const [avisoDaVisao, setAvisoDaVisao] = useState<string | null>(null);
+  const [reinicioDoCalendario, setReinicioDoCalendario] = useState(0);
   /**
    * O ajuste de estado no RENDER quando a URL muda — o mesmo padrão que o
    * `NewLeadDialog` usa para o contato dele. Um link para o MESMO funil com
@@ -168,10 +198,7 @@ export function PipelinePageClient({
     setUrlAnterior(urlAtual);
     setPedido(null);
   }
-  const filters = useMemo(
-    () => pedido ?? filtersFromParams(searchParams),
-    [pedido, searchParams],
-  );
+  const filters = useMemo(() => pedido ?? filtersFromParams(searchParams), [pedido, searchParams]);
   const setFilters = useCallback(
     (next: LeadFilters) => {
       const p = new URLSearchParams(filtersToParams(next));
@@ -184,6 +211,8 @@ export function PipelinePageClient({
        */
       const visaoPedida = searchParams.get("visao");
       if (visaoPedida) p.set("visao", visaoPedida);
+      const viewPedida = searchParams.get("view");
+      if (viewPedida) p.set("view", viewPedida);
       const qs = p.toString();
       setPedido(next);
       router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
@@ -209,6 +238,61 @@ export function PipelinePageClient({
     },
     [router, pathname, searchParams],
   );
+  const estadoDaVisao = useMemo(
+    () => ({
+      view_type: visao,
+      filters,
+      sort_config: ordenacaoDaLista,
+      view_config: visao === "calendario" ? configuracaoDoCalendario : {},
+    }),
+    [configuracaoDoCalendario, filters, ordenacaoDaLista, visao],
+  );
+  const assinaturaAtual = useMemo(() => assinaturaDaVisao(estadoDaVisao), [estadoDaVisao]);
+  const aplicarVisaoSalva = useCallback(
+    (salva: VisaoSalvaDoFunil | null) => {
+      if (!salva) {
+        setVisaoSalvaAtiva(null);
+        setAssinaturaSalva(null);
+        const p = new URLSearchParams(searchParams.toString());
+        p.delete("view");
+        const qs = p.toString();
+        router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
+        return;
+      }
+      const ordem = ordenacaoDaListaSchema.parse(salva.sort_config);
+      const calendario =
+        salva.view_type === "calendario"
+          ? configuracaoDoCalendarioSchema.parse(salva.view_config)
+          : { mode: "month" as const, date_field: null, end_date_field: null };
+      setVisao(salva.view_type);
+      setPedido(salva.filters);
+      setOrdenacaoDaLista(ordem);
+      setConfiguracaoDoCalendario(calendario);
+      setReinicioDoCalendario((valor) => valor + 1);
+      setVisaoSalvaAtiva(salva.id);
+      setAssinaturaSalva(
+        assinaturaDaVisao({
+          view_type: salva.view_type,
+          filters: salva.filters,
+          sort_config: ordem,
+          view_config: salva.view_config,
+        }),
+      );
+      setAvisoDaVisao(null);
+      const qs = paramsDaVisao(salva, searchParams).toString();
+      router.replace(`${pathname}?${qs}`, { scroll: false });
+    },
+    [pathname, router, searchParams],
+  );
+  const visaoIndisponivel = useCallback(() => {
+    const p = new URLSearchParams(searchParams.toString());
+    p.delete("view");
+    setVisaoSalvaAtiva(null);
+    setAssinaturaSalva(null);
+    setAvisoDaVisao(t("Esta visualização não existe mais ou não está disponível para você."));
+    const qs = p.toString();
+    router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
+  }, [pathname, router, searchParams, t]);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [newOpen, setNewOpen] = useState(false);
   /**
@@ -264,6 +348,10 @@ export function PipelinePageClient({
   const nomeAtual = data?.pipeline.name ?? initialName;
   // Um funil só = nada para trocar: o seletor seria ruído permanente.
   const podeTrocar = funis.length > 1;
+  const estruturaDeFunis = gruposPorArea(grupos);
+  const idsAgrupados = new Set(
+    estruturaDeFunis.flatMap(({ grupos: filhos }) => filhos.map((g) => g.id)),
+  );
 
   return (
     <div
@@ -343,11 +431,34 @@ export function PipelinePageClient({
               <SelectValue placeholder={nomeAtual} />
             </SelectTrigger>
             <SelectContent>
-              {funis.map((f) => (
-                <SelectItem key={f.id} value={f.id} data-testid={`trocar-funil-opcao-${f.id}`}>
-                  {f.name}
-                </SelectItem>
+              {estruturaDeFunis.map(({ area, grupos: filhos }) => (
+                <SelectGroup key={area.id}>
+                  <SelectLabel>{area.name}</SelectLabel>
+                  {filhos.flatMap((grupo) => {
+                    const doGrupo = funis.filter((funil) => funil.group_id === grupo.id);
+                    return doGrupo.map((funil) => (
+                      <SelectItem
+                        key={funil.id}
+                        value={funil.id}
+                        data-testid={`trocar-funil-opcao-${funil.id}`}
+                      >
+                        {grupo.name} › {funil.name}
+                      </SelectItem>
+                    ));
+                  })}
+                </SelectGroup>
               ))}
+              {funis
+                .filter((funil) => !funil.group_id || !idsAgrupados.has(funil.group_id))
+                .map((funil) => (
+                  <SelectItem
+                    key={funil.id}
+                    value={funil.id}
+                    data-testid={`trocar-funil-opcao-${funil.id}`}
+                  >
+                    {funil.name}
+                  </SelectItem>
+                ))}
             </SelectContent>
           </Select>
         )}
@@ -363,6 +474,18 @@ export function PipelinePageClient({
           passar pelo quadro.
         */}
         <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+          {!arquivado && (
+            <SeletorDeVisoes
+              pipelineId={pipelineId}
+              activeViewId={visaoSalvaAtiva}
+              requestedViewId={searchParams.get("view")}
+              modified={assinaturaSalva !== null && assinaturaAtual !== assinaturaSalva}
+              current={estadoDaVisao}
+              canManageShared={ROLE_RANK[role] >= ROLE_RANK.manager}
+              onApply={aplicarVisaoSalva}
+              onUnavailable={visaoIndisponivel}
+            />
+          )}
           {/* A DENSIDADE DOS CARDS (issue #3461, item 2) mora AO LADO das abas
               da visão, e só no Quadro: é a mesma família de escolha ("como eu
               olho este funil"), mas ela não muda o que se vê — muda quanto cabe.
@@ -454,9 +577,18 @@ export function PipelinePageClient({
           {t(
             "Este funil está arquivado: o quadro abre em leitura, e nada aqui grava até você tirá-lo do arquivo em Funis.",
           )}{" "}
-          <Link href="/app/kanban" className="underline" data-testid="funil-arquivado-ir-para-funis">
+          <Link
+            href="/app/kanban"
+            className="underline"
+            data-testid="funil-arquivado-ir-para-funis"
+          >
             {t("Funis")}
           </Link>
+        </p>
+      )}
+      {avisoDaVisao && (
+        <p role="alert" aria-live="assertive" className="text-sm text-warning-fg">
+          {avisoDaVisao}
         </p>
       )}
       {etapasIniciais.length > 0 && (
@@ -509,6 +641,8 @@ export function PipelinePageClient({
           pipeline={funilInicial}
           stages={etapasIniciais}
           filtros={filters}
+          ordenacao={ordenacaoDaLista}
+          onOrdenacaoChange={setOrdenacaoDaLista}
         />
       ) : error ? (
         <div className="rounded-md border border-destructive/30 bg-destructive/10 p-4 text-sm">
@@ -522,10 +656,13 @@ export function PipelinePageClient({
         // A MESMA lista filtrada do quadro: as duas abas olham o mesmo funil,
         // e discordar sobre quem está nele seria pior do que não ter filtro.
         <CalendarioDoFunil
+          key={`${visaoSalvaAtiva ?? "manual"}-${reinicioDoCalendario}`}
           pipelineId={pipelineId}
           pipeline={data.pipeline}
           stages={data.stages}
           leads={filteredLeads}
+          configuracao={configuracaoDoCalendario}
+          onConfiguracaoChange={setConfiguracaoDoCalendario}
         />
       ) : (
         <KanbanBoard

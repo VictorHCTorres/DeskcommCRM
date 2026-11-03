@@ -33,6 +33,23 @@ export interface FiltrosDaLista {
   status?: "open" | "won" | "lost";
 }
 
+export interface OrdenacaoDaLista {
+  field: "position" | "title" | "last_activity";
+  direction: "asc" | "desc";
+}
+
+export function lerOrdenacaoDaLista(
+  sp: URLSearchParams,
+): { ok: true; ordenacao: OrdenacaoDaLista } | { ok: false; campo: "sort" | "direction" } {
+  const field = sp.get("sort")?.trim() || "position";
+  if (field !== "position" && field !== "title" && field !== "last_activity") {
+    return { ok: false, campo: "sort" };
+  }
+  const direction = sp.get("direction")?.trim() || "asc";
+  if (direction !== "asc" && direction !== "desc") return { ok: false, campo: "direction" };
+  return { ok: true, ordenacao: { field, direction } };
+}
+
 /** O recorte da barra que a Lista sabe aplicar. "Todos" vira ausência, não valor. */
 export function filtrosDaLista(f: LeadFilters): FiltrosDaLista {
   const out: FiltrosDaLista = {};
@@ -76,9 +93,7 @@ export function filtrosForaDaLista(f: LeadFilters): FiltroForaDaLista[] {
  * pessoa casa `owner_user_id`, agente casa `owner_agent_id`, e "sem responsável"
  * é as DUAS nulas.
  */
-export type DonoDoFiltro =
-  | { coluna: "owner_user_id" | "owner_agent_id"; id: string }
-  | "ninguem";
+export type DonoDoFiltro = { coluna: "owner_user_id" | "owner_agent_id"; id: string } | "ninguem";
 
 export function donoDoFiltro(owner: string): DonoDoFiltro {
   if (owner === "unassigned") return "ninguem";

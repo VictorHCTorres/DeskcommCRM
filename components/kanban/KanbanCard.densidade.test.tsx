@@ -71,6 +71,13 @@ const LEAD = {
   value_cents: 250_000,
   currency: "BRL",
   tags: ["vip"],
+  source_metadata: {
+    clickup: {
+      priority: "high",
+      start_at: "2026-11-03T12:00:00.000Z",
+      time_estimate_ms: 1_800_000,
+    },
+  },
   stage_changed_at: ENTRADA_NA_ETAPA,
   created_at: ENTRADA_NA_ETAPA,
   owner_kind: "user",
@@ -152,6 +159,9 @@ describe("card compacto × confortável (#3461, item 2)", () => {
     expect(within(cartao).getByText(/Marcos/)).toBeInTheDocument();
     // E o tempo na etapa também.
     expect(within(cartao).getByText(/Negociação/)).toBeInTheDocument();
+    expect(within(cartao).getByText(/Prioridade: Alta/)).toBeInTheDocument();
+    expect(within(cartao).getByText(/Início: 2026-11-03/)).toBeInTheDocument();
+    expect(within(cartao).getByText(/Estimativa: 30min/)).toBeInTheDocument();
   });
 
   it("o compacto tira do card a conversa e o contato — e é isto que o PR declara", () => {

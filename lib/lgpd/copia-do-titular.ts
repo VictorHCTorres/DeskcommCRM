@@ -68,21 +68,21 @@ export const SECOES_DA_EQUIPE = {
  */
 export const O_QUE_FICA = {
   request_id: "o protocolo do pedido dele (o e-mail cita o começo)",
-  organization_id: "o \"ID interno\" que o PDF já imprime para o suporte",
+  organization_id: 'o "ID interno" que o PDF já imprime para o suporte',
   organization_legal_name: "o controlador: quem responde pelos dados",
   organization_display_name: "o nome com que o controlador se apresenta a ele",
   dpo_email: "o encarregado a quem ele se dirige",
   lei_citada: "a lei que fundamenta a resposta",
   lei_rotulo: "o rótulo dessa lei no país dele",
-  papel_controlador:
-    "como o documento chama quem responde pelos dados no país dele (issue #2344)",
+  papel_controlador: "como o documento chama quem responde pelos dados no país dele (issue #2344)",
   papel_encarregado:
     "como o documento chama o contato dele para pedidos de dados no país dele (issue #2344)",
   fuso: "o fuso das datas do documento",
   art15: "as informações do art. 15.º do RGPD devidas a ele",
-  messages_completas: "todas as mensagens dele, sem o recorte de 100 (doc 110, 2A: também no Brasil)",
+  messages_completas:
+    "todas as mensagens dele, sem o recorte de 100 (doc 110, 2A: também no Brasil)",
   secoes_no_limite: "a ressalva de que pode haver mais registros do que os entregues",
-  documento_rotulo: "o nome do documento dele no país (\"CPF\")",
+  documento_rotulo: 'o nome do documento dele no país ("CPF")',
   generated_at: "quando a cópia foi gerada",
   no_local_footprint: "se a instalação tem ou não dado dele",
   contact: "a ficha dele, inclusive os campos personalizados e a origem do anúncio",
@@ -124,8 +124,13 @@ export const O_QUE_FICA = {
   channel_session_groups: "os grupos de WhatsApp ligados a ele",
   group_messages_authored: "o que ele escreveu em grupos",
   conversation_drafts: "o texto escrito PARA ele por outro sistema",
-  contact_field_proposals: "o dado dele que a IA ouviu na conversa e propôs gravar, e o que se decidiu",
-  lead_attachments: "os documentos anexados aos negócios dele: nome, tipo, tamanho e data (o arquivo não vai no relatório)",
+  contact_field_proposals:
+    "o dado dele que a IA ouviu na conversa e propôs gravar, e o que se decidiu",
+  lead_attachments:
+    "os documentos anexados aos negócios dele: nome, tipo, tamanho e data (o arquivo não vai no relatório)",
+  task_attachments:
+    "os documentos ClickUp anexados às tarefas dele: nome, tipo, tamanho e data (o arquivo não vai no relatório)",
+  task_comments: "os comentários históricos ClickUp gravados nas tarefas dele",
   lead_notes: "a memória que a IA guarda sobre ele (LGPD art. 20)",
   ai_agent_runs:
     "o que a IA fez na conversa com ele e quando: o nome de cada ação, sem o que ela digitou (#1965, revisto no doc 110, 1A)",
@@ -135,7 +140,10 @@ export const O_QUE_FICA = {
 } as const;
 
 /** Toda seção do payload decidida: a que falta não compila. */
-const _todaSecaoDecidida = { ...O_QUE_FICA, ...SECOES_DA_EQUIPE } satisfies Record<keyof ExportPayload, string>;
+const _todaSecaoDecidida = { ...O_QUE_FICA, ...SECOES_DA_EQUIPE } satisfies Record<
+  keyof ExportPayload,
+  string
+>;
 void _todaSecaoDecidida;
 
 /**
@@ -163,7 +171,8 @@ export const CAMPOS_DA_EQUIPE: Readonly<Record<string, Readonly<Record<string, s
     meeting_state: "estado interno da criação do link da reunião (o link em si fica)",
   },
   case_events: {
-    metadata: "metadado do motor do caso: guarda o telefone (mascarado) do plantão avisado e chaves internas",
+    metadata:
+      "metadado do motor do caso: guarda o telefone (mascarado) do plantão avisado e chaves internas",
   },
   cases: {
     title: TEXTO_DA_IA_NO_CASO,
@@ -177,8 +186,7 @@ export const CAMPOS_DA_EQUIPE: Readonly<Record<string, Readonly<Record<string, s
   passagens: {
     motor: "qual dos dois motores do sistema passou a conversa",
     origem: "o caminho de código por onde a passagem entrou (o motivo, `motivo_codigo`, fica)",
-    body:
-      "a narrativa montada PARA quem vai atender (`montarBriefingDaPassagem`): repete o texto livre de quem passou — o `por_que`, o `cliente_quer` e o `o_que_tentei` da IA (doc 110, 1A) e a razão de quem escalou — e o resto já vai em `title`, `notes`, `tentativas` e `motivo_codigo`",
+    body: "a narrativa montada PARA quem vai atender (`montarBriefingDaPassagem`): repete o texto livre de quem passou — o `por_que`, o `cliente_quer` e o `o_que_tentei` da IA (doc 110, 1A) e a razão de quem escalou — e o resto já vai em `title`, `notes`, `tentativas` e `motivo_codigo`",
   },
   avisos_de_caso: {
     destino_mascarado: "telefone, mesmo mascarado, do FUNCIONÁRIO avisado: dado de terceiro",
@@ -200,7 +208,9 @@ export const NOTAS_SOBRE_O_TITULAR: Readonly<Record<string, Readonly<Record<stri
   sales: { notes: "anotação que o atendente escreveu na comanda" },
   "b2b.pessoa": { notes: "anotação da equipe sobre a pessoa na base de empresas" },
   "b2b.vinculos": { notes: "anotação da equipe sobre o vínculo com a empresa" },
-  contact_field_proposals: { motivo_recusa: "por que a equipe recusou a proposta de gravar um dado dele" },
+  contact_field_proposals: {
+    motivo_recusa: "por que a equipe recusou a proposta de gravar um dado dele",
+  },
   passagens: {
     content:
       "a razão que a pessoa da equipe escreveu ao escalar o caso (origem `caso_escalado`). Nas outras origens ele sai em todo país: ver `ORIGENS_DIGITADAS_PELA_IA`",
@@ -267,7 +277,8 @@ const ehChaveDeBanco = (campo: string) =>
 
 type Objeto = Record<string, unknown>;
 
-const ehObjeto = (v: unknown): v is Objeto => typeof v === "object" && v !== null && !Array.isArray(v);
+const ehObjeto = (v: unknown): v is Objeto =>
+  typeof v === "object" && v !== null && !Array.isArray(v);
 
 /** As linhas de uma seção: os itens da lista, ou o próprio objeto. */
 const linhasDe = (v: unknown): Objeto[] =>
@@ -333,7 +344,10 @@ function chavesQueSaoDaLinha(secao: string, linha: Objeto, p: Projecao): Set<str
   }
   if (secao === "case_events") {
     const ator = String(linha.actor_kind);
-    if (ATORES_DO_CASO_QUE_ESCREVEM_PARA_A_EQUIPE.has(ator) || (!p.recebeAsNotas && ator === "human")) {
+    if (
+      ATORES_DO_CASO_QUE_ESCREVEM_PARA_A_EQUIPE.has(ator) ||
+      (!p.recebeAsNotas && ator === "human")
+    ) {
       saida.add("body");
     }
   }
@@ -380,7 +394,9 @@ function projetaSecao(secao: string, valor: unknown, p: Projecao): unknown {
       // O que não é objeto não tem chave de banco a tirar; `undefined` de array
       // é `null` no JSON, como deixava a cópia profunda de antes (`stringify`
       // seguido de `parse`).
-      projetadas.push(ehObjeto(item) ? projetaLinha(secao, linhaDoTitulo(secao, item, p), p) : (item ?? null));
+      projetadas.push(
+        ehObjeto(item) ? projetaLinha(secao, linhaDoTitulo(secao, item, p), p) : (item ?? null),
+      );
     }
     return projetadas;
   }
@@ -432,7 +448,8 @@ function* planoDeSecoes(data: ExportPayload, pais: string): Generator<[string, u
 export function copiaDoTitular(data: ExportPayload, pais: string): Objeto {
   const p = projecaoDe(pais);
   const copia: Objeto = {};
-  for (const [secao, valor] of planoDeSecoes(data, pais)) copia[secao] = projetaSecao(secao, valor, p);
+  for (const [secao, valor] of planoDeSecoes(data, pais))
+    copia[secao] = projetaSecao(secao, valor, p);
   return copia;
 }
 
@@ -486,7 +503,12 @@ function escrito(valor: unknown, nivel: number): string {
  * e não a seção, nem o arquivo (`messages_completas` tem linhas de mais para
  * caber em memória como texto, #2576).
  */
-function* escreveSecao(secao: string, valor: unknown, nivel: number, p: Projecao): Generator<string> {
+function* escreveSecao(
+  secao: string,
+  valor: unknown,
+  nivel: number,
+  p: Projecao,
+): Generator<string> {
   if (Array.isArray(valor)) {
     if (valor.length === 0) {
       yield "[]";

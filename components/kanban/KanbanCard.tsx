@@ -17,6 +17,7 @@ import { OwnerBadge } from "./OwnerBadge";
 import { ContatoNoCard } from "./ContatoNoCard";
 import { ArquivosNoCard } from "./ArquivosNoCard";
 import { TarefasNoCard } from "./TarefasNoCard";
+import { clickUpLeadPresentation, formatClickUpEstimate } from "@/lib/clickup/presentation/lead";
 
 /** Os dois gestos de seleção que o card sabe relatar. */
 export type GestoDeSelecao = "alterna" | "intervalo";
@@ -123,6 +124,15 @@ export function KanbanCard({
   );
   const state = resolveCardState(card, t);
   const age = stageAgeLabel(card.hoursInStage, t);
+  const clickup = clickUpLeadPresentation(lead.source_metadata, lead.tags);
+  const priorityLabel = clickup.priority
+    ? {
+        low: t("Baixa"),
+        medium: t("Média"),
+        high: t("Alta"),
+        urgent: t("Urgente"),
+      }[clickup.priority]
+    : null;
 
   // Clique ABRE o dossiê; ctrl/cmd+clique SELECIONA; shift+clique estende até a
   // âncora. "Clicar abre" é a convenção mais forte, e seleção múltipla é recurso
@@ -145,11 +155,7 @@ export function KanbanCard({
   // O título é o maior e mais natural alvo do card. Quem lê "Segurando Shift,
   // um clique seleciona tudo entre o card anterior e o que você clicou" e clica
   // no card clica no nome dele — e recebia o dossiê.
-  const decidirClique = (e: {
-    shiftKey: boolean;
-    metaKey: boolean;
-    ctrlKey: boolean;
-  }): void => {
+  const decidirClique = (e: { shiftKey: boolean; metaKey: boolean; ctrlKey: boolean }): void => {
     if (e.shiftKey) {
       onSelect?.(card.id, "intervalo");
       return;
@@ -183,7 +189,7 @@ export function KanbanCard({
           data-densidade={denso ? "compacta" : "confortavel"}
           className={cn(
             "group relative overflow-hidden rounded-md border border-border bg-surface",
-            denso ? "py-1.5 pl-2.5 pr-2" : "py-2.5 pl-3 pr-3",
+            denso ? "py-1.5 pr-2 pl-2.5" : "py-2.5 pr-3 pl-3",
             "shadow-xs transition-colors",
             "hover:border-border-strong",
             snapshot.isDragging && "rotate-1 shadow-md ring-1 ring-accent/40",
@@ -244,9 +250,7 @@ export function KanbanCard({
                   className={cn(
                     "mt-1 h-4 w-4 shrink-0 cursor-pointer accent-accent transition-opacity",
                     "focus:opacity-100 focus-visible:outline-2 focus-visible:outline-accent",
-                    isSelected || isSelecting
-                      ? "opacity-100"
-                      : "opacity-0 group-hover:opacity-100",
+                    isSelected || isSelecting ? "opacity-100" : "opacity-0 group-hover:opacity-100",
                   )}
                 />
               )}
@@ -272,7 +276,7 @@ export function KanbanCard({
                 // dossiê). O dado não some — some a segunda linha.
                 title={denso ? card.title : undefined}
                 className={cn(
-                  "text-sm font-medium leading-5 text-text",
+                  "text-sm leading-5 font-medium text-text",
                   denso ? "line-clamp-1 h-5" : "line-clamp-2 h-10",
                 )}
               >
@@ -327,13 +331,47 @@ export function KanbanCard({
             {!value && !recorrente && "—"}
           </p>
 
+          {(priorityLabel ||
+            clickup.tags.length > 0 ||
+            clickup.startAt ||
+            clickup.timeEstimateMs != null) && (
+            <div
+              className="mt-1 flex min-w-0 items-center gap-1 overflow-hidden text-[10px]"
+              aria-label={t("Prioridade e tags do ClickUp")}
+            >
+              {priorityLabel ? (
+                <span className="shrink-0 rounded-md border border-border px-1.5 py-0.5 text-text-muted">
+                  {t("Prioridade")}: {priorityLabel}
+                </span>
+              ) : null}
+              {clickup.tags.slice(0, 2).map((tag) => (
+                <span
+                  key={tag}
+                  className="max-w-24 truncate rounded-full bg-muted px-1.5 py-0.5 text-text-muted"
+                >
+                  {tag}
+                </span>
+              ))}
+              {clickup.tags.length > 2 ? (
+                <span className="shrink-0 text-text-muted" aria-label={t("Mais tags")}>
+                  +{clickup.tags.length - 2}
+                </span>
+              ) : null}
+              {clickup.startAt ? (
+                <span className="shrink-0 text-text-muted">
+                  {t("Início")}: {clickup.startAt.slice(0, 10)}
+                </span>
+              ) : null}
+              {clickup.timeEstimateMs != null ? (
+                <span className="shrink-0 text-text-muted">
+                  {t("Estimativa")}: {formatClickUpEstimate(clickup.timeEstimateMs)}
+                </span>
+              ) : null}
+            </div>
+          )}
+
           {/* ③ a linha do agente — um slot, três estados, nunca três blocos. */}
-          <div
-            className={cn(
-              "flex items-center gap-2 text-xs",
-              denso ? "mt-1 h-5" : "mt-1.5 h-6",
-            )}
-          >
+          <div className={cn("flex items-center gap-2 text-xs", denso ? "mt-1 h-5" : "mt-1.5 h-6")}>
             {state.slot.type === "awaiting" && (
               // A proposta do agente é a ÚNICA linha do card com ação: é o
               // ponto onde a decisão do humano entra. Sem os botões aqui, o
@@ -419,7 +457,7 @@ export function KanbanCard({
               />
               <TarefasNoCard tarefas={lead.tarefas} />
             </div>
-            <span className="shrink-0 whitespace-nowrap text-[11px] tabular-nums text-text-muted">
+            <span className="shrink-0 text-[11px] whitespace-nowrap text-text-muted tabular-nums">
               {state.showStageAge && age
                 ? `${age} ${t("em")} ${card.stageName}`
                 : `${t("em")} ${card.stageName}`}

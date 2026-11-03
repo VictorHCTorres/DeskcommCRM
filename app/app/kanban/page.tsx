@@ -7,6 +7,8 @@ import { ROLE_RANK } from "@/lib/auth/types";
 import { createClient } from "@/lib/supabase/server";
 import { traduzir } from "@/lib/i18n/dicionario";
 import { FunisClient, type FunilDaLista } from "./_client";
+import type { SupabaseClient } from "@supabase/supabase-js";
+import { listarGruposDeFunil } from "@/lib/pipelines/grupos";
 
 export const dynamic = "force-dynamic";
 export const metadata: Metadata = { title: "Funis" };
@@ -47,7 +49,9 @@ export default async function KanbanPickerPage() {
     // invisível e indestrutível: quem arquivou não tinha como ver, tirar do
     // arquivo nem excluir o que arquivou. A separação passou para a partição
     // abaixo — a lista de trabalho continua só com os vivos.
-    .select("id, name, slug, description, position, is_default, is_client_pipeline, is_archived")
+    .select(
+      "id, name, slug, description, position, is_default, is_client_pipeline, is_archived, group_id",
+    )
     .eq("organization_id", activeOrg.orgId)
     .order("position");
 
@@ -63,6 +67,11 @@ export default async function KanbanPickerPage() {
   const podeImportar = ROLE_RANK[activeOrg.role] >= ROLE_RANK.agent;
   const idioma = user.idioma;
   const t = (texto: string) => traduzir(texto, idioma);
+  const grupos = await listarGruposDeFunil(
+    supabase as unknown as SupabaseClient,
+    activeOrg.orgId,
+    podeGerenciar,
+  );
 
   return (
     <div className="flex h-full flex-col gap-4 p-6">
@@ -83,6 +92,7 @@ export default async function KanbanPickerPage() {
         arquivados={arquivados}
         podeGerenciar={podeGerenciar}
         podeImportar={podeImportar}
+        grupos={grupos}
       />
     </div>
   );

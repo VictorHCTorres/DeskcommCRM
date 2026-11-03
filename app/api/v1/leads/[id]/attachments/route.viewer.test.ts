@@ -52,6 +52,7 @@ const h = vi.hoisted(() => {
   const upload = vi.fn();
   const remove = vi.fn();
   const assinar = vi.fn();
+  const download = vi.fn();
   const audit = vi.fn();
 
   /**
@@ -90,7 +91,7 @@ const h = vi.hoisted(() => {
     return b;
   }
 
-  return { db, consulta, upload, remove, assinar, audit };
+  return { db, consulta, upload, remove, assinar, download, audit };
 });
 
 let papelDaSessao: Role = "viewer";
@@ -119,12 +120,20 @@ vi.mock("@/lib/supabase/server", () => ({ createClient: async () => ({ from: h.c
 vi.mock("@/lib/supabase/admin", () => ({
   createAdminClient: () => ({
     from: h.consulta,
-    storage: { from: () => ({ upload: h.upload, remove: h.remove, createSignedUrl: h.assinar }) },
+    storage: {
+      from: () => ({
+        upload: h.upload,
+        remove: h.remove,
+        createSignedUrl: h.assinar,
+        download: h.download,
+      }),
+    },
   }),
 }));
 
 import { DELETE, GET, POST } from "@/app/api/v1/leads/[id]/attachments/route";
 import { GET as GET_MIDIA } from "@/app/api/v1/leads/[id]/attachments/[attachmentId]/media/route";
+import { clickUpAssetFinalPath } from "@/lib/clickup/assets/paths";
 
 const ctx = { params: Promise.resolve({ id: LEAD }) };
 const ctxDaMidia = { params: Promise.resolve({ id: LEAD, attachmentId: ANEXO }) };
@@ -142,7 +151,12 @@ beforeEach(() => {
       organization_id: ORG,
       settings: {
         fields: [
-          { key: "comprovante", label: "Comprovante", type: "file", obrigatorio_em: { etapas: [ETAPA] } },
+          {
+            key: "comprovante",
+            label: "Comprovante",
+            type: "file",
+            obrigatorio_em: { etapas: [ETAPA] },
+          },
         ],
       },
     },
@@ -165,6 +179,10 @@ beforeEach(() => {
   h.assinar
     .mockReset()
     .mockResolvedValue({ data: { signedUrl: "https://storage.local/assinado" }, error: null });
+  h.download.mockReset().mockResolvedValue({
+    data: new Blob(["arquivo"], { type: "application/pdf" }),
+    error: null,
+  });
   h.audit.mockReset().mockResolvedValue(undefined);
 });
 
@@ -184,6 +202,31 @@ describe("anexos do negócio — quem só lê (viewer) lê (#3431)", () => {
     expect(res.status).toBe(302);
     expect(res.headers.get("location")).toBe("https://storage.local/assinado");
     expect(h.assinar).toHaveBeenCalledTimes(1);
+  });
+
+  it("viewer abre anexo ClickUp pelo bucket privado sem signed URL persistida", async () => {
+    const existente = h.db.crm_lead_attachments?.[0];
+    expect(existente).toBeDefined();
+    h.db.crm_lead_attachments = [
+      {
+        ...existente!,
+        source_attachment_id: "clickup-att-1",
+        storage_path: clickUpAssetFinalPath({
+          organizationId: ORG,
+          workspaceId: "wk-1",
+          targetKind: "leads",
+          targetId: LEAD,
+          sha256: "a".repeat(64),
+          extension: "pdf",
+        }),
+      },
+    ];
+    const res = await GET_MIDIA(pedido("GET"), ctxDaMidia);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(res.headers.get("content-disposition")).toContain("contrato.pdf");
+    expect(h.download).toHaveBeenCalledOnce();
+    expect(h.assinar).not.toHaveBeenCalled();
   });
 
   it("CONTROLE: viewer NÃO sobe arquivo — o POST segue exigindo agent", async () => {

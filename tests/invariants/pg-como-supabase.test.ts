@@ -79,6 +79,22 @@ describe("o adaptador FILTRA", () => {
     expect(error).toBeNull();
     expect(data).toBeNull();
   });
+
+  it("`.or` aplica alternativas reais e preserva os filtros externos por AND", async () => {
+    const { data, error } = await db
+      .from("crm_pipelines")
+      .select("name")
+      .eq("organization_id", ORG)
+      .eq("is_default", false)
+      .or("slug.eq.bravo,slug.in.(alfa,zulu)");
+
+    expect(error).toBeNull();
+    expect((data as Array<{ name: string }>).map((x) => x.name).sort()).toEqual([
+      "Alfa",
+      "Bravo",
+      "Zulu",
+    ]);
+  });
 });
 
 describe("o adaptador COMPARA — `lt`/`gt`, não só igualdade", () => {

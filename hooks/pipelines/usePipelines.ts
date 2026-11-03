@@ -43,6 +43,8 @@ export interface PatchDeFunil {
    */
   is_archived?: false;
   depois_de?: string | null;
+  /** Grupo visual ativo; `null` devolve o funil para Sem grupo. */
+  group_id?: string | null;
 }
 
 /** O funil como as rotas o devolvem — a mesma forma que a página entrega por props. */
@@ -54,6 +56,7 @@ export interface FunilDaResposta {
   position: number;
   is_default: boolean;
   is_client_pipeline: boolean;
+  group_id?: string | null;
 }
 
 /**

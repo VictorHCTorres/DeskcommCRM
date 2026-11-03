@@ -1,0 +1,10 @@
+{
+  "attachments": [
+    {
+      "id": "a-task",
+      "name": "manual.pdf",
+      "size": 1024
+    }
+  ],
+  "next_cursor": null
+}

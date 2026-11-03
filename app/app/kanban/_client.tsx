@@ -1,11 +1,12 @@
 "use client";
-import { useState } from "react";
+import { Fragment, useMemo, useState } from "react";
 import Link from "next/link";
 
 import { useActiveOrg } from "@/hooks/auth/AuthProvider";
 import { useT } from "@/hooks/i18n/useT";
 
 import { ImportarLeads } from "./_components/ImportarLeads";
+import { OrganizacaoDeFunis } from "./_components/OrganizacaoDeFunis";
 import { EmptyPipeline } from "@/components/empty";
 import {
   AlertDialog,
@@ -21,6 +22,15 @@ import { Badge } from "@/components/ui/badge";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectLabel,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { ApiError } from "@/lib/api/types";
 import {
   Archive,
@@ -33,6 +43,7 @@ import {
   Trash,
 } from "@/lib/ui/icons";
 import { useArquivarFunil, useCriarFunil, useEditarFunil } from "@/hooks/pipelines/usePipelines";
+import { gruposPorArea, type GrupoDeFunil } from "@/lib/pipelines/grupos";
 
 export interface FunilDaLista {
   id: string;
@@ -42,6 +53,7 @@ export interface FunilDaLista {
   position: number;
   is_default: boolean;
   is_client_pipeline?: boolean;
+  group_id?: string | null;
 }
 
 /**
@@ -90,6 +102,7 @@ export function FunisClient({
   arquivados: arquivadosDoServidor,
   podeGerenciar,
   podeImportar,
+  grupos: gruposDoServidor = [],
 }: {
   funis: FunilDaLista[];
   /**
@@ -102,6 +115,7 @@ export function FunisClient({
   podeGerenciar: boolean;
   /** Espelha o `requireRole("agent")` de `POST /api/v1/leads/import`. */
   podeImportar: boolean;
+  grupos?: GrupoDeFunil[];
 }) {
   const t = useT();
   /**
@@ -129,6 +143,7 @@ export function FunisClient({
    */
   const [funis, setFunis] = useState<FunilDaLista[]>(funisDoServidor);
   const [arquivados, setArquivados] = useState<FunilDaLista[]>(arquivadosDoServidor);
+  const [grupos, setGrupos] = useState<GrupoDeFunil[]>(gruposDoServidor);
   const [ultimoDoServidor, setUltimoDoServidor] = useState<FunilDaLista[]>(funisDoServidor);
   // Ajuste DURANTE o render, não em efeito: é o padrão do React para "a prop
   // mudou, reponha o estado" e não dispara render em cascata (o efeito
@@ -141,6 +156,7 @@ export function FunisClient({
     setUltimoDoServidor(funisDoServidor);
     setFunis(funisDoServidor);
     setArquivados(arquivadosDoServidor);
+    setGrupos(gruposDoServidor);
   }
 
   const criar = useCriarFunil();
@@ -155,6 +171,42 @@ export function FunisClient({
   const [erro, setErro] = useState<{ id: string | null; texto: string } | null>(null);
 
   const ocupado = criar.isPending || editar.isPending || arquivar.isPending;
+  const estrutura = useMemo(() => gruposPorArea(grupos), [grupos]);
+  const grupoAtivoPorId = useMemo(
+    () =>
+      new Map(estrutura.flatMap(({ grupos: filhos }) => filhos.map((grupo) => [grupo.id, grupo]))),
+    [estrutura],
+  );
+  const areaPorId = useMemo(
+    () => new Map(estrutura.map(({ area }) => [area.id, area])),
+    [estrutura],
+  );
+  const ordemDoGrupo = useMemo(
+    () =>
+      new Map(
+        estrutura.flatMap(({ grupos: filhos }, areaIndex) =>
+          filhos.map((grupo, grupoIndex) => [grupo.id, areaIndex * 10_000 + grupoIndex]),
+        ),
+      ),
+    [estrutura],
+  );
+  const funisOrdenados = useMemo(
+    () =>
+      [...funis].sort((a, b) => {
+        const grupoA = a.group_id && grupoAtivoPorId.has(a.group_id) ? a.group_id : null;
+        const grupoB = b.group_id && grupoAtivoPorId.has(b.group_id) ? b.group_id : null;
+        const ordemA = grupoA
+          ? (ordemDoGrupo.get(grupoA) ?? Number.MAX_SAFE_INTEGER - 1)
+          : Number.MAX_SAFE_INTEGER;
+        const ordemB = grupoB
+          ? (ordemDoGrupo.get(grupoB) ?? Number.MAX_SAFE_INTEGER - 1)
+          : Number.MAX_SAFE_INTEGER;
+        return ordemA - ordemB || a.position - b.position;
+      }),
+    [funis, grupoAtivoPorId, ordemDoGrupo],
+  );
+  const secaoDoFunil = (funil: FunilDaLista) =>
+    funil.group_id && grupoAtivoPorId.has(funil.group_id) ? funil.group_id : "sem-grupo";
 
   /**
    * As DUAS listas vêm de toda resposta, e as duas se aplicam juntas.
@@ -234,7 +286,10 @@ export function FunisClient({
   }
 
   const formularioDeCriacao = novo !== null && (
-    <Card className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center" data-testid="form-novo-funil">
+    <Card
+      className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center"
+      data-testid="form-novo-funil"
+    >
       <Input
         autoFocus
         value={novo}
@@ -249,7 +304,11 @@ export function FunisClient({
         disabled={ocupado}
       />
       <div className="flex gap-2">
-        <Button onClick={criarFunil} disabled={ocupado || !novo.trim()} data-testid="confirmar-novo-funil">
+        <Button
+          onClick={criarFunil}
+          disabled={ocupado || !novo.trim()}
+          data-testid="confirmar-novo-funil"
+        >
           {t("Criar funil")}
         </Button>
         <Button variant="ghost" onClick={() => setNovo(null)} disabled={ocupado}>
@@ -485,7 +544,12 @@ export function FunisClient({
               uma vez por mês — ruído permanente para um gesto ocasional. */}
           {podeImportar ? <ImportarLeads funis={funis} /> : null}
           {podeGerenciar && novo === null ? (
-            <Button onClick={() => setNovo("")} disabled={ocupado} data-testid="novo-funil" className="w-full sm:w-auto">
+            <Button
+              onClick={() => setNovo("")}
+              disabled={ocupado}
+              data-testid="novo-funil"
+              className="w-full sm:w-auto"
+            >
               <Plus size={16} className="mr-2" aria-hidden /> {t("Novo funil")}
             </Button>
           ) : null}
@@ -494,6 +558,8 @@ export function FunisClient({
 
       {formularioDeCriacao}
 
+      {podeGerenciar && <OrganizacaoDeFunis grupos={grupos} onChange={setGrupos} />}
+
       {erro?.id === null && (
         <p className="text-sm text-destructive" data-testid="erro-geral">
           {erro.texto}
@@ -501,14 +567,29 @@ export function FunisClient({
       )}
 
       <ul className="flex flex-col divide-y divide-border rounded-md border border-border">
-        {funis.map((funil, i) => {
+        {funisOrdenados.map((funil, i) => {
           const renomeandoAqui = renomeando?.id === funil.id ? renomeando : null;
           const arquivandoAqui = arquivando?.id === funil.id ? arquivando : null;
           const erroDaLinha = erro?.id === funil.id ? erro.texto : null;
+          const secao = secaoDoFunil(funil);
+          const secaoAnterior = i > 0 ? secaoDoFunil(funisOrdenados[i - 1]!) : null;
+          const grupo = secao === "sem-grupo" ? null : grupoAtivoPorId.get(secao);
+          const area = grupo ? areaPorId.get(grupo.parent_id ?? "") : null;
+          const irmaos = funisOrdenados.filter((item) => secaoDoFunil(item) === secao);
+          const indiceNosIrmaos = irmaos.findIndex((item) => item.id === funil.id);
 
           return (
-            <li key={funil.id} className="flex flex-col gap-3 p-4" data-testid={`funil-${funil.id}`}>
-              {/* `sm:flex-wrap`: a linha do funil QUEBRA em vez de espremer a
+            <Fragment key={funil.id}>
+              {secao !== secaoAnterior && (
+                <li
+                  className="bg-muted/50 px-4 py-2 text-xs font-semibold text-muted-foreground"
+                  data-testid={`secao-${secao}`}
+                >
+                  {grupo && area ? `${area.name} › ${grupo.name}` : t("Sem grupo")}
+                </li>
+              )}
+              <li className="flex flex-col gap-3 p-4" data-testid={`funil-${funil.id}`}>
+                {/* `sm:flex-wrap`: a linha do funil QUEBRA em vez de espremer a
                   coluna do nome. Em ~900px o grupo de ações (Renomear/Tornar
                   padrão/Funil de clientes/Arquivar) e o `shrink-0` que ele
                   tinha tomavam a largura toda, a coluna do nome (`flex-1`)
@@ -518,33 +599,41 @@ export function FunisClient({
                   DENTRO do cartão; em janela cheia continuam ao lado, como
                   sempre. Vale em qualquer largura: não há breakpoint novo, só
                   a permissão de quebrar. */}
-              <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center">
-                {podeGerenciar && (
-                  <div className="flex shrink-0 flex-wrap gap-1">
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      aria-label={`${t("Subir")} «${funil.name}» ${t("na lista")}`}
-                      data-testid={`subir-${funil.id}`}
-                      disabled={ocupado || i === 0}
-                      onClick={() => aplicar(funil.id, { depois_de: vizinhoAoMover(funis, i, "subir") })}
-                    >
-                      <CaretUp size={16} aria-hidden />
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      aria-label={`${t("Descer")} «${funil.name}» ${t("na lista")}`}
-                      data-testid={`descer-${funil.id}`}
-                      disabled={ocupado || i === funis.length - 1}
-                      onClick={() => aplicar(funil.id, { depois_de: vizinhoAoMover(funis, i, "descer") })}
-                    >
-                      <CaretDown size={16} aria-hidden />
-                    </Button>
-                  </div>
-                )}
+                <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center">
+                  {podeGerenciar && (
+                    <div className="flex shrink-0 flex-wrap gap-1">
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        aria-label={`${t("Subir")} «${funil.name}» ${t("na lista")}`}
+                        data-testid={`subir-${funil.id}`}
+                        disabled={ocupado || indiceNosIrmaos === 0}
+                        onClick={() =>
+                          aplicar(funil.id, {
+                            depois_de: vizinhoAoMover(irmaos, indiceNosIrmaos, "subir"),
+                          })
+                        }
+                      >
+                        <CaretUp size={16} aria-hidden />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        aria-label={`${t("Descer")} «${funil.name}» ${t("na lista")}`}
+                        data-testid={`descer-${funil.id}`}
+                        disabled={ocupado || indiceNosIrmaos === irmaos.length - 1}
+                        onClick={() =>
+                          aplicar(funil.id, {
+                            depois_de: vizinhoAoMover(irmaos, indiceNosIrmaos, "descer"),
+                          })
+                        }
+                      >
+                        <CaretDown size={16} aria-hidden />
+                      </Button>
+                    </div>
+                  )}
 
-                {/* SEM `min-w-*`: o piso da coluna do nome é o PRÓPRIO conteúdo
+                  {/* SEM `min-w-*`: o piso da coluna do nome é o PRÓPRIO conteúdo
                     (min-width automático = palavra mais longa do nome + selos).
                     Com `min-w-0` ela encolhia até 0 e o nome ia para baixo dos
                     selos; um piso fixo (`min-w-40`, 160px) também não basta,
@@ -552,62 +641,69 @@ export function FunisClient({
                     e «Predeterminado» (es) passa sozinho dos 160px. Com o piso
                     no conteúdo, quando não cabe é a LINHA que quebra
                     (`sm:flex-wrap` acima), não o selo que cruza o slug. */}
-                <div className="flex-1">
-                  {renomeandoAqui ? (
-                    <div className="flex gap-2">
-                      <Input
-                        autoFocus
-                        value={renomeandoAqui.nome}
-                        onChange={(e) => setRenomeando({ id: funil.id, nome: e.target.value })}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") aplicar(funil.id, { name: renomeandoAqui.nome });
-                          if (e.key === "Escape") setRenomeando(null);
-                        }}
-                        aria-label={`${t("Novo nome de")} «${funil.name}»`}
-                        data-testid={`nome-${funil.id}`}
-                        disabled={ocupado}
-                      />
-                      <Button
-                        size="sm"
-                        onClick={() => aplicar(funil.id, { name: renomeandoAqui.nome })}
-                        disabled={ocupado || !renomeandoAqui.nome.trim()}
-                        data-testid={`salvar-nome-${funil.id}`}
+                  <div className="flex-1">
+                    {renomeandoAqui ? (
+                      <div className="flex gap-2">
+                        <Input
+                          autoFocus
+                          value={renomeandoAqui.nome}
+                          onChange={(e) => setRenomeando({ id: funil.id, nome: e.target.value })}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") aplicar(funil.id, { name: renomeandoAqui.nome });
+                            if (e.key === "Escape") setRenomeando(null);
+                          }}
+                          aria-label={`${t("Novo nome de")} «${funil.name}»`}
+                          data-testid={`nome-${funil.id}`}
+                          disabled={ocupado}
+                        />
+                        <Button
+                          size="sm"
+                          onClick={() => aplicar(funil.id, { name: renomeandoAqui.nome })}
+                          disabled={ocupado || !renomeandoAqui.nome.trim()}
+                          data-testid={`salvar-nome-${funil.id}`}
+                        >
+                          {t("Salvar")}
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => setRenomeando(null)}
+                          disabled={ocupado}
+                        >
+                          {t("Cancelar")}
+                        </Button>
+                      </div>
+                    ) : (
+                      <Link
+                        href={`/app/pipelines/${funil.id}`}
+                        className="group flex flex-col"
+                        data-testid={`abrir-${funil.id}`}
                       >
-                        {t("Salvar")}
-                      </Button>
-                      <Button variant="ghost" size="sm" onClick={() => setRenomeando(null)} disabled={ocupado}>
-                        {t("Cancelar")}
-                      </Button>
-                    </div>
-                  ) : (
-                    <Link
-                      href={`/app/pipelines/${funil.id}`}
-                      className="group flex flex-col"
-                      data-testid={`abrir-${funil.id}`}
-                    >
-                      <span className="flex items-center gap-2">
-                        <span className="text-sm font-medium group-hover:underline">{funil.name}</span>
-                        {funil.is_default && (
-                          <Badge variant="secondary" className="text-[10px]">
-                            {t("Padrão")}
-                          </Badge>
+                        <span className="flex items-center gap-2">
+                          <span className="text-sm font-medium group-hover:underline">
+                            {funil.name}
+                          </span>
+                          {funil.is_default && (
+                            <Badge variant="secondary" className="text-[10px]">
+                              {t("Padrão")}
+                            </Badge>
+                          )}
+                          {clientesLigado && funil.is_client_pipeline && (
+                            <Badge variant="secondary" className="text-[10px]">
+                              {t("Clientes")}
+                            </Badge>
+                          )}
+                        </span>
+                        {funil.description && (
+                          <span className="text-xs text-muted-foreground">{funil.description}</span>
                         )}
-                        {clientesLigado && funil.is_client_pipeline && (
-                          <Badge variant="secondary" className="text-[10px]">
-                            {t("Clientes")}
-                          </Badge>
-                        )}
-                      </span>
-                      {funil.description && (
-                        <span className="text-xs text-muted-foreground">{funil.description}</span>
-                      )}
-                    </Link>
-                  )}
-                </div>
+                      </Link>
+                    )}
+                  </div>
 
-                <span className="shrink-0 text-xs text-muted-foreground">/{funil.slug}</span>
+                  <span className="shrink-0 text-xs text-muted-foreground">/{funil.slug}</span>
 
-                {/*
+                  {/*
                   SEM `shrink-0`, que era a CAUSA: com ele o grupo exigia a
                   largura de todos os botões numa linha só (~419px de um cartão
                   de ~556px) e empurrava tudo para fora; a coluna do nome é que
@@ -615,118 +711,160 @@ export function FunisClient({
                   espaço na linha, a própria linha quebra (`sm:flex-wrap`) e ele
                   desce inteiro, dentro do cartão.
                 */}
-                {podeGerenciar && !renomeandoAqui && (
-                  <div className="flex min-w-0 flex-wrap gap-1">
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => setRenomeando({ id: funil.id, nome: funil.name })}
-                      disabled={ocupado}
-                      data-testid={`renomear-${funil.id}`}
-                    >
-                      <PencilSimple size={16} className="mr-1" aria-hidden /> {t("Renomear")}
-                    </Button>
-                    {!funil.is_default && (
+                  {podeGerenciar && !renomeandoAqui && (
+                    <div className="flex min-w-0 flex-wrap gap-1">
+                      <Select
+                        value={grupo?.id ?? "sem-grupo"}
+                        onValueChange={(group_id) =>
+                          aplicar(funil.id, {
+                            group_id: group_id === "sem-grupo" ? null : group_id,
+                          })
+                        }
+                        disabled={ocupado}
+                      >
+                        <SelectTrigger
+                          className="w-auto min-w-36"
+                          aria-label={`${t("Grupo de")} ${funil.name}`}
+                          data-testid={`grupo-${funil.id}`}
+                        >
+                          <SelectValue placeholder={t("Sem grupo")} />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="sem-grupo">{t("Sem grupo")}</SelectItem>
+                          {estrutura.map(({ area: areaDaOpcao, grupos: filhos }) => (
+                            <SelectGroup key={areaDaOpcao.id}>
+                              <SelectLabel>{areaDaOpcao.name}</SelectLabel>
+                              {filhos.map((filho) => (
+                                <SelectItem key={filho.id} value={filho.id}>
+                                  {filho.name}
+                                </SelectItem>
+                              ))}
+                            </SelectGroup>
+                          ))}
+                        </SelectContent>
+                      </Select>
                       <Button
                         variant="ghost"
                         size="sm"
-                        onClick={() => aplicar(funil.id, { is_default: true })}
+                        onClick={() => setRenomeando({ id: funil.id, nome: funil.name })}
                         disabled={ocupado}
-                        data-testid={`padrao-${funil.id}`}
+                        data-testid={`renomear-${funil.id}`}
                       >
-                        <Check size={16} className="mr-1" aria-hidden /> {t("Tornar padrão")}
+                        <PencilSimple size={16} className="mr-1" aria-hidden /> {t("Renomear")}
                       </Button>
-                    )}
-                    {/*
+                      {!funil.is_default && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => aplicar(funil.id, { is_default: true })}
+                          disabled={ocupado}
+                          data-testid={`padrao-${funil.id}`}
+                        >
+                          <Check size={16} className="mr-1" aria-hidden /> {t("Tornar padrão")}
+                        </Button>
+                      )}
+                      {/*
                       Ligar e desligar no MESMO lugar, ao contrário de "Tornar
                       padrão", que só liga: toda organização precisa de um funil
                       padrão, nenhuma precisa de um funil de clientes. Quem
                       experimentou tem de conseguir desfazer sem pedir ajuda.
                     */}
-                    {clientesLigado && (
+                      {clientesLigado && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() =>
+                            aplicar(funil.id, { is_client_pipeline: !funil.is_client_pipeline })
+                          }
+                          disabled={ocupado}
+                          data-testid={`clientes-${funil.id}`}
+                        >
+                          <Check size={16} className="mr-1" aria-hidden />{" "}
+                          {funil.is_client_pipeline
+                            ? t("Deixar de ser funil de clientes")
+                            : t("Funil de clientes")}
+                        </Button>
+                      )}
                       <Button
                         variant="ghost"
                         size="sm"
-                        onClick={() =>
-                          aplicar(funil.id, { is_client_pipeline: !funil.is_client_pipeline })
-                        }
+                        onClick={() => {
+                          setErro(null);
+                          setArquivando({ id: funil.id, erro: null });
+                        }}
                         disabled={ocupado}
-                        data-testid={`clientes-${funil.id}`}
+                        data-testid={`arquivar-${funil.id}`}
                       >
-                        <Check size={16} className="mr-1" aria-hidden />{" "}
-                        {funil.is_client_pipeline
-                          ? t("Deixar de ser funil de clientes")
-                          : t("Funil de clientes")}
+                        <Archive size={16} className="mr-1" aria-hidden /> {t("Arquivar")}
                       </Button>
-                    )}
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => {
-                        setErro(null);
-                        setArquivando({ id: funil.id, erro: null });
-                      }}
-                      disabled={ocupado}
-                      data-testid={`arquivar-${funil.id}`}
-                    >
-                      <Archive size={16} className="mr-1" aria-hidden /> {t("Arquivar")}
-                    </Button>
-                  </div>
-                )}
-              </div>
-
-              {erroDaLinha && (
-                <p className="text-sm leading-relaxed text-destructive" data-testid={`erro-${funil.id}`}>
-                  {erroDaLinha}
-                </p>
-              )}
-
-              {arquivandoAqui && (
-                <Card className="space-y-3 p-4" data-testid={`arquivar-painel-${funil.id}`}>
-                  {arquivandoAqui.erro ? (
-                    // A recusa da rota, INTEIRA: é ela que diz qual formulário ou
-                    // automação está no caminho, e o que fazer antes de tentar de novo.
-                    <p className="text-sm leading-relaxed" data-testid={`arquivar-erro-${funil.id}`}>
-                      {arquivandoAqui.erro}
-                    </p>
-                  ) : (
-                    <p className="text-sm leading-relaxed">
-                      {t("Arquivar")} «{funil.name}»?{" "}
-                      {t(
-                        "Ele sai desta lista e para de receber negócio novo. O histórico continua guardado, e nada é apagado.",
-                      )}
-                    </p>
+                    </div>
                   )}
-                  <div className="flex flex-wrap gap-2">
-                    <Button
-                      size="sm"
-                      onClick={() => pedirArquivamento(funil.id, false)}
-                      disabled={ocupado}
-                      data-testid={`arquivar-confirmar-${funil.id}`}
-                    >
-                      {t("Arquivar")}
-                    </Button>
-                    {/* Excluir de vez só passa no funil que NUNCA recebeu negócio.
+                </div>
+
+                {erroDaLinha && (
+                  <p
+                    className="text-sm leading-relaxed text-destructive"
+                    data-testid={`erro-${funil.id}`}
+                  >
+                    {erroDaLinha}
+                  </p>
+                )}
+
+                {arquivandoAqui && (
+                  <Card className="space-y-3 p-4" data-testid={`arquivar-painel-${funil.id}`}>
+                    {arquivandoAqui.erro ? (
+                      // A recusa da rota, INTEIRA: é ela que diz qual formulário ou
+                      // automação está no caminho, e o que fazer antes de tentar de novo.
+                      <p
+                        className="text-sm leading-relaxed"
+                        data-testid={`arquivar-erro-${funil.id}`}
+                      >
+                        {arquivandoAqui.erro}
+                      </p>
+                    ) : (
+                      <p className="text-sm leading-relaxed">
+                        {t("Arquivar")} «{funil.name}»?{" "}
+                        {t(
+                          "Ele sai desta lista e para de receber negócio novo. O histórico continua guardado, e nada é apagado.",
+                        )}
+                      </p>
+                    )}
+                    <div className="flex flex-wrap gap-2">
+                      <Button
+                        size="sm"
+                        onClick={() => pedirArquivamento(funil.id, false)}
+                        disabled={ocupado}
+                        data-testid={`arquivar-confirmar-${funil.id}`}
+                      >
+                        {t("Arquivar")}
+                      </Button>
+                      {/* Excluir de vez só passa no funil que NUNCA recebeu negócio.
                         A tela não sabe disso antes de perguntar — e não precisa
                         saber: a rota recusa explicando, e a explicação aparece
                         aqui mesmo. Fazer a tela adivinhar exigiria uma segunda
                         contagem, que discordaria da do servidor. */}
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => pedirArquivamento(funil.id, true)}
-                      disabled={ocupado}
-                      data-testid={`excluir-${funil.id}`}
-                    >
-                      {t("Excluir de vez")}
-                    </Button>
-                    <Button variant="ghost" size="sm" onClick={() => setArquivando(null)} disabled={ocupado}>
-                      {t("Cancelar")}
-                    </Button>
-                  </div>
-                </Card>
-              )}
-            </li>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => pedirArquivamento(funil.id, true)}
+                        disabled={ocupado}
+                        data-testid={`excluir-${funil.id}`}
+                      >
+                        {t("Excluir de vez")}
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => setArquivando(null)}
+                        disabled={ocupado}
+                      >
+                        {t("Cancelar")}
+                      </Button>
+                    </div>
+                  </Card>
+                )}
+              </li>
+            </Fragment>
           );
         })}
       </ul>
@@ -753,7 +891,11 @@ export function FunisClient({
           {t(
             "Para separar quem já é cliente, ligue “Clientes pela agenda” em Configurações › Tipos de agendamento. Enquanto estiver desligado, todo contato novo entra pelo funil padrão.",
           )}{" "}
-          <Link href="/app/settings/tenant/agenda" className="underline" data-testid="funis-rodape-ligar">
+          <Link
+            href="/app/settings/tenant/agenda"
+            className="underline"
+            data-testid="funis-rodape-ligar"
+          >
             {t("Abrir Tipos de agendamento")}
           </Link>
         </p>

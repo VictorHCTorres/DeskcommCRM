@@ -69,6 +69,9 @@ CRONS="
 # número: é o cron que dá a cadência base, e o ritmo da campanha e do canal
 # (channel_knobs + pacing_ledger) só sabem torná-la mais lenta.
 * * * * *|45|api/v1/cron/campaign-worker
+* * * * *|45|api/v1/cron/clickup-crm-import
+* * * * *|45|api/v1/cron/clickup-docs-import
+* * * * *|45|api/v1/cron/clickup-assets-import
 */5 * * * *|60|api/v1/cron/webhook-log-retention
 */5 * * * *|45|api/v1/cron/channel-health
 # A JANELA DE MANUTENÇÃO (#2388). Minuto a minuto porque o que ela decide é a
@@ -96,6 +99,8 @@ CRONS="
 # transformaria avisar 15 minutos antes em avisar até 20. Barato: só tarefa
 # com prazo na janela, com responsável, e que ainda não virou item da Central.
 */5 * * * *|45|api/v1/cron/task-reminder
+# Tarefas recorrentes: a cada 5 minutos, com CAS por série e UNIQUE por geração.
+*/5 * * * *|45|api/v1/cron/task-recurrence
 */15 * * * *|45|api/v1/cron/agenda-expira-pendentes
 */15 * * * *|60|api/v1/cron/risk-watcher
 # O CASO PARADO. De hora em hora, e não a cada 5 minutos: o prazo é de 24h, e

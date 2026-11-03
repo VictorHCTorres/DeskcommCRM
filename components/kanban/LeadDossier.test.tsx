@@ -88,6 +88,13 @@ const LEAD = {
   currency: "BRL",
   score: null,
   conversa: null,
+  tags: ["VIP"],
+  source_metadata: {
+    clickup: {
+      start_at: "2026-11-03T12:00:00.000Z",
+      time_estimate_ms: 7_200_000,
+    },
+  },
   owner_kind: null,
   owner_user_id: null,
   owner_agent_id: null,
@@ -119,7 +126,9 @@ function secao(id: string): HTMLElement {
 }
 
 function entradasVisiveis(): string[] {
-  return [...document.querySelectorAll("[data-entrada]")].map((n) => n.getAttribute("data-entrada")!);
+  return [...document.querySelectorAll("[data-entrada]")].map((n) =>
+    n.getAttribute("data-entrada")!,
+  );
 }
 
 function seisAtividades() {
@@ -143,7 +152,9 @@ describe("a ordem das seções do dossiê (#3181)", () => {
     // poderia estar certo com o título trocado de lugar. O seletor pega o
     // primeiro `<span>` do cabeçalho — o segundo é o sinal `+`/`−`, que é
     // `aria-hidden` mas continua no `textContent` do `<h3>`.
-    const titulos = ordemDasSecoes().map((id) => secao(id).querySelector("h3 button span")?.textContent);
+    const titulos = ordemDasSecoes().map(
+      (id) => secao(id).querySelector("h3 button span")?.textContent,
+    );
     expect(titulos).toEqual(["Contato", "Dados do negócio", "Linha do tempo"]);
 
     // E os campos do negócio vêm ANTES de a linha do tempo começar: era
@@ -152,7 +163,9 @@ describe("a ordem das seções do dossiê (#3181)", () => {
     const timeline = document.querySelector('[data-peca="linha-do-tempo"]');
     expect(campos).not.toBeNull();
     expect(timeline).not.toBeNull();
-    expect(campos!.compareDocumentPosition(timeline!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(
+      campos!.compareDocumentPosition(timeline!) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
   });
 
   it("as três seções nascem ABERTAS — sem preferência salva, ninguém esconde conteúdo", () => {
@@ -161,11 +174,17 @@ describe("a ordem das seções do dossiê (#3181)", () => {
     for (const id of ["contato", "dados-do-negocio", "linha-do-tempo"]) {
       expect(secao(id).getAttribute("data-recolhida")).toBe("nao");
       const cabecalho = within(secao(id)).getByRole("button");
-      expect(cabecalho, `a seção ${id} não se anuncia aberta`).toHaveAttribute("aria-expanded", "true");
+      expect(cabecalho, `a seção ${id} não se anuncia aberta`).toHaveAttribute(
+        "aria-expanded",
+        "true",
+      );
     }
     // O painel inteiro: contato, campos, tarefas e timeline montados.
     for (const peca of ["contato", "campos", "tarefas", "linha-do-tempo"]) {
-      expect(document.querySelector(`[data-peca="${peca}"]`), `falta a peça ${peca}`).not.toBeNull();
+      expect(
+        document.querySelector(`[data-peca="${peca}"]`),
+        `falta a peça ${peca}`,
+      ).not.toBeNull();
     }
   });
 });
@@ -185,11 +204,12 @@ describe("a linha do tempo recolhida (#3181)", () => {
 
     expect(entradasVisiveis()).toEqual(["a6", "a5", "a4"]);
     expect(entradasVisiveis().length).toBeLessThanOrEqual(3);
-    expect(within(secao("linha-do-tempo")).getByRole("button", { name: "Ver tudo" })).toBeInTheDocument();
-    expect(within(secao("linha-do-tempo")).getByRole("button", { name: "Linha do tempo" })).toHaveAttribute(
-      "aria-expanded",
-      "false",
-    );
+    expect(
+      within(secao("linha-do-tempo")).getByRole("button", { name: "Ver tudo" }),
+    ).toBeInTheDocument();
+    expect(
+      within(secao("linha-do-tempo")).getByRole("button", { name: "Linha do tempo" }),
+    ).toHaveAttribute("aria-expanded", "false");
   });
 
   it("⭐ aberta: TODAS as entradas continuam lá", async () => {
@@ -205,7 +225,9 @@ describe("a linha do tempo recolhida (#3181)", () => {
     window.localStorage.setItem(CHAVE_DAS_SECOES_RECOLHIDAS, JSON.stringify(["linha-do-tempo"]));
     montarDossie();
 
-    const verTudo = await within(secao("linha-do-tempo")).findByRole("button", { name: "Ver tudo" });
+    const verTudo = await within(secao("linha-do-tempo")).findByRole("button", {
+      name: "Ver tudo",
+    });
     await user.click(verTudo);
 
     expect(secao("linha-do-tempo").getAttribute("data-recolhida")).toBe("nao");
@@ -232,7 +254,9 @@ describe("o estado recolhido é LEMBRADO entre renderizações (#3181)", () => {
     const user = userEvent.setup();
     const primeiro = montarDossie();
 
-    await user.click(within(secao("linha-do-tempo")).getByRole("button", { name: "Linha do tempo" }));
+    await user.click(
+      within(secao("linha-do-tempo")).getByRole("button", { name: "Linha do tempo" }),
+    );
     expect(secao("linha-do-tempo").getAttribute("data-recolhida")).toBe("sim");
     expect(JSON.parse(window.localStorage.getItem(CHAVE_DAS_SECOES_RECOLHIDAS) ?? "[]")).toContain(
       "linha-do-tempo",
@@ -254,12 +278,17 @@ describe("o estado recolhido é LEMBRADO entre renderizações (#3181)", () => {
     expect(secao("contato").getAttribute("data-recolhida")).toBe("sim");
     expect(secao("dados-do-negocio").getAttribute("data-recolhida")).toBe("nao");
     expect(secao("linha-do-tempo").getAttribute("data-recolhida")).toBe("nao");
-    expect(JSON.parse(window.localStorage.getItem(CHAVE_DAS_SECOES_RECOLHIDAS) ?? "[]")).toEqual(["contato"]);
+    expect(JSON.parse(window.localStorage.getItem(CHAVE_DAS_SECOES_RECOLHIDAS) ?? "[]")).toEqual([
+      "contato",
+    ]);
   });
 
   it("reabrir a seção também é lembrado", async () => {
     const user = userEvent.setup();
-    window.localStorage.setItem(CHAVE_DAS_SECOES_RECOLHIDAS, JSON.stringify(["contato", "linha-do-tempo"]));
+    window.localStorage.setItem(
+      CHAVE_DAS_SECOES_RECOLHIDAS,
+      JSON.stringify(["contato", "linha-do-tempo"]),
+    );
     montarDossie();
 
     await waitFor(() => expect(secao("contato").getAttribute("data-recolhida")).toBe("sim"));
@@ -286,7 +315,9 @@ describe("o estado recolhido é LEMBRADO entre renderizações (#3181)", () => {
 
     try {
       montarDossie();
-      await user.click(within(secao("linha-do-tempo")).getByRole("button", { name: "Linha do tempo" }));
+      await user.click(
+        within(secao("linha-do-tempo")).getByRole("button", { name: "Linha do tempo" }),
+      );
 
       // O clique vale nesta sessão; só não sobrevive a um F5.
       expect(secao("linha-do-tempo").getAttribute("data-recolhida")).toBe("sim");
@@ -309,7 +340,9 @@ describe("os campos do negócio continuam alcançáveis (#3181)", () => {
     window.localStorage.setItem(CHAVE_DAS_SECOES_RECOLHIDAS, JSON.stringify(["dados-do-negocio"]));
     montarDossie();
 
-    await waitFor(() => expect(secao("dados-do-negocio").getAttribute("data-recolhida")).toBe("sim"));
+    await waitFor(() =>
+      expect(secao("dados-do-negocio").getAttribute("data-recolhida")).toBe("sim"),
+    );
     // Recolhida, o formulário fica MONTADO e escondido — fechar no meio de uma
     // edição não pode descartar o que já foi digitado.
     expect(document.querySelector('[data-peca="campos"]')).not.toBeNull();
@@ -317,6 +350,22 @@ describe("os campos do negócio continuam alcançáveis (#3181)", () => {
     await user.click(screen.getByRole("button", { name: "Editar campos" }));
 
     expect(secao("dados-do-negocio").getAttribute("data-recolhida")).toBe("nao");
-    expect(within(secao("dados-do-negocio")).getByRole("button", { expanded: true })).toBeInTheDocument();
+    expect(
+      within(secao("dados-do-negocio")).getByRole("button", { expanded: true }),
+    ).toBeInTheDocument();
+  });
+});
+
+describe("fidelidade ClickUp no detalhe do negócio", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+    linhaDoTempo.itens = [];
+  });
+
+  it("mostra início/estimativa e oferece relações somente leitura", () => {
+    montarDossie();
+    expect(screen.getByText(/Início:/)).toBeInTheDocument();
+    expect(screen.getByText(/Estimativa: 2h/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Relações do ClickUp" })).toBeInTheDocument();
   });
 });

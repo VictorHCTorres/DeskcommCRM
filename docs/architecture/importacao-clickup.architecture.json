@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Importação ClickUp para CRM e Conhecimento",
+    "subtitle": "Snapshot revisável, execução por leases independentes e aplicação create-only",
+    "output": "importacao-clickup.html",
+    "quality_profile": "standard"
+  },
+  "lanes": [
+    { "id": "api", "label": "API" },
+    { "id": "worker", "label": "Workers" },
+    { "id": "db", "label": "Postgres" }
+  ],
+  "mainPath": ["preview", "staging", "mapping", "execute", "crm", "domain"],
+  "nodes": [
+    {
+      "id": "preview",
+      "lane": "api",
+      "col": 0,
+      "type": "api",
+      "label": "Discovery server-side ou bundle em storage privado"
+    },
+    {
+      "id": "mapping",
+      "lane": "api",
+      "col": 2,
+      "type": "api",
+      "label": "Mapping explícito por List + CAS"
+    },
+    {
+      "id": "execute",
+      "lane": "api",
+      "col": 3,
+      "type": "api",
+      "label": "Execute idempotente por scope"
+    },
+    {
+      "id": "staging",
+      "lane": "db",
+      "col": 1,
+      "type": "database",
+      "label": "Runs, items e preview paginado sem snapshot no browser"
+    },
+    {
+      "id": "leases",
+      "lane": "db",
+      "col": 4,
+      "type": "database",
+      "label": "Lease por processador e por item"
+    },
+    {
+      "id": "crm",
+      "lane": "worker",
+      "col": 5,
+      "type": "worker",
+      "label": "Worker CRM create-only, lote 40"
+    },
+    {
+      "id": "docs",
+      "lane": "worker",
+      "col": 5,
+      "type": "worker",
+      "label": "Worker Docs + outbox de indexação"
+    },
+    {
+      "id": "domain",
+      "lane": "db",
+      "col": 6,
+      "type": "database",
+      "label": "Área › Grupo › Funil, leads e tasks"
+    },
+    {
+      "id": "rag",
+      "lane": "db",
+      "col": 6,
+      "type": "database",
+      "label": "Fonte building até versão RAG pronta"
+    },
+    {
+      "id": "sidecar",
+      "lane": "api",
+      "col": 1,
+      "type": "api",
+      "label": "Sidecar v1 + uploads privados vinculados ao run"
+    },
+    {
+      "id": "assets",
+      "lane": "worker",
+      "col": 5,
+      "type": "worker",
+      "label": "Quarantine › sniff/SHA › promoção idempotente"
+    },
+    {
+      "id": "history",
+      "lane": "db",
+      "col": 6,
+      "type": "database",
+      "label": "Anexos e comentários históricos tenant-safe"
+    }
+  ],
+  "edges": [
+    { "id": "e1", "from": "preview", "to": "staging", "label": "snapshot/hash" },
+    { "id": "e2", "from": "staging", "to": "mapping", "label": "48 Lists exigem decisão" },
+    { "id": "e3", "from": "mapping", "to": "execute", "label": "revision/hash CAS" },
+    { "id": "e4", "from": "execute", "to": "leases", "label": "queue scope-aware" },
+    { "id": "e5", "from": "leases", "to": "crm", "label": "claim CRM" },
+    { "id": "e6", "from": "leases", "to": "docs", "label": "claim Docs paralelo" },
+    { "id": "e7", "from": "crm", "to": "domain", "label": "IDs determinísticos + receipts" },
+    { "id": "e8", "from": "docs", "to": "rag", "label": "evento deduplicado" },
+    { "id": "e9", "from": "preview", "to": "sidecar", "label": "run/snapshot/hash" },
+    { "id": "e10", "from": "sidecar", "to": "assets", "label": "receipt privado + claim CAS" },
+    { "id": "e11", "from": "assets", "to": "history", "label": "MIME/SHA + receipt create-only" }
+  ]
+}

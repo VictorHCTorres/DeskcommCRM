@@ -32,7 +32,7 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 import { copyToClipboard } from "@/lib/clipboard";
-import { Copy, Trash, CaretDown, PencilSimple, Check, X } from "@/lib/ui/icons";
+import { Copy, Trash, CaretDown, PencilSimple, Check, X, ArrowSquareOut } from "@/lib/ui/icons";
 import { cn } from "@/lib/utils";
 import {
   useDeleteWebhookSource,
@@ -67,7 +67,19 @@ function publicUrl(pathToken: string): string {
   return `${base}/api/v1/webhooks/in/${pathToken}`;
 }
 
-function formSnippet(url: string, fields: readonly WebhookFormField[], t: (texto: string) => string): string {
+function nativeFormUrl(pathToken: string): string {
+  const base =
+    typeof window !== "undefined"
+      ? window.location.origin
+      : (process.env.NEXT_PUBLIC_APP_URL ?? "");
+  return `${base}/f/${pathToken}`;
+}
+
+function formSnippet(
+  url: string,
+  fields: readonly WebhookFormField[],
+  t: (texto: string) => string,
+): string {
   return gerarHtmlDoFormulario(url, fields, {
     nome: t("Seu nome"),
     telefone: t("Seu WhatsApp"),
@@ -121,15 +133,21 @@ export function SourceDetail({ source, open, onOpenChange }: Props) {
   const { data: eventsRes, refetch: refetchEvents } = useWebhookSourceEvents(
     open ? source.id : null,
   );
-  const [autorizacaoIA, setAutorizacaoIA] = React.useState<{ id: string; ativa: boolean } | null>(null);
-  const autorizaIA = autorizacaoIA?.id === source.id ? autorizacaoIA.ativa : source.authorize_ai_on_capture;
+  const [autorizacaoIA, setAutorizacaoIA] = React.useState<{ id: string; ativa: boolean } | null>(
+    null,
+  );
+  const autorizaIA =
+    autorizacaoIA?.id === source.id ? autorizacaoIA.ativa : source.authorize_ai_on_capture;
   /**
    * A opção do #2316, com o mesmo cuidado de estado das outras: `source` é
    * snapshot, então a resposta do PATCH é o dado mais fresco que esta tela
    * alcança — e o id junto evita pintar o estado de uma fonte no painel de
    * outra.
    */
-  const [atualizacaoDeCard, setAtualizacaoDeCard] = React.useState<{ id: string; ativa: boolean } | null>(null);
+  const [atualizacaoDeCard, setAtualizacaoDeCard] = React.useState<{
+    id: string;
+    ativa: boolean;
+  } | null>(null);
   const atualizaCard =
     atualizacaoDeCard?.id === source.id
       ? atualizacaoDeCard.ativa
@@ -139,15 +157,21 @@ export function SourceDetail({ source, open, onOpenChange }: Props) {
    * PATCH é o dado mais fresco que esta tela alcança (`source` é snapshot), e o
    * id junto evita pintar o estado de uma fonte no painel de outra.
    */
-  const [reusoDoCardAberto, setReusoDoCardAberto] = React.useState<{ id: string; ativa: boolean } | null>(null);
+  const [reusoDoCardAberto, setReusoDoCardAberto] = React.useState<{
+    id: string;
+    ativa: boolean;
+  } | null>(null);
   const reusaCardAberto =
     reusoDoCardAberto?.id === source.id
       ? reusoDoCardAberto.ativa
       : source.reuse_open_lead_on_capture;
   const [testing, setTesting] = React.useState(false);
   const [testOk, setTestOk] = React.useState(false);
+  const [atividade, setAtividade] = React.useState<{ id: string; ativa: boolean } | null>(null);
   const [formFields, setFormFields] = React.useState<WebhookFormField[]>(source.form_fields ?? []);
-  const [savedFormFields, setSavedFormFields] = React.useState<WebhookFormField[]>(source.form_fields ?? []);
+  const [savedFormFields, setSavedFormFields] = React.useState<WebhookFormField[]>(
+    source.form_fields ?? [],
+  );
   const sourceIdDosCampos = React.useRef(source.id);
   const sourceIdDoNome = React.useRef(source.id);
   const [nomeFonteSalvo, setNomeFonteSalvo] = React.useState(source.name);
@@ -172,8 +196,11 @@ export function SourceDetail({ source, open, onOpenChange }: Props) {
   const [revelado, setRevelado] = React.useState<{ id: string; valor: string } | null>(null);
 
   const url = publicUrl(source.path_token);
+  const urlDoFormulario = nativeFormUrl(source.path_token);
   const events = eventsRes?.data ?? [];
   const temAssinatura = assinatura?.id === source.id ? assinatura.ativa : source.has_secret;
+  const fonteAtiva = atividade?.id === source.id ? atividade.ativa : source.is_active;
+  const formularioNativoDisponivel = fonteAtiva && !temAssinatura;
   const secretRevelado = revelado?.id === source.id ? revelado.valor : null;
   const formFieldsDirty = JSON.stringify(formFields) !== JSON.stringify(savedFormFields);
 
@@ -358,8 +385,8 @@ export function SourceDetail({ source, open, onOpenChange }: Props) {
                 </Button>
               </div>
             )}
-            <Badge variant={source.is_active ? "success" : "neutral"}>
-              {source.is_active ? t("Ativa") : t("Pausada")}
+            <Badge variant={fonteAtiva ? "success" : "neutral"}>
+              {fonteAtiva ? t("Ativa") : t("Pausada")}
             </Badge>
           </div>
           <SheetDescription>
@@ -385,73 +412,189 @@ export function SourceDetail({ source, open, onOpenChange }: Props) {
             </div>
           </section>
 
+          <section className="space-y-3 rounded-sm border border-border p-3">
+            <div>
+              <p className="text-sm font-medium text-text">{t("Formulário público nativo")}</p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {t(
+                  "Use este link quando você não tiver um site próprio. As respostas entram pelo mesmo histórico e pelo mesmo funil desta fonte.",
+                )}
+              </p>
+            </div>
+            <code className="block truncate rounded-sm bg-muted px-3 py-2 text-xs">
+              {urlDoFormulario}
+            </code>
+            <div className="flex flex-wrap gap-2">
+              {formularioNativoDisponivel ? (
+                <Button type="button" variant="secondary" asChild>
+                  <Link href={urlDoFormulario} target="_blank" rel="noreferrer">
+                    <ArrowSquareOut /> {t("Abrir formulário")}
+                  </Link>
+                </Button>
+              ) : (
+                <Button type="button" variant="secondary" disabled>
+                  <ArrowSquareOut /> {t("Abrir formulário")}
+                </Button>
+              )}
+              <Button
+                type="button"
+                variant="secondary"
+                disabled={!formularioNativoDisponivel}
+                onClick={() => copy(urlDoFormulario, t("Link do formulário copiado."), t)}
+              >
+                <Copy /> {t("Copiar link")}
+              </Button>
+            </div>
+            {!fonteAtiva ? (
+              <p className="text-xs text-muted-foreground">
+                {t("Ative a fonte para publicar o formulário.")}
+              </p>
+            ) : temAssinatura ? (
+              <p className="text-xs text-muted-foreground">
+                {t(
+                  "O formulário nativo fica indisponível enquanto a assinatura HMAC estiver ligada, porque o navegador não recebe o segredo.",
+                )}
+              </p>
+            ) : null}
+          </section>
+
           <section className="space-y-2 rounded-sm border border-border p-3">
             <div className="flex items-center justify-between gap-3">
-              <label htmlFor="authorize-ai-on-capture" className="block text-sm font-medium text-text">
+              <label
+                htmlFor="authorize-ai-on-capture"
+                className="block text-sm font-medium text-text"
+              >
                 {t("Autorizar IA para leads deste formulário")}
               </label>
-              <Switch id="authorize-ai-on-capture" checked={Boolean(autorizaIA)}
+              <Switch
+                id="authorize-ai-on-capture"
+                checked={Boolean(autorizaIA)}
                 disabled={!podeGerirWebhooks || update.isPending || (!temAssinatura && !autorizaIA)}
-                onCheckedChange={(ativa) => update.mutate(
-                  { id: source.id, authorize_ai_on_capture: ativa },
-                  { onSuccess: (res) => setAutorizacaoIA({ id: source.id, ativa: res.data.authorize_ai_on_capture }) },
-                )} />
+                onCheckedChange={(ativa) =>
+                  update.mutate(
+                    { id: source.id, authorize_ai_on_capture: ativa },
+                    {
+                      onSuccess: (res) =>
+                        setAutorizacaoIA({
+                          id: source.id,
+                          ativa: res.data.authorize_ai_on_capture,
+                        }),
+                    },
+                  )
+                }
+              />
             </div>
             <p className="text-sm text-muted-foreground">
-              {t("Autoriza somente novos envios completos com consentimento explícito para atendimento automatizado. Não retoma contatos bloqueados ou em atendimento humano. O agente e o canal precisam estar configurados para atender.")}
+              {t(
+                "Autoriza somente novos envios completos com consentimento explícito para atendimento automatizado. Não retoma contatos bloqueados ou em atendimento humano. O agente e o canal precisam estar configurados para atender.",
+              )}
             </p>
-            {!temAssinatura && <p className="text-sm text-muted-foreground">
-              {t("Configure a assinatura da fonte antes de autorizar IA. Para remover a assinatura, desligue primeiro a autorização de IA.")}
-            </p>}
+            {!temAssinatura && (
+              <p className="text-sm text-muted-foreground">
+                {t(
+                  "Configure a assinatura da fonte antes de autorizar IA. Para remover a assinatura, desligue primeiro a autorização de IA.",
+                )}
+              </p>
+            )}
             <p className="text-sm text-muted-foreground">
-              {t("O integrador deve enviar external_id, ai_service_consent: true, submission_status: completed e ai_service_consent_version com a versão do aviso aceito. Aceitar apenas a política de privacidade não autoriza a IA. Sem external_id, o envio não concede nem renova a autorização; reenviar com o mesmo external_id não libera de novo. Uma recusa (false) num envio completo e válido revoga, mesmo sem external_id.")}
+              {t(
+                "O integrador deve enviar external_id, ai_service_consent: true, submission_status: completed e ai_service_consent_version com a versão do aviso aceito. Aceitar apenas a política de privacidade não autoriza a IA. Sem external_id, o envio não concede nem renova a autorização; reenviar com o mesmo external_id não libera de novo. Uma recusa (false) num envio completo e válido revoga, mesmo sem external_id.",
+              )}
             </p>
           </section>
 
           <section className="space-y-2 rounded-sm border border-border p-3">
             <div className="flex items-center justify-between gap-3">
-              <label htmlFor="update-existing-lead-on-capture" className="block text-sm font-medium text-text">
+              <label
+                htmlFor="update-existing-lead-on-capture"
+                className="block text-sm font-medium text-text"
+              >
                 {t("Atualizar o card quando o envio repete o mesmo cadastro")}
               </label>
-              <Switch id="update-existing-lead-on-capture" checked={Boolean(atualizaCard)}
-                disabled={!podeGerirWebhooks || update.isPending || (!temAssinatura && !atualizaCard)}
-                onCheckedChange={(ativa) => update.mutate(
-                  { id: source.id, update_existing_lead_on_capture: ativa },
-                  { onSuccess: (res) => setAtualizacaoDeCard({ id: source.id, ativa: res.data.update_existing_lead_on_capture }) },
-                )} />
+              <Switch
+                id="update-existing-lead-on-capture"
+                checked={Boolean(atualizaCard)}
+                disabled={
+                  !podeGerirWebhooks || update.isPending || (!temAssinatura && !atualizaCard)
+                }
+                onCheckedChange={(ativa) =>
+                  update.mutate(
+                    { id: source.id, update_existing_lead_on_capture: ativa },
+                    {
+                      onSuccess: (res) =>
+                        setAtualizacaoDeCard({
+                          id: source.id,
+                          ativa: res.data.update_existing_lead_on_capture,
+                        }),
+                    },
+                  )
+                }
+              />
             </div>
             <p className="text-sm text-muted-foreground">
-              {t("Só para integrações entre sistemas: ligado, um envio com o mesmo external_id que traga dado novo atualiza o card desta fonte — os campos, o título e a etapa pedida em stage, sempre para a frente. Desligado, o padrão, o envio repetido continua sendo reenvio e nada no card muda, nem o que a equipe corrigiu à mão.")}
+              {t(
+                "Só para integrações entre sistemas: ligado, um envio com o mesmo external_id que traga dado novo atualiza o card desta fonte — os campos, o título e a etapa pedida em stage, sempre para a frente. Desligado, o padrão, o envio repetido continua sendo reenvio e nada no card muda, nem o que a equipe corrigiu à mão.",
+              )}
             </p>
-            {!temAssinatura && <p className="text-sm text-muted-foreground">
-              {t("Configure a assinatura da fonte antes de deixar a integração atualizar o card. Para remover a assinatura, desligue primeiro a atualização pelo external_id.")}
-            </p>}
+            {!temAssinatura && (
+              <p className="text-sm text-muted-foreground">
+                {t(
+                  "Configure a assinatura da fonte antes de deixar a integração atualizar o card. Para remover a assinatura, desligue primeiro a atualização pelo external_id.",
+                )}
+              </p>
+            )}
           </section>
 
           <section className="space-y-2 rounded-sm border border-border p-3">
             <div className="flex items-center justify-between gap-3">
-              <label htmlFor="reuse-open-lead-on-capture" className="block text-sm font-medium text-text">
+              <label
+                htmlFor="reuse-open-lead-on-capture"
+                className="block text-sm font-medium text-text"
+              >
                 {t("Reaproveitar o card aberto do contato")}
               </label>
-              <Switch id="reuse-open-lead-on-capture" checked={Boolean(reusaCardAberto)}
-                disabled={!podeGerirWebhooks || update.isPending || (!temAssinatura && !reusaCardAberto)}
-                onCheckedChange={(ativa) => update.mutate(
-                  { id: source.id, reuse_open_lead_on_capture: ativa },
-                  { onSuccess: (res) => setReusoDoCardAberto({ id: source.id, ativa: res.data.reuse_open_lead_on_capture }) },
-                )} />
+              <Switch
+                id="reuse-open-lead-on-capture"
+                checked={Boolean(reusaCardAberto)}
+                disabled={
+                  !podeGerirWebhooks || update.isPending || (!temAssinatura && !reusaCardAberto)
+                }
+                onCheckedChange={(ativa) =>
+                  update.mutate(
+                    { id: source.id, reuse_open_lead_on_capture: ativa },
+                    {
+                      onSuccess: (res) =>
+                        setReusoDoCardAberto({
+                          id: source.id,
+                          ativa: res.data.reuse_open_lead_on_capture,
+                        }),
+                    },
+                  )
+                }
+              />
             </div>
             <p className="text-sm text-muted-foreground">
-              {t("Só para fontes com assinatura: ligado, um envio de quem já tem card aberto neste funil atualiza esse card — os campos novos e a etapa da fonte, sempre para a frente — em vez de abrir um segundo card. Desligado, o padrão, cada envio continua virando um card novo.")}
+              {t(
+                "Só para fontes com assinatura: ligado, um envio de quem já tem card aberto neste funil atualiza esse card — os campos novos e a etapa da fonte, sempre para a frente — em vez de abrir um segundo card. Desligado, o padrão, cada envio continua virando um card novo.",
+              )}
             </p>
-            {!temAssinatura && <p className="text-sm text-muted-foreground">
-              {t("Configure a assinatura da fonte antes de reaproveitar o card aberto do contato. Para remover a assinatura, desligue primeiro o reaproveitamento do card aberto.")}
-            </p>}
+            {!temAssinatura && (
+              <p className="text-sm text-muted-foreground">
+                {t(
+                  "Configure a assinatura da fonte antes de reaproveitar o card aberto do contato. Para remover a assinatura, desligue primeiro o reaproveitamento do card aberto.",
+                )}
+              </p>
+            )}
           </section>
 
           <section className="space-y-2">
-            <p className="text-sm font-medium text-text">{t("Personalizar perguntas do formulário")}</p>
+            <p className="text-sm font-medium text-text">
+              {t("Personalizar perguntas do formulário")}
+            </p>
             <p className="text-xs text-muted-foreground">
-              {t("As respostas extras ficam nos campos personalizados do lead e no histórico desta captação. O checkbox envia sim ou não; a lista permite escolher uma opção.")}
+              {t(
+                "As respostas extras ficam nos campos personalizados do lead e no histórico desta captação. O checkbox envia sim ou não; a lista permite escolher uma opção.",
+              )}
             </p>
             <WebhookFormFieldsEditor fields={formFields} onChange={setFormFields} />
             <Button
@@ -467,7 +610,12 @@ export function SourceDetail({ source, open, onOpenChange }: Props) {
             <p className="text-sm font-medium text-text">
               {t("Formulário pronto para colar no seu site")}
             </p>
-            <Textarea readOnly rows={Math.min(24, 8 + formFields.length * 3)} value={formSnippet(url, formFields, t)} className="font-mono text-xs" />
+            <Textarea
+              readOnly
+              rows={Math.min(24, 8 + formFields.length * 3)}
+              value={formSnippet(url, formFields, t)}
+              className="font-mono text-xs"
+            />
             <Button
               type="button"
               variant="secondary"
@@ -575,7 +723,7 @@ export function SourceDetail({ source, open, onOpenChange }: Props) {
                   {/* `break-all`, não `truncate`: é a única vez que este valor
                       aparece, e um "…" no fim esconde metade de um segredo que
                       não volta. Quem copia à mão precisa vê-lo inteiro. */}
-                  <code className="flex-1 break-all rounded-sm border border-border bg-muted px-3 py-2 text-xs">
+                  <code className="flex-1 rounded-sm border border-border bg-muted px-3 py-2 text-xs break-all">
                     {secretRevelado}
                   </code>
                   <Button
@@ -702,14 +850,16 @@ export function SourceDetail({ source, open, onOpenChange }: Props) {
               </p>
             </div>
             <Switch
-              checked={source.is_active}
+              checked={fonteAtiva}
               disabled={update.isPending}
               onCheckedChange={(checked) =>
                 update.mutate(
                   { id: source.id, is_active: checked },
                   {
-                    onSuccess: () =>
-                      toast.success(checked ? t("Fonte ativada.") : t("Fonte pausada.")),
+                    onSuccess: () => {
+                      setAtividade({ id: source.id, ativa: checked });
+                      toast.success(checked ? t("Fonte ativada.") : t("Fonte pausada."));
+                    },
                   },
                 )
               }

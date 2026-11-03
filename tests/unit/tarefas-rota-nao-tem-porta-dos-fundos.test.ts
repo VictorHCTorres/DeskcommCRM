@@ -88,7 +88,17 @@ function fazerSupabase(respostas: Resposta[]) {
       const r = proxima();
       return Promise.resolve({ data: r.data ?? null, error: r.error ?? null });
     };
-    for (const metodo of ["select", "insert", "update", "delete", "order", "limit", "in", "gte", "lte"]) {
+    for (const metodo of [
+      "select",
+      "insert",
+      "update",
+      "delete",
+      "order",
+      "limit",
+      "in",
+      "gte",
+      "lte",
+    ]) {
       elo[metodo] = () => elo;
     }
     elo.eq = (coluna: string, valor: unknown) => {
@@ -130,9 +140,7 @@ describe("GET /api/v1/tasks", () => {
     const espiao = fazerSupabase([{ data: [LINHA] }]);
     const { GET } = await import("@/app/api/v1/tasks/route");
 
-    const res = await GET(
-      new NextRequest(`http://x/api/v1/tasks?organization_id=${OUTRA_ORG}`),
-    );
+    const res = await GET(new NextRequest(`http://x/api/v1/tasks?organization_id=${OUTRA_ORG}`));
 
     expect(res.status).toBe(200);
     expect(espiao.filtros).toContainEqual(["organization_id", ORG]);
@@ -145,7 +153,10 @@ describe("GET /api/v1/tasks", () => {
 
     await GET(new NextRequest("http://x/api/v1/tasks"));
 
-    expect(espiao.tabelas).toEqual(["crm_tasks"]);
+    // A família exige leituras adicionais na MESMA tabela (raiz/filhas), mas
+    // continua sem a antiga porta dos fundos em `crm_leads.custom_fields`.
+    expect(espiao.tabelas.length).toBeGreaterThan(0);
+    expect(new Set(espiao.tabelas)).toEqual(new Set(["crm_tasks"]));
   });
 
   it('"a tabela não existe" vira 500, nunca 200 com o dado em outro lugar', async () => {
@@ -341,7 +352,7 @@ describe("PATCH e DELETE /api/v1/tasks/[id]", () => {
 
 // Este teste isola o handler; autoridade de suporte é exercitada na suíte própria.
 vi.mock("@/lib/impersonate/support", async (importOriginal) => ({
-  ...await importOriginal<typeof import("@/lib/impersonate/support")>(),
+  ...(await importOriginal<typeof import("@/lib/impersonate/support")>()),
   requireSupportWrite: vi.fn(async () => null),
   authenticatedSessionId: vi.fn(async () => "f2200000-0000-4000-8000-000000000099"),
 }));

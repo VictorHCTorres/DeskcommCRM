@@ -105,6 +105,51 @@ describe("TarefasClient — criar a partir de 'Minhas'", () => {
     renderTela(false);
     expect(await criaSemTocarNoResponsavel()).toMatchObject({ assigned_to: null });
   });
+
+  it("falha na recorrência e retry não repetem o POST da tarefa", async () => {
+    let tentativasDoPut = 0;
+    fetchEspiao.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        return new Response(JSON.stringify({ data: { task: { id: "task-criada" } } }), {
+          status: 201,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (init?.method === "PUT" && String(url).endsWith("/recurrence")) {
+        tentativasDoPut += 1;
+        return new Response(
+          JSON.stringify(
+            tentativasDoPut === 1
+              ? { error: { message: "Falha transitória" } }
+              : { data: { recurrence_id: "serie-1", next_run_at: null } },
+          ),
+          {
+            status: tentativasDoPut === 1 ? 500 : 200,
+            headers: { "Content-Type": "application/json" },
+          },
+        );
+      }
+      return new Response(JSON.stringify({ data: { tasks: [] } }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+    renderTela(false);
+    await waitFor(() => expect(fetchEspiao).toHaveBeenCalled());
+    await userEvent.click(screen.getByRole("button", { name: "Nova tarefa" }));
+    await userEvent.type(screen.getByLabelText("O que precisa ser feito"), "Rotina diária");
+    await userEvent.click(screen.getByLabelText("Recorrência"));
+    await userEvent.click(await screen.findByRole("option", { name: "Diariamente" }));
+    await userEvent.click(screen.getByLabelText("Gerar"));
+    await userEvent.click(await screen.findByRole("option", { name: "Após concluir" }));
+
+    await userEvent.click(screen.getByRole("button", { name: "Salvar" }));
+    await screen.findByRole("alert");
+    await userEvent.click(screen.getByRole("button", { name: "Salvar" }));
+    await waitFor(() => expect(tentativasDoPut).toBe(2));
+
+    expect(fetchEspiao.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1);
+  });
 });
 
 describe("TarefasClient — o calendário não prende o celular", () => {
@@ -123,3 +168,52 @@ describe("TarefasClient — o calendário não prende o celular", () => {
   });
 });
 
+describe("TarefasClient — edição não reenvia vínculos invisíveis", () => {
+  it("editar o título omite lead_id e contact_id inalterados", async () => {
+    const tarefa = {
+      id: "task-1",
+      organization_id: "org-1",
+      title: "Título antigo",
+      description: null,
+      due_date: null,
+      priority: "medium",
+      status: "pending",
+      lead_id: "lead-sem-visibilidade",
+      contact_id: "contact-sem-visibilidade",
+      demanda_id: null,
+      assigned_to: null,
+      created_by: "u-eu",
+      parent_task_id: null,
+      recurrence_id: null,
+      recurrence_generation: 0,
+      recurrence_scheduled_for: null,
+      created_at: "2026-11-01T00:00:00.000Z",
+      updated_at: "2026-11-01T00:00:00.000Z",
+    };
+    fetchEspiao.mockImplementation(
+      async (_url: string, init?: RequestInit) =>
+        new Response(
+          JSON.stringify({
+            data: init?.method === "PATCH" ? { task: tarefa } : { tasks: [tarefa] },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+    );
+    renderTela(false);
+    await screen.findByText("Título antigo");
+    await userEvent.click(screen.getByRole("button", { name: "Editar a tarefa" }));
+    const titulo = screen.getByLabelText("O que precisa ser feito");
+    await userEvent.clear(titulo);
+    await userEvent.type(titulo, "Título novo");
+    await userEvent.click(screen.getByRole("button", { name: "Salvar" }));
+
+    await waitFor(() =>
+      expect(fetchEspiao.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(true),
+    );
+    const chamada = fetchEspiao.mock.calls.find(([, init]) => init?.method === "PATCH");
+    const corpo = JSON.parse(String(chamada?.[1]?.body)) as Record<string, unknown>;
+    expect(corpo.title).toBe("Título novo");
+    expect(corpo).not.toHaveProperty("lead_id");
+    expect(corpo).not.toHaveProperty("contact_id");
+  });
+});

@@ -39,11 +39,14 @@ jobs:
   abrir-pr-de-release:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    env:
+      TEM_RELEASE_APP: ${{ secrets.RELEASE_APP_ID != '' && secrets.RELEASE_APP_PRIVATE_KEY != '' }}
     permissions:
       contents: read
     steps:
       - uses: actions/create-github-app-token@v3
         id: token
+        if: env.TEM_RELEASE_APP == 'true'
         with:
           app-id: ${{ secrets.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
@@ -53,7 +56,10 @@ jobs:
           # `fetch-depth: 0` porque o corte compara com as tags, e o checkout
           # raso padrão não traz nenhuma.
           fetch-depth: 0
-          token: ${{ steps.token.outputs.token }}
+          # O produto oficial usa o GitHub App. Um fork que publica o próprio
+          # canal pode fornecer um token dedicado em RELEASE_TOKEN; eventos
+          # criados por ele continuam disparando os workflows de imagem.
+          token: ${{ steps.token.outputs.token || secrets.RELEASE_TOKEN }}
 
       - uses: ./.github/actions/preparar-node
         # O teto do preâmbulo mora aqui porque passo de composite action não
@@ -74,7 +80,7 @@ jobs:
 
       - name: Abrir o PR
         env:
-          GH_TOKEN: ${{ steps.token.outputs.token }}
+          GH_TOKEN: ${{ steps.token.outputs.token || secrets.RELEASE_TOKEN }}
           VERSAO: ${{ steps.corte.outputs.versao }}
         run: |
           set -euo pipefail
@@ -100,6 +106,8 @@ jobs:
   cortar-tag:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    env:
+      TEM_RELEASE_APP: ${{ secrets.RELEASE_APP_ID != '' && secrets.RELEASE_APP_PRIVATE_KEY != '' }}
     permissions:
       contents: read
       # A guarda pergunta à API quem abriu o PR de origem do merge
@@ -110,6 +118,7 @@ jobs:
     steps:
       - uses: actions/create-github-app-token@v3
         id: token
+        if: env.TEM_RELEASE_APP == 'true'
         with:
           app-id: ${{ secrets.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
@@ -117,7 +126,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-          token: ${{ steps.token.outputs.token }}
+          token: ${{ steps.token.outputs.token || secrets.RELEASE_TOKEN }}
 
       - uses: ./.github/actions/preparar-node
         # O teto do preâmbulo mora aqui porque passo de composite action não
@@ -378,7 +387,7 @@ jobs:
       - name: Publicar a release no GitHub
         if: steps.pendente.outputs.cortar == 'sim'
         env:
-          GH_TOKEN: ${{ steps.token.outputs.token }}
+          GH_TOKEN: ${{ steps.token.outputs.token || secrets.RELEASE_TOKEN }}
           VERSAO: ${{ steps.pendente.outputs.versao }}
         run: |
           set -euo pipefail

@@ -24,6 +24,8 @@ import { useUser } from "@/hooks/auth/AuthProvider";
 import { useT } from "@/hooks/i18n/useT";
 import { useAssignableMembers } from "@/hooks/inbox/useAssignableMembers";
 import type {
+  ConfiguracaoDeRecorrencia,
+  FrequenciaDaRecorrencia,
   NovaTarefa,
   PrioridadeDaTarefa,
   SituacaoDaTarefa,
@@ -38,7 +40,11 @@ interface Props {
   tarefa?: Tarefa | null;
   /** `YYYY-MM-DD` vindo do clique numa célula do calendário. */
   prazoSugerido?: string;
-  aoSalvar: (entrada: NovaTarefa) => Promise<unknown>;
+  aoSalvar: (
+    entrada: NovaTarefa,
+    recorrencia?: ConfiguracaoDeRecorrencia | null,
+  ) => Promise<unknown>;
+  parentTaskId?: string | null;
   leadId?: string | null;
   contactId?: string | null;
   /**
@@ -85,6 +91,7 @@ export function FormularioDeTarefa({
   contactId,
   demandaId,
   responsavelPadrao,
+  parentTaskId,
 }: Props) {
   const t = useT();
   const usuario = useUser();
@@ -110,6 +117,10 @@ export function FormularioDeTarefa({
   const [responsavel, setResponsavel] = useState<string>(responsavelInicial);
   const [salvando, setSalvando] = useState(false);
   const [erro, setErro] = useState<string | null>(null);
+  const [frequencia, setFrequencia] = useState<"none" | FrequenciaDaRecorrencia>("none");
+  const [modoRecorrencia, setModoRecorrencia] = useState<"on_schedule" | "after_completion">(
+    "on_schedule",
+  );
 
   async function enviar(e: React.FormEvent) {
     e.preventDefault();
@@ -121,30 +132,52 @@ export function FormularioDeTarefa({
     // Sem dia não há hora que valha, e uma hora solta viraria "hoje às 9h" sem
     // ninguém ter pedido.
     const prazo = dia ? new Date(`${dia}T${hora || "00:00"}:00`).toISOString() : null;
+    if (!editando && frequencia !== "none" && modoRecorrencia === "on_schedule" && !prazo) {
+      setErro(t("Defina um prazo para a recorrência agendada."));
+      return;
+    }
 
     setSalvando(true);
     setErro(null);
     try {
-      await aoSalvar({
-        title: titulo.trim(),
-        description: descricao.trim() || null,
-        due_date: prazo,
-        priority: prioridade,
-        status: situacao,
-        lead_id: tarefa?.lead_id ?? leadId ?? null,
-        contact_id: tarefa?.contact_id ?? contactId ?? null,
-        // A demanda só viaja em CRIAÇÃO. Ao editar uma tarefa existente,
-        // reenviar o vínculo o sobrescreveria com o do formulário — e o
-        // formulário de edição não é onde se re-vincula (a tela de Tarefas não
-        // ganhou esse campo). Criar de dentro do inbox, sim: nasce presa.
-        ...(editando ? {} : { demanda_id: demandaId ?? null }),
-        // Só vai quando MUDOU. Uma tarefa antiga pode ter como responsável
-        // alguém que saiu da equipe: reenviar o mesmo id faria a rota recusar a
-        // edição do título por causa de um campo em que ninguém mexeu.
-        ...(responsavel !== responsavelInicial || !editando
-          ? { assigned_to: responsavel === NINGUEM ? null : responsavel }
-          : {}),
-      });
+      await aoSalvar(
+        {
+          title: titulo.trim(),
+          description: descricao.trim() || null,
+          due_date: prazo,
+          priority: prioridade,
+          status: situacao,
+          // Como demanda e responsável, estes vínculos só viajam na CRIAÇÃO.
+          // A edição não oferece relink; reenviar o id inalterado faria uma
+          // simples troca de título depender da visibilidade atual do lead.
+          ...(editando
+            ? {}
+            : {
+                lead_id: leadId ?? null,
+                contact_id: contactId ?? null,
+              }),
+          // A demanda só viaja em CRIAÇÃO. Ao editar uma tarefa existente,
+          // reenviar o vínculo o sobrescreveria com o do formulário — e o
+          // formulário de edição não é onde se re-vincula (a tela de Tarefas não
+          // ganhou esse campo). Criar de dentro do inbox, sim: nasce presa.
+          ...(editando ? {} : { demanda_id: demandaId ?? null }),
+          ...(editando ? {} : { parent_task_id: parentTaskId ?? null }),
+          // Só vai quando MUDOU. Uma tarefa antiga pode ter como responsável
+          // alguém que saiu da equipe: reenviar o mesmo id faria a rota recusar a
+          // edição do título por causa de um campo em que ninguém mexeu.
+          ...(responsavel !== responsavelInicial || !editando
+            ? { assigned_to: responsavel === NINGUEM ? null : responsavel }
+            : {}),
+        },
+        !editando && frequencia !== "none"
+          ? {
+              frequency: frequencia,
+              interval: 1,
+              mode: modoRecorrencia,
+              timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+            }
+          : null,
+      );
       aoMudarAbertura(false);
     } catch (falha) {
       // A mensagem do servidor quando ela existe: ela nomeia o campo recusado.
@@ -172,6 +205,48 @@ export function FormularioDeTarefa({
               autoFocus
             />
           </div>
+
+          {!editando && !parentTaskId ? (
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1.5">
+                <Label htmlFor="tarefa-recorrencia">{t("Recorrência")}</Label>
+                <Select
+                  value={frequencia}
+                  onValueChange={(valor) =>
+                    setFrequencia(valor as "none" | FrequenciaDaRecorrencia)
+                  }
+                >
+                  <SelectTrigger id="tarefa-recorrencia">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="none">{t("Não repetir")}</SelectItem>
+                    <SelectItem value="daily">{t("Diariamente")}</SelectItem>
+                    <SelectItem value="weekly">{t("Semanalmente")}</SelectItem>
+                    <SelectItem value="monthly">{t("Mensalmente")}</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="tarefa-recorrencia-modo">{t("Gerar")}</Label>
+                <Select
+                  value={modoRecorrencia}
+                  onValueChange={(valor) =>
+                    setModoRecorrencia(valor as "on_schedule" | "after_completion")
+                  }
+                  disabled={frequencia === "none"}
+                >
+                  <SelectTrigger id="tarefa-recorrencia-modo">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="on_schedule">{t("No prazo agendado")}</SelectItem>
+                    <SelectItem value="after_completion">{t("Após concluir")}</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+          ) : null}
 
           <div className="space-y-1.5">
             <Label htmlFor="tarefa-descricao">{t("Detalhes")}</Label>
@@ -252,9 +327,7 @@ export function FormularioDeTarefa({
                 <SelectItem value={NINGUEM}>{t("Ninguém")}</SelectItem>
                 {(membros.data ?? []).map((membro) => (
                   <SelectItem key={membro.user_id} value={membro.user_id}>
-                    {membro.user_id === usuario.id
-                      ? t("Eu")
-                      : rotuloDoMembro(membro, t)}
+                    {membro.user_id === usuario.id ? t("Eu") : rotuloDoMembro(membro, t)}
                   </SelectItem>
                 ))}
                 {/* O responsável de hoje pode não estar mais na lista (saiu da
@@ -275,7 +348,10 @@ export function FormularioDeTarefa({
           </div>
 
           {erro ? (
-            <p role="alert" className="rounded-md bg-destructive/10 p-2 text-xs font-medium text-destructive">
+            <p
+              role="alert"
+              className="rounded-md bg-destructive/10 p-2 text-xs font-medium text-destructive"
+            >
               {erro}
             </p>
           ) : null}

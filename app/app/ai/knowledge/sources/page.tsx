@@ -73,6 +73,7 @@ export default async function AcervoPage() {
         initialSources={initialSources}
         initialChave={estadoDaChave}
         agentes={agentes}
+        podeImportarPrivados={ROLE_RANK[activeOrg.role] >= ROLE_RANK.admin}
       />
     </div>
   );

@@ -499,6 +499,12 @@ export const AUDIT_ACTIONS = [
   "pipeline.created",
   "pipeline.updated",
   "pipeline.archived",
+  "pipeline_group.created",
+  "pipeline_group.updated",
+  "pipeline_group.archived",
+  "pipeline_view.created",
+  "pipeline_view.updated",
+  "pipeline_view.deleted",
   // Só existe para o funil que nunca recebeu negócio: com histórico, a operação
   // vira `pipeline.archived` e a linha continua no banco.
   "pipeline.deleted",
@@ -1415,6 +1421,16 @@ export const AUDIT_ACTIONS = [
   // Aviso escrito pelo admin da empresa e empurrado para a equipe (#1418). O
   // metadata leva só a janela de publicação; título e corpo ficam em `avisos`.
   "aviso.created",
+  // Importador ClickUp: somente ids, escopo, revisões e contagens; nunca token,
+  // payload bruto, nome de tarefa ou conteúdo de Docs.
+  "clickup.connection_created",
+  "clickup.import_previewed",
+  "clickup.import_mapping_updated",
+  "clickup.import_queued",
+  "clickup.import_retried",
+  "clickup.import_cancelled",
+  "clickup.asset_upload_prepared",
+  "clickup.assets_staged",
 ] as const;
 
 /** Um código de auditoria. Derivado de `AUDIT_ACTIONS` — não redigite a lista. */

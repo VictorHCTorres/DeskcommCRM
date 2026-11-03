@@ -19,9 +19,11 @@
  * organization_id check). The admin client bypasses RLS.
  */
 
+import { isClickUpAssetFinalPathOwnedBy } from "@/lib/clickup/assets/paths";
 import { logger } from "@/lib/logger";
 import { isLeadAttachmentPathOwnedBy } from "@/lib/messaging/media/upload-validation";
 import { createAdminClient } from "@/lib/supabase/admin";
+import { filtroDeTarefasDoTitular } from "./task-scope";
 
 export interface CascadeResult {
   alreadyAnonymized: boolean;
@@ -177,7 +179,9 @@ export async function cascadeRedactContact(args: CascadeArgs): Promise<CascadeRe
     .eq("organization_id", args.organizationId)
     .eq("contact_id", args.contactId);
   if (conversasErro) {
-    throw new Error(`[lgpd-redact-cascade] conversas do contato não lidas: ${conversasErro.message}`);
+    throw new Error(
+      `[lgpd-redact-cascade] conversas do contato não lidas: ${conversasErro.message}`,
+    );
   }
   const idsDasConversas = (conversasDoContato ?? []).map((linha) => linha.id);
   if (idsDasConversas.length > 0) {
@@ -215,7 +219,7 @@ export async function cascadeRedactContact(args: CascadeArgs): Promise<CascadeRe
   if (idsDosLeads.length > 0) {
     const { data: anexosDosLeads, error: anexosErro } = await admin
       .from("crm_lead_attachments")
-      .select("id, lead_id, storage_path")
+      .select("id, lead_id, storage_path, source_attachment_id")
       .eq("organization_id", args.organizationId)
       .in("lead_id", idsDosLeads);
     if (anexosErro) {
@@ -223,8 +227,17 @@ export async function cascadeRedactContact(args: CascadeArgs): Promise<CascadeRe
     }
     for (const anexo of anexosDosLeads ?? []) {
       if (!anexo.storage_path) continue;
+      const importadoDoClickUp = Boolean(anexo.source_attachment_id);
+      const caminhoValido = importadoDoClickUp
+        ? isClickUpAssetFinalPathOwnedBy(
+            anexo.storage_path,
+            args.organizationId,
+            "leads",
+            anexo.lead_id,
+          )
+        : isLeadAttachmentPathOwnedBy(anexo.storage_path, args.organizationId, anexo.lead_id);
       // A fila remove com o cliente admin: só o que mora sob o prefixo do negócio.
-      if (!isLeadAttachmentPathOwnedBy(anexo.storage_path, args.organizationId, anexo.lead_id)) {
+      if (!caminhoValido) {
         logger.warn("[lgpd-redact-cascade] anexo com caminho fora do negócio; não enfileirado", {
           attachmentId: anexo.id,
           requestId: args.requestId,
@@ -234,7 +247,7 @@ export async function cascadeRedactContact(args: CascadeArgs): Promise<CascadeRe
       await enfileirarMidiaNaFila(admin, {
         organizationId: args.organizationId,
         requestId: args.requestId,
-        bucket: "internal-media",
+        bucket: importadoDoClickUp ? "clickup-assets" : "internal-media",
         objectPath: anexo.storage_path,
       });
     }
@@ -248,11 +261,93 @@ export async function cascadeRedactContact(args: CascadeArgs): Promise<CascadeRe
     }
   }
 
-  const { data, error } = await admin.rpc("fn_lgpd_cascade_redact_contact" as never, {
-    p_organization_id: args.organizationId,
-    p_contact_id: args.contactId,
-    p_request_id: args.requestId,
-  } as never);
+  const filtroDasTarefas = filtroDeTarefasDoTitular(args.contactId, idsDosLeads);
+  const { data: tarefasDosLeads, error: tarefasErro } = await admin
+    .from("crm_tasks")
+    .select("id")
+    .eq("organization_id", args.organizationId)
+    .or(filtroDasTarefas);
+  if (tarefasErro) {
+    throw new Error(`[lgpd-redact-cascade] tarefas dos leads não lidas: ${tarefasErro.message}`);
+  }
+  const idsDasTarefas = (tarefasDosLeads ?? []).map((tarefa) => tarefa.id);
+  if (idsDasTarefas.length > 0) {
+    const { error: redigirTarefasErro } = await admin
+      .from("crm_tasks")
+      .update({
+        tags: [],
+        start_at: null,
+        time_estimate_ms: null,
+        source_metadata: {},
+      })
+      .eq("organization_id", args.organizationId)
+      .in("id", idsDasTarefas);
+    if (redigirTarefasErro) {
+      throw new Error(
+        `[lgpd-redact-cascade] fidelidade ClickUp das tarefas não redigida: ${redigirTarefasErro.message}`,
+      );
+    }
+    const { data: anexosDasTarefas, error: anexosErro } = await admin
+      .from("crm_task_attachments")
+      .select("id,task_id,storage_path")
+      .eq("organization_id", args.organizationId)
+      .in("task_id", idsDasTarefas);
+    if (anexosErro) {
+      throw new Error(`[lgpd-redact-cascade] anexos das tarefas não lidos: ${anexosErro.message}`);
+    }
+    for (const anexo of anexosDasTarefas ?? []) {
+      if (
+        !anexo.storage_path ||
+        !isClickUpAssetFinalPathOwnedBy(
+          anexo.storage_path,
+          args.organizationId,
+          "tasks",
+          anexo.task_id,
+        )
+      ) {
+        continue;
+      }
+      await enfileirarMidiaNaFila(admin, {
+        organizationId: args.organizationId,
+        requestId: args.requestId,
+        bucket: "clickup-assets",
+        objectPath: anexo.storage_path,
+      });
+    }
+    const { error: apagarAnexosErro } = await admin
+      .from("crm_task_attachments")
+      .delete()
+      .eq("organization_id", args.organizationId)
+      .in("task_id", idsDasTarefas);
+    if (apagarAnexosErro) {
+      throw new Error(
+        `[lgpd-redact-cascade] anexos das tarefas não apagados: ${apagarAnexosErro.message}`,
+      );
+    }
+    const { error: comentariosErro } = await admin
+      .from("crm_task_comments")
+      .update({
+        source_user_id: "redacted",
+        author_display_name: "Pessoa anonimizada",
+        body_markdown: "[conteúdo anonimizado]",
+      })
+      .eq("organization_id", args.organizationId)
+      .in("task_id", idsDasTarefas);
+    if (comentariosErro) {
+      throw new Error(
+        `[lgpd-redact-cascade] comentários das tarefas não anonimizados: ${comentariosErro.message}`,
+      );
+    }
+  }
+
+  const { data, error } = await admin.rpc(
+    "fn_lgpd_cascade_redact_contact" as never,
+    {
+      p_organization_id: args.organizationId,
+      p_contact_id: args.contactId,
+      p_request_id: args.requestId,
+    } as never,
+  );
 
   if (error) {
     throw new Error(`[lgpd-redact-cascade] rpc failed: ${error.message}`);

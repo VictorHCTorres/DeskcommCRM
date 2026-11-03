@@ -20,9 +20,17 @@ import { createLeadHandler, moveLeadHandler, updateLeadHandler } from "@/app/api
 import type { HandlerCtx } from "@/lib/api/handlers/types";
 import { emitLeadActivity } from "@/lib/leads/activity-emitter";
 import { estamparAtribuicaoDoContato } from "@/lib/leads/atribuicao-de-anuncio";
-import { classificarLeadInicial, type ResultadoClassificacaoInicial } from "@/lib/leads/classificacao-inicial";
+import {
+  classificarLeadInicial,
+  type ResultadoClassificacaoInicial,
+} from "@/lib/leads/classificacao-inicial";
 import type { CreateLeadInput } from "@/lib/schemas";
-import { mapInboundPayload, extrairAtribuicaoDoInbound, verifyInboundSignature, type FieldMap } from "@/lib/webhooks/inbound";
+import {
+  mapInboundPayload,
+  extrairAtribuicaoDoInbound,
+  verifyInboundSignature,
+  type FieldMap,
+} from "@/lib/webhooks/inbound";
 import { HEADER_ASSINATURA_DE_ENTRADA } from "@/lib/webhooks/assinatura";
 import { encontrarContatoPorTelefoneComNome } from "@/lib/channels/contato-por-telefone";
 import {
@@ -38,7 +46,11 @@ import {
   mapRdStationPayload,
   type RdStationMapped,
 } from "@/lib/webhooks/rdstation";
-import { isElementorPayload, mapElementorPayload, type ElementorMapped } from "@/lib/webhooks/elementor";
+import {
+  isElementorPayload,
+  mapElementorPayload,
+  type ElementorMapped,
+} from "@/lib/webhooks/elementor";
 import {
   motivoDaRecusaDaCriacao,
   origemDaPagina,
@@ -52,10 +64,12 @@ import { ApiError } from "@/lib/api/types";
 import { autorizarCaptacaoParaIA, camposDaCaptacao } from "@/lib/ai/elegibilidade/formulario";
 import { autorizarContatoParaIA } from "@/lib/ai/elegibilidade/autorizacao";
 import { kickLocalPipeline } from "@/lib/dev/kick-local-pipeline";
+import { normalizarCamposNumericos, webhookFormFieldsSchema } from "@/lib/webhooks/formulario";
 import {
-  normalizarCamposNumericos,
-  webhookFormFieldsSchema,
-} from "@/lib/webhooks/formulario";
+  ehSubmissaoFormularioPublico,
+  filtrarHoneypotFormularioPublico,
+  submissaoFormularioPublicoEhValida,
+} from "@/lib/webhooks/formulario-publico";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -70,9 +84,19 @@ const RATE_LIMIT_PER_MIN = 60;
 // duplicated (not exported there) only so the route can flag a phone-looking
 // field that failed normalizePhoneBR, for observability. Keep in sync if that
 // list changes.
-const PHONE_ALIASES_FOR_LOGGING = ["phone", "telefone", "whatsapp", "celular", "phone_number", "tel"];
+const PHONE_ALIASES_FOR_LOGGING = [
+  "phone",
+  "telefone",
+  "whatsapp",
+  "celular",
+  "phone_number",
+  "tel",
+];
 
-function findRawPhoneIfUnnormalized(payload: Record<string, unknown>, fieldMap: FieldMap): string | null {
+function findRawPhoneIfUnnormalized(
+  payload: Record<string, unknown>,
+  fieldMap: FieldMap,
+): string | null {
   const aliases = [...(fieldMap.phone ?? []), ...PHONE_ALIASES_FOR_LOGGING];
   const lowered = new Map(Object.keys(payload).map((k) => [k.toLowerCase(), k]));
   for (const alias of aliases) {
@@ -146,7 +170,11 @@ async function etapaAlvoDoEnvio(
     });
     return null;
   }
-  const etapas = (data ?? []) as Array<{ id: string; name: string | null; position: number | null }>;
+  const etapas = (data ?? []) as Array<{
+    id: string;
+    name: string | null;
+    position: number | null;
+  }>;
   const alvo =
     etapas.find((e) => e.id === indicado) ??
     etapas.find((e) => (e.name ?? "").trim().toLowerCase() === indicado.trim().toLowerCase());
@@ -170,18 +198,12 @@ export async function POST(req: NextRequest, ctx: RouteCtx): Promise<NextRespons
     return fail("not_found", "unknown webhook token", 404, { requestId });
   }
 
-  const rl = await checkRateLimit(`webhook_in:${token}`, RATE_LIMIT_PER_MIN, 60);
-  if (!rl.allowed) {
-    return fail("rate_limited", "Too many requests.", 429, {
-      requestId,
-      headers: { "Retry-After": "60" },
-    });
-  }
-
   const admin = createAdminClient();
   const { data: source, error: srcErr } = await admin
     .from("webhook_sources")
-    .select("id, name, organization_id, secret_encrypted, default_pipeline_id, default_stage_id, field_map, form_fields, redirect_to, is_active, authorize_ai_on_capture, update_existing_lead_on_capture, reuse_open_lead_on_capture")
+    .select(
+      "id, name, organization_id, secret_encrypted, default_pipeline_id, default_stage_id, field_map, form_fields, redirect_to, is_active, authorize_ai_on_capture, update_existing_lead_on_capture, reuse_open_lead_on_capture",
+    )
     .eq("path_token", token)
     .maybeSingle();
   if (srcErr) return fail("internal_error", srcErr.message, 500, { requestId });
@@ -203,12 +225,31 @@ export async function POST(req: NextRequest, ctx: RouteCtx): Promise<NextRespons
     }
   }
 
+  // A chave reservada precisa ser observada antes de o honeypot ser removido.
+  // Só fontes sem HMAC usam o balde por IP: uma integração assinada que mande
+  // essa chave continua sob o limite global, sem ampliar a superfície de brute
+  // force. Um bot do formulário, por sua vez, não esgota o token para todos os
+  // visitantes legítimos.
+  const submissaoNativa = ehSubmissaoFormularioPublico(payload);
+  const ipDoCliente = ipDoClienteParaInet(req.headers);
+  const chaveDoRateLimit =
+    submissaoNativa && !source.secret_encrypted
+      ? `webhook_in_native:${token}:${ipDoCliente ?? "sem-ip"}`
+      : `webhook_in:${token}`;
+  const rl = await checkRateLimit(chaveDoRateLimit, RATE_LIMIT_PER_MIN, 60);
+  if (!rl.allowed) {
+    return fail("rate_limited", "Too many requests.", 429, {
+      requestId,
+      headers: { "Retry-After": "60" },
+    });
+  }
+
   // A ORIGEM, lida uma vez e usada em todos os desfechos abaixo — inclusive nos
   // que recusam. Quem publicou um formulário que não está entrando precisa ver
   // que a batida CHEGOU e por que morreu; sem isto o registro só existe quando
   // deu certo, que é exatamente quando ninguém precisa dele.
   const origemDaCaptacao = {
-    remoteIp: ipDoClienteParaInet(req.headers),
+    remoteIp: ipDoCliente,
     userAgent: req.headers.get("user-agent"),
     origin: origemDaPagina(req.headers),
     requestId,
@@ -231,11 +272,14 @@ export async function POST(req: NextRequest, ctx: RouteCtx): Promise<NextRespons
   if (source.secret_encrypted) {
     sourceSecret = await decryptWebhookSecret(admin, source.secret_encrypted as unknown as string);
     if (sourceSecret === null) {
-      logger.error("[webhooks.in] segredo da fonte não decifra — captação recusada até recadastrar a assinatura", {
-        organizationId: source.organization_id,
-        webhookSourceId: source.id,
-        requestId,
-      });
+      logger.error(
+        "[webhooks.in] segredo da fonte não decifra — captação recusada até recadastrar a assinatura",
+        {
+          organizationId: source.organization_id,
+          webhookSourceId: source.id,
+          requestId,
+        },
+      );
       recusa = "assinatura_indecifravel";
     } else if (!verifyInboundSignature(rawBody, sigHeader, sourceSecret)) {
       recusa = "assinatura_invalida";
@@ -257,6 +301,25 @@ export async function POST(req: NextRequest, ctx: RouteCtx): Promise<NextRespons
       rejectReason: recusa,
     });
     return fail("unauthenticated", "invalid_signature", 401, { requestId });
+  }
+
+  // O formulário nativo envia uma armadilha invisível com chave reservada.
+  // Ela roda DEPOIS da assinatura: uma fonte protegida nunca pode trocar o 401
+  // por um falso sucesso apenas preenchendo o honeypot. Bot já autenticado (ou
+  // fonte sem HMAC) recebe sucesso indistinguível do envio real, mas não cria
+  // contato/card nem polui o histórico. A chave sai do payload também quando
+  // vazia, para nunca virar campo personalizado ou PII persistida.
+  const antispam = filtrarHoneypotFormularioPublico(payload);
+  if (antispam.bloqueado) return ok({ received: true }, { requestId });
+  payload = antispam.payload;
+
+  if (submissaoNativa) {
+    const campos = webhookFormFieldsSchema.safeParse(source.form_fields ?? []);
+    if (!campos.success || !submissaoFormularioPublicoEhValida(payload, campos.data)) {
+      return fail("invalid_request", "Confira os campos obrigatórios e tente novamente.", 422, {
+        requestId,
+      });
+    }
   }
 
   const headersJson: Record<string, string> = {};
@@ -295,9 +358,7 @@ export async function POST(req: NextRequest, ctx: RouteCtx): Promise<NextRespons
   // o idempotency key e o mapeamento de campos abaixo. Respondi tem
   // precedência: um payload nunca é dos dois.
   const rdStationMapped: RdStationMapped | null =
-    respondiMapped === null && isRdStationPayload(payload)
-      ? mapRdStationPayload(payload)
-      : null;
+    respondiMapped === null && isRdStationPayload(payload) ? mapRdStationPayload(payload) : null;
 
   // Elementor Pro manda `fields[<id>][value]` (colchetes, uma linha por
   // propriedade) — mesmo problema: nenhuma chave de topo chama `nome`. Fica por
@@ -319,18 +380,18 @@ export async function POST(req: NextRequest, ctx: RouteCtx): Promise<NextRespons
   const externalId =
     typeof externalIdRaw === "string" && externalIdRaw.trim()
       ? externalIdRaw.trim().slice(0, 255)
-      // O MESMO corte do ramo acima. A assimetria era de uma linha e o desfecho
-      // não: `uniq_crm_leads_org_source_external` é btree, e btree recusa chave
-      // que não caiba em ~2.704 bytes. Medido em Postgres 17 real, com conteúdo
-      // INCOMPRESSÍVEL (o pglz comprime `repeat('a')` e mascara o limite): a
-      // partir de ~2.669 bytes o INSERT sai com sqlstate 54000, o handler
-      // devolve 500 e NENHUM lead entra.
-      //
-      // Não é alcançável pelo Respondi real — o `respondent_id` do formulário é
-      // uuid de 36 chars, ~60× abaixo do limiar. É higiene de simetria: dois
-      // ramos do mesmo `?:` produzindo a mesma coluna com regras diferentes é o
-      // tipo de coisa que só aparece quando alguém manda um corpo fabricado.
-      : (respondiMapped?.externalId?.slice(0, 255) ??
+      : // O MESMO corte do ramo acima. A assimetria era de uma linha e o desfecho
+        // não: `uniq_crm_leads_org_source_external` é btree, e btree recusa chave
+        // que não caiba em ~2.704 bytes. Medido em Postgres 17 real, com conteúdo
+        // INCOMPRESSÍVEL (o pglz comprime `repeat('a')` e mascara o limite): a
+        // partir de ~2.669 bytes o INSERT sai com sqlstate 54000, o handler
+        // devolve 500 e NENHUM lead entra.
+        //
+        // Não é alcançável pelo Respondi real — o `respondent_id` do formulário é
+        // uuid de 36 chars, ~60× abaixo do limiar. É higiene de simetria: dois
+        // ramos do mesmo `?:` produzindo a mesma coluna com regras diferentes é o
+        // tipo de coisa que só aparece quando alguém manda um corpo fabricado.
+        (respondiMapped?.externalId?.slice(0, 255) ??
         rdStationMapped?.externalId?.slice(0, 255) ??
         null);
 
@@ -457,7 +518,10 @@ export async function POST(req: NextRequest, ctx: RouteCtx): Promise<NextRespons
   }
 
   const camposConfigurados = webhookFormFieldsSchema.safeParse(source.form_fields ?? []);
-  const tipagem = normalizarCamposNumericos(payload, camposConfigurados.success ? camposConfigurados.data : []);
+  const tipagem = normalizarCamposNumericos(
+    payload,
+    camposConfigurados.success ? camposConfigurados.data : [],
+  );
   if (tipagem.invalidKeys.length > 0) {
     await registrarCaptacao(admin, {
       ...fonteDaCaptacao,
@@ -661,7 +725,9 @@ export async function POST(req: NextRequest, ctx: RouteCtx): Promise<NextRespons
       outcome: "recusado",
       rejectReason: "sem_campo_mapeavel",
     });
-    return fail("invalid_request", "Nenhum campo mapeável (nome/telefone/email).", 400, { requestId });
+    return fail("invalid_request", "Nenhum campo mapeável (nome/telefone/email).", 400, {
+      requestId,
+    });
   }
 
   // Contato: upsert por telefone (se houver) — reusa a coluna E.164 canônica.
@@ -1364,7 +1430,8 @@ export async function POST(req: NextRequest, ctx: RouteCtx): Promise<NextRespons
   // atividade própria: o valor já fica visível em custom_fields, e uma
   // classificação normal não é um evento que precisa de linha na timeline.
   if (classificacaoInicial && classificacaoInicial.status !== "classificado") {
-    const tipo = classificacaoInicial.status === "desqualificado" ? "lead_disqualified" : "lead_needs_review";
+    const tipo =
+      classificacaoInicial.status === "desqualificado" ? "lead_disqualified" : "lead_needs_review";
     const atividadeClassificacao = await emitLeadActivity(admin, {
       organizationId: source.organization_id,
       leadId: String(lead.id),
@@ -1407,13 +1474,22 @@ export async function POST(req: NextRequest, ctx: RouteCtx): Promise<NextRespons
     respondiMapped.consent.detectedVia !== "not_found" &&
     !respondiMapped.consent.granted;
   if (source.authorize_ai_on_capture && contactId) {
-    const autorizou = sourceSecret !== null && await autorizarCaptacaoParaIA(admin, {
-      organizationId: source.organization_id, sourceId: source.id,
-      leadId: String(lead.id), contactId, requestId,
-    });
+    const autorizou =
+      sourceSecret !== null &&
+      (await autorizarCaptacaoParaIA(admin, {
+        organizationId: source.organization_id,
+        sourceId: source.id,
+        leadId: String(lead.id),
+        contactId,
+        requestId,
+      }));
     const atividadeIA = await emitLeadActivity(admin, {
-      organizationId: source.organization_id, leadId: String(lead.id), contactId,
-      type: "note", sourceModule: "webhook", sourceId: source.id,
+      organizationId: source.organization_id,
+      leadId: String(lead.id),
+      contactId,
+      type: "note",
+      sourceModule: "webhook",
+      sourceId: source.id,
       actor: { type: "webhook_source", id: source.id },
       reason: autorizou
         ? "Atendimento por IA autorizado pelo consentimento explícito deste formulário."
@@ -1422,7 +1498,8 @@ export async function POST(req: NextRequest, ctx: RouteCtx): Promise<NextRespons
     });
     if (!atividadeIA.ok) {
       logger.warn("[webhooks.inbound] autorização por formulário sem atividade", {
-        organization_id: source.organization_id, request_id: requestId,
+        organization_id: source.organization_id,
+        request_id: requestId,
       });
     }
   } else if (!source.authorize_ai_on_capture && respondiMapped && contactId && !consentNegado) {
@@ -1439,9 +1516,7 @@ export async function POST(req: NextRequest, ctx: RouteCtx): Promise<NextRespons
   // Sem isto, numa instalação sem cron de 1 min (relógio HTTP), o gatilho fica pending.
   await kickLocalPipeline(
     admin,
-    contactId
-      ? { organizationId: source.organization_id, contactId }
-      : undefined,
+    contactId ? { organizationId: source.organization_id, contactId } : undefined,
   );
 
   return respondWithLead(String(lead.id));

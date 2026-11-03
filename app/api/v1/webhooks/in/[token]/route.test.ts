@@ -59,21 +59,24 @@ import {
 
 const h = vi.hoisted(() => ({
   registrar: vi.fn(async () => undefined),
+  decifrar: vi.fn(async () => "segredo-da-fonte" as string | null),
   criarLead: vi.fn(async (..._args: unknown[]) => ({ id: "lead-novo" })),
   atualizarLead: vi.fn(async (..._args: unknown[]) => ({ id: "lead-whatsapp" })),
   moverLead: vi.fn(async (..._args: unknown[]) => ({ id: "lead-whatsapp" })),
+  rateLimit: vi.fn(async (..._args: unknown[]) => ({ allowed: true })),
   banco: undefined as unknown as BancoFalso,
 }));
 
 vi.mock("@/lib/supabase/admin", () => ({ createAdminClient: () => h.banco.cliente }));
 vi.mock("@/lib/ai/dispatcher/rate-limit", () => ({
-  checkRateLimit: async () => ({ allowed: true }),
+  checkRateLimit: h.rateLimit,
 }));
 vi.mock("@/lib/audit", () => ({ audit: vi.fn(async () => undefined) }));
 vi.mock("@/lib/webhooks/captacao", async (original) => ({
   ...(await original<Record<string, unknown>>()),
   registrarCaptacao: h.registrar,
 }));
+vi.mock("@/lib/webhooks/secrets", () => ({ decryptWebhookSecret: h.decifrar }));
 vi.mock("@/app/api/v1/leads/_handler", () => ({
   createLeadHandler: h.criarLead,
   updateLeadHandler: h.atualizarLead,
@@ -191,11 +194,14 @@ function responder(c: Cadeia): Resposta {
   return { data: null };
 }
 
-async function enviar(corpo: Record<string, unknown>): Promise<Response> {
+async function enviar(
+  corpo: Record<string, unknown>,
+  headers: Record<string, string> = {},
+): Promise<Response> {
   const req = new NextRequest(`http://localhost/api/v1/webhooks/in/${TOKEN}`, {
     method: "POST",
     body: JSON.stringify(corpo),
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...headers },
   });
   return (await POST(req, { params: Promise.resolve({ token: TOKEN }) })) as Response;
 }
@@ -235,6 +241,7 @@ beforeEach(() => {
   h.criarLead.mockResolvedValue({ id: "lead-novo" });
   h.atualizarLead.mockResolvedValue({ id: CARD_DA_CONVERSA });
   h.moverLead.mockResolvedValue({ id: CARD_DA_CONVERSA });
+  h.rateLimit.mockResolvedValue({ allowed: true });
   m = {
     fonte: { ...FONTE },
     porExternalId: null,
@@ -287,7 +294,11 @@ describe("primeiro envio com external_id inédito adota o card aberto (#3357)", 
     };
     m.fonte = { ...FONTE, update_existing_lead_on_capture: true };
 
-    const res = await enviar({ ...ENVIO_DO_TRIAL, evento: "trial_ativado", stage: "Teste iniciado" });
+    const res = await enviar({
+      ...ENVIO_DO_TRIAL,
+      evento: "trial_ativado",
+      stage: "Teste iniciado",
+    });
 
     expect(h.criarLead).not.toHaveBeenCalled();
     expect(carimbos()).toHaveLength(0);
@@ -348,7 +359,7 @@ describe("regressões do caminho com external_id (#3357)", () => {
           operacao(c) === "select" &&
           valorDoFiltro(c, "eq", "external_id") !== undefined,
       ),
-      "o card `source: \"webhook\"` foi achado na leitura de sempre: a do carimbo não roda",
+      'o card `source: "webhook"` foi achado na leitura de sempre: a do carimbo não roda',
     ).toHaveLength(1);
     expect(h.atualizarLead.mock.calls[0]?.[2]).toBe("lead-do-id");
     expect(desfecho()).toBe("atualizado");
@@ -388,7 +399,9 @@ describe("regressões do caminho com external_id (#3357)", () => {
     // sem ser gravado nele, e o evento seguinte do id B ia atrás do card
     // aberto mais novo do contato.
     expect(h.criarLead).toHaveBeenCalledTimes(1);
-    expect((h.criarLead.mock.calls[0]?.[2] as Record<string, unknown>).external_id).toBe("conta-9999");
+    expect((h.criarLead.mock.calls[0]?.[2] as Record<string, unknown>).external_id).toBe(
+      "conta-9999",
+    );
     expect(
       carimbos(),
       "o carimbo tentou trocar a identidade do card que já respondia por outro id",
@@ -460,7 +473,10 @@ describe("as bordas do portão 3 (#3366)", () => {
 
     const res = await enviar(semId);
 
-    expect(h.criarLead, "o envio sem id abriu um segundo card ao lado do card com id").not.toHaveBeenCalled();
+    expect(
+      h.criarLead,
+      "o envio sem id abriu um segundo card ao lado do card com id",
+    ).not.toHaveBeenCalled();
     expect(carimbos()).toHaveLength(0);
     expect(h.atualizarLead.mock.calls[0]?.[2]).toBe(CARD_DA_CONVERSA);
     expect(desfecho()).toBe("atualizado");
@@ -495,11 +511,14 @@ describe("as bordas do portão 3 (#3366)", () => {
 
     const res = await enviar(ENVIO_DO_TRIAL);
 
-    expect(h.criarLead, "a corrida de dois primeiros envios abriu um segundo card").not.toHaveBeenCalled();
+    expect(
+      h.criarLead,
+      "a corrida de dois primeiros envios abriu um segundo card",
+    ).not.toHaveBeenCalled();
     expect(await res.json()).toEqual({ data: { lead_id: CARD_DA_CONVERSA } });
   });
 
-  it("⭐ segundo envio do mesmo id com \"Atualizar o card existente\" DESLIGADA: sucesso e card intocado (o que o fragmento afirma)", async () => {
+  it('⭐ segundo envio do mesmo id com "Atualizar o card existente" DESLIGADA: sucesso e card intocado (o que o fragmento afirma)', async () => {
     m.porExternalId = { ...CARD_ABERTO, external_id: "conta-3357", webhook_source_id: "fonte-1" };
     // Só "Reaproveitar" ligada — `update_existing_lead_on_capture: false` é o default da FONTE.
 
@@ -561,5 +580,106 @@ describe("captação passa `manterForaDaLista` nas três escritas (#3508)", () =
 
     expect(h.atualizarLead).toHaveBeenCalledTimes(1);
     expect(h.atualizarLead.mock.calls[0]?.[4]).toEqual({ manterForaDaLista: true });
+  });
+});
+
+describe("antispam do formulário público nativo", () => {
+  it("responde sucesso ao bot sem criar nem registrar captação", async () => {
+    const res = await enviar({
+      nome: "Robô",
+      telefone: "+5511999999999",
+      __deskcomm_site: "https://spam.test",
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ data: { received: true } });
+    expect(h.criarLead).not.toHaveBeenCalled();
+    expect(h.registrar).not.toHaveBeenCalled();
+  });
+
+  it("não deixa o honeypot contornar a assinatura HMAC da fonte", async () => {
+    m.fonte = { ...FONTE, secret_encrypted: "cifrado" };
+
+    const res = await enviar({
+      nome: "Robô",
+      telefone: "+5511999999999",
+      __deskcomm_site: "https://spam.test",
+    });
+
+    expect(res.status).toBe(401);
+    expect(h.decifrar).toHaveBeenCalled();
+    expect(h.rateLimit).toHaveBeenCalledWith(`webhook_in:${TOKEN}`, 60, 60);
+    expect(h.criarLead).not.toHaveBeenCalled();
+    expect(h.registrar).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ outcome: "recusado", rejectReason: "assinatura_invalida" }),
+    );
+  });
+
+  it("recusa bypass direto de obrigatórios com erro público genérico", async () => {
+    m.fonte = {
+      ...FONTE,
+      form_fields: [{ key: "aceite", label: "Aceito o contato", type: "checkbox", required: true }],
+    };
+
+    const res = await enviar({
+      nome: "Ana",
+      telefone: "+5511999999999",
+      aceite: "false",
+      __deskcomm_site: "",
+    });
+
+    expect(res.status).toBe(422);
+    expect(await res.json()).toEqual({
+      error: {
+        code: "invalid_request",
+        message: "Confira os campos obrigatórios e tente novamente.",
+      },
+    });
+    expect(h.criarLead).not.toHaveBeenCalled();
+    expect(h.registrar).not.toHaveBeenCalled();
+  });
+
+  it("não impõe o contrato nativo a uma integração genérica", async () => {
+    m.fonte = {
+      ...FONTE,
+      form_fields: [{ key: "aceite", label: "Aceito o contato", type: "checkbox", required: true }],
+    };
+
+    const res = await enviar({ ...ENVIO_DO_TRIAL, aceite: "false" });
+
+    expect(res.status).toBe(200);
+    expect(h.atualizarLead).toHaveBeenCalledOnce();
+    expect(h.rateLimit).toHaveBeenCalledWith(`webhook_in:${TOKEN}`, 60, 60);
+  });
+
+  it("isola o balde por IP para um bot não bloquear outro visitante", async () => {
+    const usos = new Map<string, number>();
+    h.rateLimit.mockImplementation(async (...args: unknown[]) => {
+      const key = String(args[0]);
+      const quantidade = (usos.get(key) ?? 0) + 1;
+      usos.set(key, quantidade);
+      return { allowed: quantidade <= 1 };
+    });
+
+    const bot = await enviar(
+      {
+        nome: "Robô",
+        telefone: "+5511999999999",
+        __deskcomm_site: "https://spam.test",
+      },
+      { "x-forwarded-for": "198.51.100.10" },
+    );
+    const pessoa = await enviar(
+      { ...ENVIO_DO_TRIAL, __deskcomm_site: "" },
+      { "x-forwarded-for": "203.0.113.20" },
+    );
+
+    expect(bot.status).toBe(200);
+    expect(pessoa.status).toBe(200);
+    expect([...usos.keys()]).toEqual([
+      `webhook_in_native:${TOKEN}:198.51.100.10`,
+      `webhook_in_native:${TOKEN}:203.0.113.20`,
+    ]);
   });
 });

@@ -3,6 +3,8 @@ import { requireAuth, resolveActiveOrg } from "@/lib/auth/server";
 import type { Pipeline, Stage } from "@/lib/kanban/types";
 import { createClient } from "@/lib/supabase/server";
 import { PipelinePageClient } from "./_client";
+import type { SupabaseClient } from "@supabase/supabase-js";
+import { listarGruposDeFunil } from "@/lib/pipelines/grupos";
 
 export const dynamic = "force-dynamic";
 
@@ -49,16 +51,18 @@ export default async function PipelinePage({ params }: { params: Promise<{ id: s
   // trocar para um funil que não recebe negócio seria destino que não existe.
   const { data: funis } = await supabase
     .from("crm_pipelines")
-    .select("id, name")
+    .select("id, name, group_id")
     .eq("organization_id", activeOrg.orgId)
     .eq("is_archived", false)
     .order("position");
+  const grupos = await listarGruposDeFunil(supabase as unknown as SupabaseClient, activeOrg.orgId);
   return (
     <PipelinePageClient
       pipelineId={id}
       initialName={pipeline.name}
       role={activeOrg.role}
       funis={funis ?? []}
+      grupos={grupos}
       funilInicial={pipeline as Pipeline}
       etapasIniciais={(etapas ?? []) as Stage[]}
     />

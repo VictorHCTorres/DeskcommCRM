@@ -48,6 +48,11 @@
  * `lead_notes` (#1957, Art. 18 II): o que a cascata apaga a pedido dele é o que
  * se entrega a pedido dele. A diferença nos dois arquivos é só a linha
  * `"lead_attachments": []`; o resto segue byte a byte.
+ *
+ * Sétima exceção, regravando `data-*.json`: anexos e comentários de tarefas
+ * passam a integrar a cópia do titular pela mesma regra de paridade com a
+ * cascata. Entram apenas `task_attachments` e `task_comments`, ambos vazios
+ * nesta fixture histórica.
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";

@@ -7,6 +7,7 @@ import { createAdminClient } from "@/lib/supabase/admin";
 import { createClient } from "@/lib/supabase/server";
 import { PipelinesClient, type EtapaDoFunil, type PipelineRow } from "./_client";
 import { traduzir } from "@/lib/i18n/dicionario";
+import { ImportarClickUpCrm } from "./_clickup-import";
 
 export const dynamic = "force-dynamic";
 
@@ -62,21 +63,25 @@ export default async function PipelinesSettingsPage() {
   }
   const idioma = user.idioma;
   // #1907: sem o módulo `financeiro` não há comanda, e o interruptor do ganho some.
-  const comandaDisponivel = podeEditarConfig && (await moduloLigado(createAdminClient(), "financeiro"));
+  const comandaDisponivel =
+    podeEditarConfig && (await moduloLigado(createAdminClient(), "financeiro"));
 
   return (
     <div className="flex h-full flex-col gap-6 p-6">
-      <header>
-        <h1 className="text-2xl font-semibold tracking-tight">
-          {traduzir("Etapas do funil", idioma)}
-        </h1>
-        <p className="text-sm text-muted-foreground">
-          {traduzir("Para onde o agente leva o card em cada passo do atendimento", idioma)}
-          {podeEditarConfig
-            ? traduzir(", vocabulário, custom fields e motivos de perda", idioma)
-            : ""}
-          .
-        </p>
+      <header className="flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">
+            {traduzir("Etapas do funil", idioma)}
+          </h1>
+          <p className="text-sm text-muted-foreground">
+            {traduzir("Para onde o agente leva o card em cada passo do atendimento", idioma)}
+            {podeEditarConfig
+              ? traduzir(", vocabulário, custom fields e motivos de perda", idioma)
+              : ""}
+            .
+          </p>
+        </div>
+        <ImportarClickUpCrm podeCriarConexao={podeEditarConfig} />
       </header>
       <PipelinesClient
         pipelines={pipelines}

@@ -1,0 +1,13 @@
+{
+  "comments": [
+    {
+      "id": "c-parent",
+      "date": "1730619000000",
+      "date_updated": "1730619001000",
+      "comment_text": "Olá @Ana <script>não</script>",
+      "reply_count": 1,
+      "user": { "id": 7, "username": "Autor" },
+      "attachments": [{ "id": "a-comment" }]
+    }
+  ]
+}

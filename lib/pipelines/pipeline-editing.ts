@@ -38,6 +38,8 @@ export interface FunilEditavel {
   is_archived: boolean;
   /** Opcional porque NENHUMA regra daqui a usa — ela só existe para a tela. */
   description?: string | null;
+  /** Grupo visual; `null` mantém o funil na seção Sem grupo. */
+  group_id?: string | null;
 }
 
 /** O que amarra o funil ao resto do sistema, contado ANTES de arquivar ou excluir. */
@@ -87,7 +89,10 @@ export function validarNomeDeFunil(
   funilId: string | null,
 ): Resultado {
   if (!nome.trim()) {
-    return { ok: false, erro: "Dê um nome ao funil — é o que aparece na lista e no topo do quadro." };
+    return {
+      ok: false,
+      erro: "Dê um nome ao funil — é o que aparece na lista e no topo do quadro.",
+    };
   }
 
   const chave = chaveDeNome(nome);
@@ -132,7 +137,10 @@ export function validarArquivamento(
 ): Resultado {
   const funil = funis.find((f) => f.id === funilId);
   if (!funil) {
-    return { ok: false, erro: "Esse funil não está mais na sua lista. Recarregue a página e tente de novo." };
+    return {
+      ok: false,
+      erro: "Esse funil não está mais na sua lista. Recarregue a página e tente de novo.",
+    };
   }
 
   if (ativos(funis).filter((f) => f.id !== funilId).length === 0) {

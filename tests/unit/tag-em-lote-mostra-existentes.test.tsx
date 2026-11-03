@@ -2,6 +2,7 @@ import { useEffect } from "react";
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
 
 import { BulkActionBar } from "@/components/kanban/BulkActionBar";
@@ -164,15 +165,18 @@ describe("BulkActionBar — tag em lote", () => {
 describe("a página do funil ENTREGA as tags do quadro à barra", () => {
   it("as tags dos leads do quadro chegam ao menu de tag em lote", async () => {
     const { PipelinePageClient } = await import("@/app/app/pipelines/[id]/_client");
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
-      <PipelinePageClient
-        pipelineId="p-1"
-        initialName="Funil"
-        role="admin"
-        funis={[]}
-        funilInicial={FUNIL_LEVE}
-        etapasIniciais={ETAPAS}
-      />,
+      <QueryClientProvider client={queryClient}>
+        <PipelinePageClient
+          pipelineId="p-1"
+          initialName="Funil"
+          role="admin"
+          funis={[]}
+          funilInicial={FUNIL_LEVE}
+          etapasIniciais={ETAPAS}
+        />
+      </QueryClientProvider>,
     );
 
     await userEvent.click(await screen.findByRole("button", { name: /tag/i }));

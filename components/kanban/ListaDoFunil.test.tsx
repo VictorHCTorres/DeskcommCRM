@@ -33,14 +33,33 @@ const ETAPAS = [
 ] as unknown as Stage[];
 
 const PAGINA = {
-  leads: [{ id: "l-1", title: "Negócio A", stage_id: "e-1", value_cents: null, currency: null }],
+  leads: [
+    {
+      id: "l-1",
+      title: "Negócio A",
+      stage_id: "e-1",
+      value_cents: null,
+      currency: null,
+      tags: ["VIP"],
+      source_metadata: {
+        clickup: {
+          priority: "urgent",
+          start_at: "2026-11-03T12:00:00.000Z",
+          time_estimate_ms: 5_400_000,
+        },
+      },
+    },
+  ],
   page: 1,
   perPage: 50,
   hasMore: true,
 };
+const ORDEM_PADRAO = { field: "position", direction: "asc" } as const;
 
 function montar(filtros: LeadFilters) {
-  return render(<ListaDoFunil pipelineId="p-1" pipeline={FUNIL} stages={ETAPAS} filtros={filtros} />);
+  return render(
+    <ListaDoFunil pipelineId="p-1" pipeline={FUNIL} stages={ETAPAS} filtros={filtros} />,
+  );
 }
 
 beforeEach(() => {
@@ -52,25 +71,46 @@ describe("a Lista e a barra de filtros", () => {
   it("⭐ Responsável e Status da barra vão para o pedido da página", () => {
     montar({ owner: ANA, status: "open" });
 
-    expect(useLeadsPaginados).toHaveBeenLastCalledWith("p-1", 1, { owner: ANA, status: "open" });
+    expect(useLeadsPaginados).toHaveBeenLastCalledWith(
+      "p-1",
+      1,
+      { owner: ANA, status: "open" },
+      undefined,
+      ORDEM_PADRAO,
+    );
   });
 
-  it("\"Todos\" da barra (`any`/`all`) não vira filtro: o funil inteiro", () => {
+  it("mostra prioridade, tags, início e estimativa projetados sem metadata bruta", () => {
+    montar({});
+    expect(screen.getByText(/Prioridade: Urgente/)).toBeInTheDocument();
+    expect(screen.getByText("VIP")).toBeInTheDocument();
+    expect(screen.getByText(/Início:/)).toBeInTheDocument();
+    expect(screen.getByText(/Estimativa: 1h 30min/)).toBeInTheDocument();
+    expect(screen.queryByText("time_estimate_ms")).toBeNull();
+  });
+
+  it('"Todos" da barra (`any`/`all`) não vira filtro: o funil inteiro', () => {
     montar({ owner: "any", status: "all" });
 
-    expect(useLeadsPaginados).toHaveBeenLastCalledWith("p-1", 1, {});
+    expect(useLeadsPaginados).toHaveBeenLastCalledWith("p-1", 1, {}, undefined, ORDEM_PADRAO);
   });
 
   it("filtro NOVO volta para a página 1 — a página 2 de antes não é a 2 de agora", async () => {
     const { rerender } = montar({});
     await userEvent.click(screen.getByRole("button", { name: "Próxima" }));
-    expect(useLeadsPaginados).toHaveBeenLastCalledWith("p-1", 2, {});
+    expect(useLeadsPaginados).toHaveBeenLastCalledWith("p-1", 2, {}, undefined, ORDEM_PADRAO);
 
     rerender(
       <ListaDoFunil pipelineId="p-1" pipeline={FUNIL} stages={ETAPAS} filtros={{ owner: ANA }} />,
     );
 
-    expect(useLeadsPaginados).toHaveBeenLastCalledWith("p-1", 1, { owner: ANA });
+    expect(useLeadsPaginados).toHaveBeenLastCalledWith(
+      "p-1",
+      1,
+      { owner: ANA },
+      undefined,
+      ORDEM_PADRAO,
+    );
   });
 
   it("filtro que a Lista ainda NÃO aplica é dito na tela, com o nome da barra", () => {
@@ -88,7 +128,7 @@ describe("a Lista e a barra de filtros", () => {
     expect(screen.queryByTestId("lista-filtros-fora")).toBeNull();
   });
 
-  it("vazio com filtro diz \"com este filtro\", e não que o funil está vazio", () => {
+  it('vazio com filtro diz "com este filtro", e não que o funil está vazio', () => {
     useLeadsPaginados.mockReturnValue({
       data: { leads: [], page: 1, perPage: 50, hasMore: false },
       isLoading: false,
