@@ -29,7 +29,11 @@ import { useQuery } from "@tanstack/react-query";
 
 import { chaveDoQuadro } from "@/hooks/kanban/useBoard";
 import { apiClient } from "@/lib/api/client";
-import { type FiltrosDaLista, paramsDosFiltrosDaLista } from "@/lib/kanban/filtros-da-lista";
+import {
+  type FiltrosDaLista,
+  type OrdenacaoDaLista,
+  paramsDosFiltrosDaLista,
+} from "@/lib/kanban/filtros-da-lista";
 import type { Lead } from "@/lib/types/leads";
 
 /** O tamanho de página padrão — o mesmo que a rota usa quando não vem `per_page`. */
@@ -82,8 +86,16 @@ export function chaveDosLeadsPaginados(
   pipelineId: string | null,
   pagina: number,
   filtros: FiltrosDaLista = {},
+  ordenacao: OrdenacaoDaLista = { field: "position", direction: "asc" },
 ) {
-  return [...chaveDoQuadro(pipelineId), "lista", pagina, paramsDosFiltrosDaLista(filtros)] as const;
+  return [
+    ...chaveDoQuadro(pipelineId),
+    "lista",
+    pagina,
+    paramsDosFiltrosDaLista(filtros),
+    ordenacao.field,
+    ordenacao.direction,
+  ] as const;
 }
 
 export function useLeadsPaginados(
@@ -91,14 +103,16 @@ export function useLeadsPaginados(
   pagina: number,
   filtros: FiltrosDaLista = {},
   porPagina: number = LEADS_POR_PAGINA,
+  ordenacao: OrdenacaoDaLista = { field: "position", direction: "asc" },
 ) {
   const doFiltro = paramsDosFiltrosDaLista(filtros);
   return useQuery({
-    queryKey: chaveDosLeadsPaginados(pipelineId, pagina, filtros),
+    queryKey: chaveDosLeadsPaginados(pipelineId, pagina, filtros, ordenacao),
     enabled: !!pipelineId,
     queryFn: async (): Promise<PaginaDeLeads> => {
       const res = await apiClient.get<RespostaDaRota>(
         `/api/v1/pipelines/${pipelineId}/leads?page=${pagina}&per_page=${porPagina}` +
+          `&sort=${ordenacao.field}&direction=${ordenacao.direction}` +
           (doFiltro ? `&${doFiltro}` : ""),
       );
       const leads = res?.data ?? [];

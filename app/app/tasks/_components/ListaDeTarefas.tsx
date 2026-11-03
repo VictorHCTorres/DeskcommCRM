@@ -12,11 +12,20 @@ import {
   agrupaPorPrazo,
   estaAtrasada,
   estaEncerrada,
+  familiasDeTarefas,
   type FaixaDePrazo,
   type PrioridadeDaTarefa,
   type Tarefa,
 } from "@/lib/tarefas/tipos";
-import { Check, Kanban, PencilSimple, Trash, UserCircle } from "@/lib/ui/icons";
+import {
+  ArrowsClockwise,
+  Check,
+  Kanban,
+  PencilSimple,
+  Plus,
+  Trash,
+  UserCircle,
+} from "@/lib/ui/icons";
 import { cn } from "@/lib/utils";
 
 interface Props {
@@ -25,6 +34,8 @@ interface Props {
   aoAlternarConcluida: (tarefa: Tarefa) => Promise<unknown>;
   aoEditar: (tarefa: Tarefa) => void;
   aoApagar: (tarefa: Tarefa) => Promise<unknown>;
+  aoCriarSubtarefa?: (tarefa: Tarefa) => void;
+  aoCancelarRecorrencia?: (tarefa: Tarefa) => Promise<unknown>;
   /**
    * Mostrar de qual negócio é cada tarefa, com o atalho para ele. A tela de
    * Tarefas mostra; o dossiê não — lá dentro todas são do mesmo negócio, e
@@ -49,6 +60,7 @@ function Linha({
   aoApagar,
   mostrarNegocio,
   nomeDoResponsavel,
+  filha = false,
 }: {
   tarefa: Tarefa;
   podeEditar: boolean;
@@ -58,6 +70,7 @@ function Linha({
   mostrarNegocio: boolean;
   /** Já resolvido por quem monta a lista; `null` = sem responsável conhecido. */
   nomeDoResponsavel: string | null;
+  filha?: boolean;
 }) {
   const t = useT();
   const tag = useTagDeIdioma();
@@ -87,6 +100,7 @@ function Linha({
     <div
       className={cn(
         "group flex items-start gap-3 rounded-lg px-3 py-2.5 transition-colors hover:bg-muted/40",
+        filha && "ml-7 border-l pl-4",
         encerrada && "opacity-60",
       )}
     >
@@ -109,12 +123,7 @@ function Linha({
       </button>
 
       <div className="min-w-0 flex-1">
-        <p
-          className={cn(
-            "text-sm font-medium",
-            encerrada && "text-muted-foreground line-through",
-          )}
-        >
+        <p className={cn("text-sm font-medium", encerrada && "text-muted-foreground line-through")}>
           {tarefa.title}
         </p>
         {tarefa.description ? (
@@ -130,7 +139,9 @@ function Linha({
           >
             {rotuloDaPrioridade[tarefa.priority]}
           </span>
-          <span className={cn("text-muted-foreground", atrasada && "font-semibold text-destructive")}>
+          <span
+            className={cn("text-muted-foreground", atrasada && "font-semibold text-destructive")}
+          >
             {tarefa.due_date
               ? new Date(tarefa.due_date).toLocaleString(tag, {
                   day: "2-digit",
@@ -149,7 +160,7 @@ function Linha({
           {mostrarNegocio && tarefa.lead ? (
             <Link
               href={`/app/leads/${tarefa.lead.id}`}
-              className="flex min-w-0 max-w-[16rem] items-center gap-1 text-muted-foreground hover:text-foreground hover:underline"
+              className="flex max-w-[16rem] min-w-0 items-center gap-1 text-muted-foreground hover:text-foreground hover:underline"
               title={tarefa.lead.title}
             >
               <Kanban size={12} aria-hidden className="shrink-0" />
@@ -212,11 +223,20 @@ export function ListaDeTarefas({
   aoAlternarConcluida,
   aoEditar,
   aoApagar,
+  aoCriarSubtarefa,
+  aoCancelarRecorrencia,
   mostrarNegocio = true,
 }: Props) {
   const t = useT();
   const usuario = useUser();
-  const grupos = agrupaPorPrazo(tarefas);
+  const [expandidas, setExpandidas] = useState<Set<string>>(() => new Set());
+  const familias = familiasDeTarefas(tarefas);
+  const grupos = agrupaPorPrazo(
+    familias.map((familia) => ({
+      ...familia.prazoDaFamilia,
+      familia,
+    })),
+  );
   // Os nomes vêm da lista de responsáveis, que é `agent`+ na rota: para quem só
   // lê, a consulta nem sai e a linha fica sem o nome — nunca com um id cru.
   const membros = useAssignableMembers(podeEditar);
@@ -254,25 +274,95 @@ export function ListaDeTarefas({
         <section key={grupo.faixa}>
           <h2
             className={cn(
-              "mb-1 px-3 text-xs font-semibold uppercase tracking-wider",
+              "mb-1 px-3 text-xs font-semibold tracking-wider uppercase",
               grupo.faixa === "atrasada" ? "text-destructive" : "text-muted-foreground",
             )}
           >
             {rotuloDaFaixa[grupo.faixa]}
           </h2>
           <div className="rounded-xl border bg-card py-1">
-            {grupo.tarefas.map((tarefa) => (
-              <Linha
-                key={tarefa.id}
-                tarefa={tarefa}
-                podeEditar={podeEditar}
-                aoAlternarConcluida={aoAlternarConcluida}
-                aoEditar={aoEditar}
-                aoApagar={aoApagar}
-                mostrarNegocio={mostrarNegocio}
-                nomeDoResponsavel={nomeDoResponsavel(tarefa)}
-              />
-            ))}
+            {grupo.tarefas.map(({ familia }) => {
+              const aberta = expandidas.has(familia.raiz.id);
+              const concluidas = familia.filhas.filter(estaEncerrada).length;
+              const atrasadas = familia.filhas.filter((filha) => estaAtrasada(filha)).length;
+              return (
+                <div key={familia.raiz.id}>
+                  {familia.filhas.length > 0 ||
+                  familia.orfa ||
+                  podeEditar ||
+                  familia.raiz.recurrence_id ? (
+                    <div className="flex flex-wrap items-center gap-2 px-3 pt-2 text-[11px] text-muted-foreground">
+                      {familia.filhas.length > 0 ? (
+                        <button
+                          type="button"
+                          className="min-h-11 rounded px-1 text-left hover:text-foreground lg:min-h-0"
+                          aria-expanded={aberta}
+                          onClick={() =>
+                            setExpandidas((atuais) => {
+                              const proximas = new Set(atuais);
+                              if (aberta) proximas.delete(familia.raiz.id);
+                              else proximas.add(familia.raiz.id);
+                              return proximas;
+                            })
+                          }
+                        >
+                          {aberta ? "▾" : "▸"} {concluidas}/{familia.filhas.length}{" "}
+                          {t("subtarefas")}
+                          {atrasadas > 0 ? ` · ${atrasadas} ${t("atrasadas")}` : ""}
+                        </button>
+                      ) : null}
+                      {familia.orfa ? (
+                        <span className="font-medium text-amber-700 dark:text-amber-400">
+                          {t("Tarefa principal indisponível")}
+                        </span>
+                      ) : null}
+                      {podeEditar && aoCriarSubtarefa && !familia.orfa ? (
+                        <button
+                          type="button"
+                          className="flex min-h-11 items-center gap-1 rounded px-1 hover:text-foreground lg:min-h-0"
+                          onClick={() => aoCriarSubtarefa(familia.raiz)}
+                        >
+                          <Plus size={12} aria-hidden /> {t("Adicionar subtarefa")}
+                        </button>
+                      ) : null}
+                      {podeEditar && familia.raiz.recurrence_id && aoCancelarRecorrencia ? (
+                        <button
+                          type="button"
+                          className="flex min-h-11 items-center gap-1 rounded px-1 hover:text-destructive lg:min-h-0"
+                          onClick={() => aoCancelarRecorrencia(familia.raiz)}
+                        >
+                          <ArrowsClockwise size={12} aria-hidden /> {t("Cancelar série")}
+                        </button>
+                      ) : null}
+                    </div>
+                  ) : null}
+                  <Linha
+                    tarefa={familia.raiz}
+                    podeEditar={podeEditar}
+                    aoAlternarConcluida={aoAlternarConcluida}
+                    aoEditar={aoEditar}
+                    aoApagar={aoApagar}
+                    mostrarNegocio={mostrarNegocio}
+                    nomeDoResponsavel={nomeDoResponsavel(familia.raiz)}
+                  />
+                  {aberta
+                    ? familia.filhas.map((filha) => (
+                        <Linha
+                          key={filha.id}
+                          tarefa={filha}
+                          filha
+                          podeEditar={podeEditar}
+                          aoAlternarConcluida={aoAlternarConcluida}
+                          aoEditar={aoEditar}
+                          aoApagar={aoApagar}
+                          mostrarNegocio={mostrarNegocio}
+                          nomeDoResponsavel={nomeDoResponsavel(filha)}
+                        />
+                      ))
+                    : null}
+                </div>
+              );
+            })}
           </div>
         </section>
       ))}

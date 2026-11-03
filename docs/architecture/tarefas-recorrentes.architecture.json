@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Subtarefas e recorrência de tarefas",
+    "subtitle": "hierarquia rasa, geração idempotente e série visível na operação",
+    "output": "tarefas-recorrentes.html",
+    "quality_profile": "standard"
+  },
+  "lanes": [
+    { "id": "pessoa", "label": "Pessoa" },
+    { "id": "borda", "label": "API e relógio" },
+    { "id": "regra", "label": "Regra" },
+    { "id": "banco", "label": "Banco" },
+    { "id": "retorno", "label": "Retorno visível" }
+  ],
+  "mainPath": [
+    "formulario",
+    "rota",
+    "serie",
+    "scheduler",
+    "cron",
+    "gerador",
+    "ocorrencia",
+    "lista"
+  ],
+  "nodes": [
+    {
+      "id": "formulario",
+      "lane": "pessoa",
+      "col": 1,
+      "type": "frontend",
+      "label": "Formulário de tarefa",
+      "sublabel": "subtarefa ou preset diário/semanal/mensal; retry não repete o POST"
+    },
+    {
+      "id": "lista",
+      "lane": "pessoa",
+      "col": 5,
+      "type": "frontend",
+      "label": "Lista de tarefas",
+      "sublabel": "raiz expansível, progresso, filhas atrasadas e cancelar série"
+    },
+    {
+      "id": "rota",
+      "lane": "borda",
+      "col": 2,
+      "type": "api",
+      "label": "POST /tasks · PUT/DELETE /tasks/:id/recurrence",
+      "sublabel": "tenant/RBAC; vínculos same-org; fuso da organização; série nunca é apagada"
+    },
+    {
+      "id": "scheduler",
+      "lane": "borda",
+      "col": 3,
+      "type": "service",
+      "label": "scheduler a cada 5 minutos",
+      "sublabel": "docker/scheduler/entrypoint.sh"
+    },
+    {
+      "id": "cron",
+      "lane": "borda",
+      "col": 4,
+      "type": "api",
+      "label": "GET/POST /cron/task-recurrence",
+      "sublabel": "Bearer fail-closed; lote 100; organização operante"
+    },
+    {
+      "id": "calculo",
+      "lane": "regra",
+      "col": 2,
+      "type": "service",
+      "label": "recorrencia.ts",
+      "sublabel": "hora de parede no fuso congelado; DST; dia 29-31 no último válido"
+    },
+    {
+      "id": "gerador",
+      "lane": "regra",
+      "col": 4,
+      "type": "service",
+      "label": "gerarRecorrenciasDeTarefas",
+      "sublabel": "SQL filtra org ativa antes do limit; reconcilia conclusão; limpa provisional após CAS perdido"
+    },
+    {
+      "id": "serie",
+      "lane": "banco",
+      "col": 2,
+      "type": "database",
+      "label": "crm_task_recurrences",
+      "sublabel": "current_task_id, geração, next_run_at + next_due_at e active; histórico preservado"
+    },
+    {
+      "id": "ocorrencia",
+      "lane": "banco",
+      "col": 4,
+      "type": "database",
+      "label": "crm_tasks",
+      "sublabel": "parent_task_id + recurrence_id/generation/scheduled_for"
+    },
+    {
+      "id": "audit",
+      "lane": "retorno",
+      "col": 4,
+      "type": "service",
+      "label": "Auditoria e atividade",
+      "sublabel": "criação/configuração/cancelamento; tarefa nova volta à timeline do negócio"
+    },
+    {
+      "id": "log",
+      "lane": "retorno",
+      "col": 3,
+      "type": "service",
+      "label": "Log estruturado",
+      "sublabel": "ponteiro incoerente e falha por série ficam visíveis sem travar o lote"
+    }
+  ],
+  "edges": [
+    { "id": "e1", "from": "formulario", "to": "rota", "label": "cria/configura" },
+    { "id": "e2", "from": "rota", "to": "serie", "label": "CAS e active=false" },
+    { "id": "e3", "from": "rota", "to": "ocorrencia", "label": "gravarTarefa e contexto herdado" },
+    { "id": "e4", "from": "calculo", "to": "rota", "label": "tick imediato + prazo futuro" },
+    { "id": "e5", "from": "scheduler", "to": "cron", "label": "Bearer interno" },
+    { "id": "e6", "from": "cron", "to": "gerador", "label": "tick limitado" },
+    { "id": "e7", "from": "serie", "to": "gerador", "label": "séries vencidas" },
+    { "id": "e8", "from": "gerador", "to": "ocorrencia", "label": "uma ocorrência por geração" },
+    { "id": "e9", "from": "calculo", "to": "gerador", "label": "próximo prazo civil" },
+    { "id": "e10", "from": "gerador", "to": "serie", "label": "CAS do ponteiro" },
+    { "id": "e11", "from": "ocorrencia", "to": "lista", "label": "família e progresso" },
+    { "id": "e12", "from": "rota", "to": "audit", "label": "mudança humana" },
+    { "id": "e13", "from": "gerador", "to": "audit", "label": "criação automática" },
+    { "id": "e14", "from": "gerador", "to": "log", "label": "falha isolada" },
+    { "id": "e15", "from": "audit", "to": "lista", "label": "atividade no contexto do negócio" }
+  ]
+}

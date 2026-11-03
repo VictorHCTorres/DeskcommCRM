@@ -5,6 +5,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   proximoEstadoAoAlternar,
   type EdicaoDaTarefa,
+  type ConfiguracaoDeRecorrencia,
   type NovaTarefa,
   type Tarefa,
 } from "@/lib/tarefas/tipos";
@@ -118,6 +119,29 @@ export function useTasks(filtros: FiltrosDeTarefa = {}, opcoes: OpcoesDeTarefas 
     onSuccess: invalidar,
   });
 
+  const configurarRecorrencia = useMutation({
+    mutationFn: async ({ id, entrada }: { id: string; entrada: ConfiguracaoDeRecorrencia }) => {
+      const res = await fetch(`${BASE}/${id}/recurrence`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(entrada),
+      });
+      return leJson<{ recurrence_id: string; next_run_at: string | null }>(
+        res,
+        "Não foi possível configurar a recorrência.",
+      );
+    },
+    onSuccess: invalidar,
+  });
+
+  const cancelarRecorrencia = useMutation({
+    mutationFn: async (id: string) => {
+      const res = await fetch(`${BASE}/${id}/recurrence`, { method: "DELETE" });
+      return leJson<{ cancelled: boolean }>(res, "Não foi possível cancelar a recorrência.");
+    },
+    onSuccess: invalidar,
+  });
+
   return {
     tarefas: query.data?.tasks ?? [],
     carregando: query.isLoading,
@@ -126,6 +150,9 @@ export function useTasks(filtros: FiltrosDeTarefa = {}, opcoes: OpcoesDeTarefas 
     criarTarefa: (entrada: NovaTarefa) => criar.mutateAsync(entrada),
     editarTarefa: (id: string, entrada: EdicaoDaTarefa) => editar.mutateAsync({ id, entrada }),
     apagarTarefa: (id: string) => apagar.mutateAsync(id),
+    configurarRecorrencia: (id: string, entrada: ConfiguracaoDeRecorrencia) =>
+      configurarRecorrencia.mutateAsync({ id, entrada }),
+    cancelarRecorrencia: (id: string) => cancelarRecorrencia.mutateAsync(id),
     alternarConcluida: (tarefa: Tarefa) =>
       editar.mutateAsync({
         id: tarefa.id,

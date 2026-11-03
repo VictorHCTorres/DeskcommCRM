@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -17,7 +17,12 @@ import { cn } from "@/lib/utils";
 import { useTasks } from "@/hooks/tasks/useTasks";
 import { useAssignableMembers } from "@/hooks/inbox/useAssignableMembers";
 import { responsavelDoFiltro, type FiltroDeResponsavel } from "@/lib/tarefas/filtro-de-responsavel";
-import type { NovaTarefa, SituacaoDaTarefa, Tarefa } from "@/lib/tarefas/tipos";
+import type {
+  ConfiguracaoDeRecorrencia,
+  NovaTarefa,
+  SituacaoDaTarefa,
+  Tarefa,
+} from "@/lib/tarefas/tipos";
 
 import { CalendarioDeTarefas } from "./CalendarioDeTarefas";
 import { FormularioDeTarefa } from "./FormularioDeTarefa";
@@ -38,13 +43,20 @@ export function TarefasClient({
   const usuario = useUser();
   const [modo, setModo] = useState<"lista" | "calendario">("lista");
   const [situacao, setSituacao] = useState<FiltroDeSituacao>("aberto");
-  const [responsavel, setResponsavel] = useState<FiltroDeResponsavel>(minhasDeInicio ? "eu" : "todos");
+  const [responsavel, setResponsavel] = useState<FiltroDeResponsavel>(
+    minhasDeInicio ? "eu" : "todos",
+  );
   // `/team/assignable` exige agent: o viewer tomaria 403 (e um authz.denied no
   // audit) a cada visita. Ele fica com Todos, Minhas e Sem responsável.
   const { data: membros } = useAssignableMembers(podeEditar);
   const [emEdicao, setEmEdicao] = useState<Tarefa | null>(null);
   const [formAberto, setFormAberto] = useState(false);
   const [prazoSugerido, setPrazoSugerido] = useState<string | undefined>();
+  const [parentTaskId, setParentTaskId] = useState<string | null>(null);
+  // O POST pode vencer e o PUT da recorrência falhar. Enquanto esta mesma
+  // abertura estiver na tela, Salvar de novo retoma o PUT na tarefa já criada
+  // em vez de criar uma irmã duplicada.
+  const tarefaCriadaPendente = useRef<string | null>(null);
   // A CHAVE DE REMONTAGEM do formulário. Ele lê o estado inicial das props
   // (nada de `useEffect` sincronizando), então abrir duas vezes seguidas o
   // "Nova tarefa" precisa de uma chave NOVA — senão a segunda abertura traz o
@@ -60,28 +72,57 @@ export function TarefasClient({
     editarTarefa,
     apagarTarefa,
     alternarConcluida,
+    configurarRecorrencia,
+    cancelarRecorrencia,
   } = useTasks({
     ...(situacao === "aberto" ? { aberto: true } : { status: situacao }),
     assigned_to: responsavelDoFiltro(responsavel),
   });
 
   function abrirNova(dia?: string) {
+    tarefaCriadaPendente.current = null;
     setEmEdicao(null);
+    setParentTaskId(null);
     setPrazoSugerido(dia);
     setAberturas((n) => n + 1);
     setFormAberto(true);
   }
 
-  function abrirEdicao(tarefa: Tarefa) {
-    setEmEdicao(tarefa);
+  function abrirSubtarefa(pai: Tarefa) {
+    tarefaCriadaPendente.current = null;
+    setEmEdicao(null);
+    setParentTaskId(pai.id);
     setPrazoSugerido(undefined);
     setAberturas((n) => n + 1);
     setFormAberto(true);
   }
 
-  async function salvar(entrada: NovaTarefa) {
+  function abrirEdicao(tarefa: Tarefa) {
+    tarefaCriadaPendente.current = null;
+    setEmEdicao(tarefa);
+    setParentTaskId(null);
+    setPrazoSugerido(undefined);
+    setAberturas((n) => n + 1);
+    setFormAberto(true);
+  }
+
+  async function salvar(entrada: NovaTarefa, recorrencia?: ConfiguracaoDeRecorrencia | null) {
     if (emEdicao) await editarTarefa(emEdicao.id, entrada);
-    else await criarTarefa(entrada);
+    else {
+      let tarefaId = tarefaCriadaPendente.current;
+      if (!tarefaId) {
+        const criada = await criarTarefa(entrada);
+        tarefaId = criada.task.id;
+        tarefaCriadaPendente.current = tarefaId;
+      }
+      if (recorrencia) await configurarRecorrencia(tarefaId, recorrencia);
+      tarefaCriadaPendente.current = null;
+    }
+  }
+
+  function mudarAbertura(aberto: boolean) {
+    if (!aberto) tarefaCriadaPendente.current = null;
+    setFormAberto(aberto);
   }
 
   return (
@@ -97,10 +138,7 @@ export function TarefasClient({
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          <Select
-            value={situacao}
-            onValueChange={(v) => setSituacao(v as FiltroDeSituacao)}
-          >
+          <Select value={situacao} onValueChange={(v) => setSituacao(v as FiltroDeSituacao)}>
             <SelectTrigger className="h-11 w-[168px] text-xs lg:h-9">
               <SelectValue />
             </SelectTrigger>
@@ -113,8 +151,15 @@ export function TarefasClient({
             </SelectContent>
           </Select>
 
-          <Select value={responsavel} onValueChange={(v) => setResponsavel(v as FiltroDeResponsavel)}>
-            <SelectTrigger aria-label={t("Responsável")} className="h-11 w-[168px] text-xs lg:h-9" data-testid="tarefas-filtro-responsavel">
+          <Select
+            value={responsavel}
+            onValueChange={(v) => setResponsavel(v as FiltroDeResponsavel)}
+          >
+            <SelectTrigger
+              aria-label={t("Responsável")}
+              className="h-11 w-[168px] text-xs lg:h-9"
+              data-testid="tarefas-filtro-responsavel"
+            >
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -220,6 +265,8 @@ export function TarefasClient({
               aoAlternarConcluida={alternarConcluida}
               aoEditar={abrirEdicao}
               aoApagar={(tarefa) => apagarTarefa(tarefa.id)}
+              aoCriarSubtarefa={abrirSubtarefa}
+              aoCancelarRecorrencia={(tarefa) => cancelarRecorrencia(tarefa.id)}
             />
           </div>
         </>
@@ -228,9 +275,10 @@ export function TarefasClient({
       <FormularioDeTarefa
         key={aberturas}
         aberto={formAberto}
-        aoMudarAbertura={setFormAberto}
+        aoMudarAbertura={mudarAbertura}
         tarefa={emEdicao}
         prazoSugerido={prazoSugerido}
+        parentTaskId={parentTaskId}
         // Filtrando por alguém, a tarefa nova nasce DESSA pessoa: a lista que
         // está na tela filtra por ela, e uma tarefa sem responsável sumiria logo
         // depois de salva. Com "Todos" ou "Sem responsável", nasce sem dono.

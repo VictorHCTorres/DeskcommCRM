@@ -36,13 +36,14 @@ import { createClient } from "@/lib/supabase/server";
 import { registraAtividadeDaTarefa } from "@/lib/tarefas/atividade";
 import { conferirDemanda } from "@/lib/tarefas/demanda";
 import { conferirResponsavel } from "@/lib/tarefas/responsavel";
+import { COLUNAS_DA_TAREFA, gravarTarefa } from "@/lib/tarefas/gravar-tarefa";
 import { PRIORIDADES_DA_TAREFA, SITUACOES_DA_TAREFA, type Tarefa } from "@/lib/tarefas/tipos";
+import { conferirVinculosDaTarefa } from "@/lib/tarefas/vinculos";
 
 export const dynamic = "force-dynamic";
 
 /** As colunas que a tela lê. Explícitas para o `select *` não vazar coluna nova. */
-const COLUNAS =
-  "id, organization_id, title, description, due_date, priority, status, lead_id, contact_id, demanda_id, assigned_to, created_by, created_at, updated_at, lead:crm_leads(id, title)";
+const COLUNAS = COLUNAS_DA_TAREFA;
 
 const criacaoSchema = z.object({
   title: z.string().trim().min(1).max(255),
@@ -57,6 +58,7 @@ const criacaoSchema = z.object({
   // Opcional como os outros dois — a tarefa avulsa é caso real.
   demanda_id: z.string().uuid().nullable().optional(),
   assigned_to: z.string().uuid().nullable().optional(),
+  parent_task_id: z.string().uuid().nullable().optional(),
 });
 
 const listaSchema = z.object({
@@ -98,6 +100,7 @@ export async function GET(req: NextRequest): Promise<Response> {
   const filtros = parsed.data;
 
   const supabase = await createClient();
+
   // ⚠️ `organization_id` à mão mesmo com RLS ligada: é a regra do CLAUDE.md, e
   // ela não é redundante — o dia em que esta rota trocar para o admin client
   // (que bypassa RLS) o filtro já está aqui.
@@ -126,7 +129,49 @@ export async function GET(req: NextRequest): Promise<Response> {
     return fail("internal_error", t("Erro ao listar as tarefas."), 500, { requestId });
   }
 
-  return ok({ tasks: (data ?? []) as unknown as Tarefa[] }, { requestId });
+  const encontradas = (data ?? []) as unknown as Tarefa[];
+  // Filtro é aplicado à DEMANDA de trabalho, não pode amputar a família. Se
+  // uma filha casa com "Minhas" ou "Em aberto", trazemos a raiz e todas as
+  // irmãs; sem isso uma filha aberta sob raiz concluída desapareceria da tela.
+  const idsPresentes = new Set(encontradas.map((tarefa) => tarefa.id));
+  const paisAusentes = [
+    ...new Set(
+      encontradas
+        .map((tarefa) => tarefa.parent_task_id)
+        .filter((id): id is string => Boolean(id) && !idsPresentes.has(id!)),
+    ),
+  ];
+  const { data: pais, error: erroPais } = paisAusentes.length
+    ? await supabase
+        .from("crm_tasks")
+        .select(COLUNAS)
+        .eq("organization_id", authz.org.orgId)
+        .in("id", paisAusentes)
+    : { data: [], error: null };
+  if (erroPais) return fail("internal_error", t("Erro ao listar as tarefas."), 500, { requestId });
+  const raizes = [
+    ...new Set([
+      ...encontradas.filter((tarefa) => !tarefa.parent_task_id).map((tarefa) => tarefa.id),
+      ...paisAusentes,
+    ]),
+  ];
+  const { data: filhas, error: erroFilhas } = raizes.length
+    ? await supabase
+        .from("crm_tasks")
+        .select(COLUNAS)
+        .eq("organization_id", authz.org.orgId)
+        .in("parent_task_id", raizes)
+    : { data: [], error: null };
+  if (erroFilhas)
+    return fail("internal_error", t("Erro ao listar as tarefas."), 500, { requestId });
+  const porId = new Map(
+    [
+      ...encontradas,
+      ...((pais ?? []) as unknown as Tarefa[]),
+      ...((filhas ?? []) as unknown as Tarefa[]),
+    ].map((tarefa) => [tarefa.id, tarefa]),
+  );
+  return ok({ tasks: [...porId.values()] }, { requestId });
 }
 
 export async function POST(req: NextRequest): Promise<Response> {
@@ -166,47 +211,107 @@ export async function POST(req: NextRequest): Promise<Response> {
 
   const supabase = await createClient();
 
-  if (parsed.data.demanda_id) {
+  let contextoHerdado: {
+    lead_id: string | null;
+    contact_id: string | null;
+    demanda_id: string | null;
+  } | null = null;
+  if (parsed.data.parent_task_id) {
+    const { data: pai, error: erroPai } = await supabase
+      .from("crm_tasks")
+      .select("id, parent_task_id, lead_id, contact_id, demanda_id")
+      .eq("id", parsed.data.parent_task_id)
+      .eq("organization_id", authz.org.orgId)
+      .maybeSingle();
+    if (erroPai) return fail("internal_error", t("Erro ao salvar a tarefa."), 500, { requestId });
+    if (!pai)
+      return fail("validation_failed", t("A tarefa principal não existe."), 422, { requestId });
+    if ((pai as { parent_task_id?: string | null }).parent_task_id) {
+      return fail("state_conflict", t("Uma subtarefa não pode ter subtarefas."), 409, {
+        requestId,
+      });
+    }
+    contextoHerdado = {
+      lead_id: (pai.lead_id as string | null) ?? null,
+      contact_id: (pai.contact_id as string | null) ?? null,
+      demanda_id: (pai.demanda_id as string | null) ?? null,
+    };
+  }
+
+  const vereditoDosVinculos = await conferirVinculosDaTarefa(
+    supabase,
+    authz.org.orgId,
+    contextoHerdado ?? parsed.data,
+  );
+  if (vereditoDosVinculos === "falha_na_consulta") {
+    return fail("internal_error", t("Erro ao salvar a tarefa."), 500, { requestId });
+  }
+  if (vereditoDosVinculos === "fora_da_organizacao") {
+    return fail(
+      "validation_failed",
+      t("O negócio, o contato ou a demanda vinculada não existe."),
+      422,
+      { requestId },
+    );
+  }
+
+  const demandaParaConferir = contextoHerdado?.demanda_id ?? parsed.data.demanda_id;
+  if (demandaParaConferir) {
     // A chave estrangeira não passa pela RLS: sem esta conferência, a demanda
     // de outra organização gravaria sem erro. A régua está em `lib/tarefas/demanda.ts`.
-    const veredito = await conferirDemanda(supabase, authz.org.orgId, parsed.data.demanda_id);
+    const veredito = await conferirDemanda(supabase, authz.org.orgId, demandaParaConferir);
     if (veredito === "falha_na_consulta") {
       return fail("internal_error", t("Erro ao salvar a tarefa."), 500, { requestId });
     }
     if (veredito === "fora_da_organizacao") {
-      return fail("validation_failed", t("O negócio, o contato ou a demanda vinculada não existe."), 422, {
-        requestId,
-      });
+      return fail(
+        "validation_failed",
+        t("O negócio, o contato ou a demanda vinculada não existe."),
+        422,
+        {
+          requestId,
+        },
+      );
     }
     if (veredito === "encerrada") {
-      return fail("state_conflict", t("Esta demanda já foi encerrada. Crie a tarefa numa demanda em andamento."), 409, {
-        requestId,
-      });
+      return fail(
+        "state_conflict",
+        t("Esta demanda já foi encerrada. Crie a tarefa numa demanda em andamento."),
+        409,
+        {
+          requestId,
+        },
+      );
     }
   }
 
-  const { data, error } = await supabase
-    .from("crm_tasks")
-    .insert({
-      ...parsed.data,
-      organization_id: authz.org.orgId,
-      created_by: authz.user.id,
-    })
-    .select(COLUNAS)
-    .single();
+  const { tarefa, erro: error } = await gravarTarefa(supabase, {
+    ...parsed.data,
+    ...(contextoHerdado ?? {}),
+    organization_id: authz.org.orgId,
+    created_by: authz.user.id,
+    recurrence_id: null,
+    recurrence_generation: 0,
+    recurrence_scheduled_for: null,
+  });
 
   if (error) {
     // 23503 = negócio, contato ou demanda apagado no meio, entre a escolha e a
     // gravação. A recusa nomeia os campos porque quem lê é quem escolheu na tela.
     if (error.code === "23503") {
-      return fail("validation_failed", t("O negócio, o contato ou a demanda vinculada não existe."), 422, {
-        requestId,
-      });
+      return fail(
+        "validation_failed",
+        t("O negócio, o contato ou a demanda vinculada não existe."),
+        422,
+        {
+          requestId,
+        },
+      );
     }
     return fail("internal_error", t("Erro ao salvar a tarefa."), 500, { requestId });
   }
 
-  const tarefa = data as unknown as Tarefa;
+  if (!tarefa) return fail("internal_error", t("Erro ao salvar a tarefa."), 500, { requestId });
 
   await audit({
     organizationId: authz.org.orgId,

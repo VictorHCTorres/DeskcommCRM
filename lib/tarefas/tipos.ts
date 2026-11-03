@@ -58,6 +58,12 @@ export interface Tarefa {
   created_by: string | null;
   created_at: string;
   updated_at: string;
+  /** Um nível apenas: subtarefa aponta para uma tarefa raiz. */
+  parent_task_id?: string | null;
+  /** Série que gerou esta ocorrência; nula em tarefa avulsa. */
+  recurrence_id?: string | null;
+  recurrence_generation?: number;
+  recurrence_scheduled_for?: string | null;
   /**
    * Derivado (não é coluna): o negócio de `lead_id`, embutido pela rota para a
    * lista de Tarefas dizer DE QUEM é a tarefa sem uma consulta por linha. Nulo
@@ -77,9 +83,40 @@ export interface NovaTarefa {
   /** A demanda do atendimento a que a tarefa fica presa (#2818). */
   demanda_id?: string | null;
   assigned_to?: string | null;
+  parent_task_id?: string | null;
 }
 
 export type EdicaoDaTarefa = Partial<NovaTarefa>;
+
+export const FREQUENCIAS_DA_RECORRENCIA = ["daily", "weekly", "monthly"] as const;
+export type FrequenciaDaRecorrencia = (typeof FREQUENCIAS_DA_RECORRENCIA)[number];
+export const MODOS_DA_RECORRENCIA = ["on_schedule", "after_completion"] as const;
+export type ModoDaRecorrencia = (typeof MODOS_DA_RECORRENCIA)[number];
+
+export interface RecorrenciaDaTarefa {
+  id: string;
+  organization_id: string;
+  current_task_id: string | null;
+  frequency: FrequenciaDaRecorrencia;
+  interval: number;
+  mode: ModoDaRecorrencia;
+  timezone: string;
+  next_run_at: string | null;
+  /** Prazo da próxima ocorrência; separado do tick imediato de after_completion. */
+  next_due_at?: string | null;
+  generation: number;
+  active: boolean;
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ConfiguracaoDeRecorrencia {
+  frequency: FrequenciaDaRecorrencia;
+  interval?: number;
+  mode: ModoDaRecorrencia;
+  timezone: string;
+}
 
 /** Encerrada de qualquer das duas formas: feita ou desistida. */
 export function estaEncerrada(tarefa: Pick<Tarefa, "status">): boolean {
@@ -206,6 +243,49 @@ export function agrupaPorPrazo<T extends Pick<Tarefa, "due_date" | "status">>(
     const linhas = porFaixa.get(faixa);
     return linhas?.length ? [{ faixa, tarefas: linhas }] : [];
   });
+}
+
+export interface FamiliaDeTarefas {
+  raiz: Tarefa;
+  filhas: Tarefa[];
+  /** A filha chegou ao cliente, mas a raiz foi apagada ou ficou fora da leitura. */
+  orfa?: boolean;
+  /** Projeção usada somente para colocar a família na faixa mais urgente. */
+  prazoDaFamilia: Pick<Tarefa, "due_date" | "status">;
+}
+
+/** Raízes com filhas e o menor prazo que ainda pede ação. */
+export function familiasDeTarefas(tarefas: readonly Tarefa[]): FamiliaDeTarefas[] {
+  const filhas = new Map<string, Tarefa[]>();
+  for (const tarefa of tarefas) {
+    if (!tarefa.parent_task_id) continue;
+    filhas.set(tarefa.parent_task_id, [...(filhas.get(tarefa.parent_task_id) ?? []), tarefa]);
+  }
+  const familiasComRaiz = tarefas
+    .filter((tarefa) => !tarefa.parent_task_id)
+    .map((raiz) => {
+      const daRaiz = filhas.get(raiz.id) ?? [];
+      const abertas = [raiz, ...daRaiz].filter((tarefa) => !estaEncerrada(tarefa));
+      const comPrazo = abertas.filter((tarefa) => tarefa.due_date);
+      const urgente = comPrazo.sort(
+        (a, b) => new Date(a.due_date!).getTime() - new Date(b.due_date!).getTime(),
+      )[0];
+      return {
+        raiz,
+        filhas: daRaiz,
+        prazoDaFamilia: urgente ?? (abertas[0] ? { due_date: null, status: "pending" } : raiz),
+      };
+    });
+  const idsDasRaizes = new Set(familiasComRaiz.map((familia) => familia.raiz.id));
+  const orfas = tarefas
+    .filter((tarefa) => tarefa.parent_task_id && !idsDasRaizes.has(tarefa.parent_task_id))
+    .map((tarefa) => ({
+      raiz: tarefa,
+      filhas: [],
+      orfa: true,
+      prazoDaFamilia: tarefa,
+    }));
+  return [...familiasComRaiz, ...orfas];
 }
 
 /**

@@ -2,8 +2,8 @@
   "schema_version": 1,
   "diagram_type": "architecture",
   "meta": {
-    "title": "Gestão de funis por Área e Grupo",
-    "subtitle": "Organização visual tenant-safe que preserva todos os funis e negócios",
+    "title": "Gestão e visualizações salvas de funis",
+    "subtitle": "Organização tenant-safe e olhares pessoais/compartilhados sobre o mesmo funil",
     "output": "gestao-funis.html",
     "quality_profile": "standard"
   },
@@ -62,6 +62,27 @@
       "col": 3,
       "type": "database",
       "label": "api_audit_log — criação, edição e arquivo"
+    },
+    {
+      "id": "seletorVisoes",
+      "lane": "pessoa",
+      "col": 1,
+      "type": "frontend",
+      "label": "Seletor — aplicar, salvar, atualizar ou excluir visão"
+    },
+    {
+      "id": "rotaVisoes",
+      "lane": "app",
+      "col": 2,
+      "type": "api",
+      "label": "/pipelines/[id]/views — contrato Zod versionado"
+    },
+    {
+      "id": "visoes",
+      "lane": "db",
+      "col": 3,
+      "type": "database",
+      "label": "crm_pipeline_views — pessoal/compartilhada sob RLS"
     }
   ],
   "edges": [
@@ -85,6 +106,16 @@
       "from": "rotaFunis",
       "to": "auditoria",
       "label": "pipeline.updated registra mudança de grupo"
+    },
+    { "id": "e12", "from": "quadro", "to": "seletorVisoes", "label": "configura o olhar atual" },
+    { "id": "e13", "from": "seletorVisoes", "to": "rotaVisoes", "label": "salva JSON canônico" },
+    { "id": "e14", "from": "rotaVisoes", "to": "visoes", "label": "autoriza dono ou manager" },
+    { "id": "e15", "from": "visoes", "to": "seletorVisoes", "label": "reabre pela URL ?view" },
+    {
+      "id": "e16",
+      "from": "rotaVisoes",
+      "to": "auditoria",
+      "label": "created/updated/deleted sem PII"
     }
   ]
 }

@@ -96,6 +96,8 @@ CRONS="
 # transformaria avisar 15 minutos antes em avisar até 20. Barato: só tarefa
 # com prazo na janela, com responsável, e que ainda não virou item da Central.
 */5 * * * *|45|api/v1/cron/task-reminder
+# Tarefas recorrentes: a cada 5 minutos, com CAS por série e UNIQUE por geração.
+*/5 * * * *|45|api/v1/cron/task-recurrence
 */15 * * * *|45|api/v1/cron/agenda-expira-pendentes
 */15 * * * *|60|api/v1/cron/risk-watcher
 # O CASO PARADO. De hora em hora, e não a cada 5 minutos: o prazo é de 24h, e

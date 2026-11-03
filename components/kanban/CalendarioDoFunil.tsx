@@ -22,6 +22,7 @@ import {
 } from "@/lib/kanban/calendario-do-funil";
 import type { Pipeline, Stage } from "@/lib/kanban/types";
 import type { Lead } from "@/lib/types/leads";
+import type { ConfiguracaoDoCalendario } from "@/lib/kanban/visoes-salvas";
 import { CaretLeft, CaretRight } from "@/lib/ui/icons";
 import { cn } from "@/lib/utils";
 
@@ -46,6 +47,8 @@ interface Props {
   stages: Stage[];
   /** Os negócios já filtrados pela barra da página, mesma entrada do quadro. */
   leads: Lead[];
+  configuracao?: ConfiguracaoDoCalendario;
+  onConfiguracaoChange?: (configuracao: ConfiguracaoDoCalendario) => void;
 }
 
 /**
@@ -85,7 +88,14 @@ interface Props {
  * tela e reprova sem ser defeito. Renomear o apelido local fecha o falso
  * positivo e não esconde nada de quem lê o código.
  */
-export function CalendarioDoFunil({ pipelineId, pipeline: funil, stages, leads }: Props) {
+export function CalendarioDoFunil({
+  pipelineId,
+  pipeline: funil,
+  stages,
+  leads,
+  configuracao,
+  onConfiguracaoChange,
+}: Props) {
   const t = useT();
   const tag = useTagDeIdioma();
   const { data: members } = useAssignableMembers(true);
@@ -94,15 +104,12 @@ export function CalendarioDoFunil({ pipelineId, pipeline: funil, stages, leads }
     [members],
   );
 
-  const campos = useMemo(
-    () => camposDeDataDoNegocio(funil.settings),
-    [funil.settings],
-  );
+  const campos = useMemo(() => camposDeDataDoNegocio(funil.settings), [funil.settings]);
 
-  const [visao, setVisao] = useState<"mes" | "semana">("mes");
+  const [visaoLocal, setVisaoLocal] = useState<"mes" | "semana">("mes");
   const [ancora, setAncora] = useState(() => new Date());
-  const [campoEscolhido, setCampoEscolhido] = useState<string | null>(null);
-  const [campoFinalEscolhido, setCampoFinalEscolhido] = useState<string | null>(null);
+  const [campoLocal, setCampoLocal] = useState<string | null>(null);
+  const [campoFinalLocal, setCampoFinalLocal] = useState<string | null>(null);
   const [dossieId, setDossieId] = useState<string | null>(null);
 
   /**
@@ -111,17 +118,33 @@ export function CalendarioDoFunil({ pipelineId, pipeline: funil, stages, leads }
    * seletor apontaria para uma chave que ninguém tem e a grade ficaria vazia
    * sem dizer por quê — o padrão, aqui, é o primeiro campo de data do funil.
    */
+  const visao = configuracao ? (configuracao.mode === "week" ? "semana" : "mes") : visaoLocal;
+  const campoPedido = configuracao?.date_field ?? campoLocal;
+  const campoFinalPedido = configuracao?.end_date_field ?? campoFinalLocal;
   const campo =
-    campoEscolhido && campos.some((c) => c.key === campoEscolhido)
-      ? campoEscolhido
+    campoPedido && campos.some((c) => c.key === campoPedido)
+      ? campoPedido
       : (campos[0]?.key ?? null);
   const campoFinal =
-    campoFinalEscolhido &&
-    campoFinalEscolhido !== SEM_INTERVALO &&
-    campoFinalEscolhido !== campo &&
-    campos.some((c) => c.key === campoFinalEscolhido)
-      ? campoFinalEscolhido
+    campoFinalPedido &&
+    campoFinalPedido !== SEM_INTERVALO &&
+    campoFinalPedido !== campo &&
+    campos.some((c) => c.key === campoFinalPedido)
+      ? campoFinalPedido
       : null;
+
+  const alterarConfiguracao = (patch: Partial<ConfiguracaoDoCalendario>) => {
+    const proxima: ConfiguracaoDoCalendario = {
+      mode: visao === "semana" ? "week" : "month",
+      date_field: campo,
+      end_date_field: campoFinal,
+      ...patch,
+    };
+    onConfiguracaoChange?.(proxima);
+    if (patch.mode) setVisaoLocal(patch.mode === "week" ? "semana" : "mes");
+    if ("date_field" in patch) setCampoLocal(patch.date_field ?? null);
+    if ("end_date_field" in patch) setCampoFinalLocal(patch.end_date_field ?? null);
+  };
 
   const porDia = useMemo(
     () => (campo ? negociosPorDia(leads, campo, campoFinal) : new Map<string, Lead[]>()),
@@ -134,9 +157,7 @@ export function CalendarioDoFunil({ pipelineId, pipeline: funil, stages, leads }
   // chamada de união incompatível no typecheck.
   const dias: (Date | null)[] = useMemo(
     () =>
-      visao === "mes"
-        ? gradeDoMes(ancora.getFullYear(), ancora.getMonth())
-        : diasDaSemana(ancora),
+      visao === "mes" ? gradeDoMes(ancora.getFullYear(), ancora.getMonth()) : diasDaSemana(ancora),
     [visao, ancora],
   );
 
@@ -194,9 +215,7 @@ export function CalendarioDoFunil({ pipelineId, pipeline: funil, stages, leads }
           >
             <CaretLeft size={16} aria-hidden />
           </Button>
-          <h2 className="min-w-0 truncate text-base font-semibold capitalize">
-            {rotuloDoPeriodo}
-          </h2>
+          <h2 className="min-w-0 truncate text-base font-semibold capitalize">{rotuloDoPeriodo}</h2>
           <Button
             variant="ghost"
             size="icon"
@@ -210,7 +229,10 @@ export function CalendarioDoFunil({ pipelineId, pipeline: funil, stages, leads }
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          <Select value={campo ?? undefined} onValueChange={setCampoEscolhido}>
+          <Select
+            value={campo ?? undefined}
+            onValueChange={(date_field) => alterarConfiguracao({ date_field })}
+          >
             <SelectTrigger
               aria-label={t("Campo de data")}
               data-testid="calendario-campo"
@@ -230,7 +252,7 @@ export function CalendarioDoFunil({ pipelineId, pipeline: funil, stages, leads }
           <Select
             value={campoFinal ?? SEM_INTERVALO}
             onValueChange={(valor) =>
-              setCampoFinalEscolhido(valor === SEM_INTERVALO ? null : valor)
+              alterarConfiguracao({ end_date_field: valor === SEM_INTERVALO ? null : valor })
             }
           >
             <SelectTrigger
@@ -257,7 +279,7 @@ export function CalendarioDoFunil({ pipelineId, pipeline: funil, stages, leads }
               type="button"
               data-testid="calendario-mes"
               aria-pressed={visao === "mes"}
-              onClick={() => setVisao("mes")}
+              onClick={() => alterarConfiguracao({ mode: "month" })}
               className={cn(
                 "rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors",
                 visao === "mes"
@@ -271,7 +293,7 @@ export function CalendarioDoFunil({ pipelineId, pipeline: funil, stages, leads }
               type="button"
               data-testid="calendario-semana"
               aria-pressed={visao === "semana"}
-              onClick={() => setVisao("semana")}
+              onClick={() => alterarConfiguracao({ mode: "week" })}
               className={cn(
                 "rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors",
                 visao === "semana"
@@ -290,7 +312,7 @@ export function CalendarioDoFunil({ pipelineId, pipeline: funil, stages, leads }
           {cabecalho.map((rotulo, i) => (
             <div
               key={`${rotulo}-${i}`}
-              className="py-2 text-center text-[11px] font-semibold uppercase tracking-wider text-muted-foreground"
+              className="py-2 text-center text-[11px] font-semibold tracking-wider text-muted-foreground uppercase"
             >
               {rotulo}
             </div>
@@ -300,9 +322,7 @@ export function CalendarioDoFunil({ pipelineId, pipeline: funil, stages, leads }
         <div className="grid grid-cols-7 divide-x divide-y">
           {dias.map((dia, i) => {
             if (!dia) {
-              return (
-                <div key={`vazio-${i}`} className="min-h-[104px] bg-muted/15" aria-hidden />
-              );
+              return <div key={`vazio-${i}`} className="min-h-[104px] bg-muted/15" aria-hidden />;
             }
 
             const chave = chaveDoDia(dia);

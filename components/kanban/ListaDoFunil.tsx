@@ -10,6 +10,7 @@ import { atalhosDoFunil } from "@/lib/leads/atalhos-do-card";
 import type { LeadFilters } from "@/lib/kanban/filters";
 import {
   type FiltroForaDaLista,
+  type OrdenacaoDaLista,
   filtrosDaLista,
   filtrosForaDaLista,
   paramsDosFiltrosDaLista,
@@ -37,6 +38,8 @@ interface Props {
    * sabe (`filtrosForaDaLista`) — #3172, fatia 2.
    */
   filtros?: LeadFilters;
+  ordenacao?: OrdenacaoDaLista;
+  onOrdenacaoChange?: (ordenacao: OrdenacaoDaLista) => void;
 }
 
 /** Sem barra (ou barra limpa): o funil inteiro. Fora do componente para ser estável. */
@@ -78,7 +81,14 @@ const SEM_FILTRO: LeadFilters = {};
  * responsável mostrava os mesmos negócios, e quem usava concluía que o filtro
  * estava quebrado.
  */
-export function ListaDoFunil({ pipelineId, pipeline: funil, stages, filtros = SEM_FILTRO }: Props) {
+export function ListaDoFunil({
+  pipelineId,
+  pipeline: funil,
+  stages,
+  filtros = SEM_FILTRO,
+  ordenacao = { field: "position", direction: "asc" },
+  onOrdenacaoChange,
+}: Props) {
   const t = useT();
   const tag = useTagDeIdioma();
   const { data: members } = useAssignableMembers(true);
@@ -102,7 +112,20 @@ export function ListaDoFunil({ pipelineId, pipeline: funil, stages, filtros = SE
     setPagina(1);
   }
   const [dossieId, setDossieId] = useState<string | null>(null);
-  const { data, isLoading, error } = useLeadsPaginados(pipelineId, pagina, daLista);
+  const { data, isLoading, error } = useLeadsPaginados(
+    pipelineId,
+    pagina,
+    daLista,
+    undefined,
+    ordenacao,
+  );
+
+  const alternarOrdem = (field: OrdenacaoDaLista["field"]) => {
+    onOrdenacaoChange?.({
+      field,
+      direction: ordenacao.field === field && ordenacao.direction === "asc" ? "desc" : "asc",
+    });
+  };
 
   /** O nome do filtro como a BARRA o chama — quem leu "Tag" lá reconhece aqui. */
   const nomeDoFiltro = (f: FiltroForaDaLista): string =>
@@ -162,10 +185,9 @@ export function ListaDoFunil({ pipelineId, pipeline: funil, stages, filtros = SE
           data-testid="lista-filtros-fora"
           className="rounded-md border border-warning-fg/30 bg-warning-bg px-3 py-2 text-sm text-warning-fg"
         >
-          {t("Na Lista, estes filtros ainda não valem: {filtros}. No Quadro eles funcionam.").replace(
-            "{filtros}",
-            fora.map(nomeDoFiltro).join(", "),
-          )}
+          {t(
+            "Na Lista, estes filtros ainda não valem: {filtros}. No Quadro eles funcionam.",
+          ).replace("{filtros}", fora.map(nomeDoFiltro).join(", "))}
         </div>
       )}
       {error ? (
@@ -188,7 +210,9 @@ export function ListaDoFunil({ pipelineId, pipeline: funil, stages, filtros = SE
             <thead className="bg-muted/50 text-left text-xs text-muted-foreground">
               <tr>
                 <th scope="col" className="p-3 font-medium">
-                  {t("Negócio")}
+                  <button type="button" onClick={() => alternarOrdem("title")}>
+                    {t("Negócio")}
+                  </button>
                 </th>
                 <th scope="col" className="p-3 font-medium">
                   {t("Etapa")}
@@ -197,7 +221,9 @@ export function ListaDoFunil({ pipelineId, pipeline: funil, stages, filtros = SE
                   {t("Valor")}
                 </th>
                 <th scope="col" className="p-3 font-medium">
-                  {t("Última atividade")}
+                  <button type="button" onClick={() => alternarOrdem("last_activity")}>
+                    {t("Última atividade")}
+                  </button>
                 </th>
               </tr>
             </thead>
