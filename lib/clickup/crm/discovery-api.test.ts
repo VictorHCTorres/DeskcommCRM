@@ -5,7 +5,7 @@ import { JANELA_LONGA_DA_RESERVA_MS } from "@/lib/api/idempotency";
 import {
   CLICKUP_DISCOVERY_CONCURRENCY,
   CLICKUP_DISCOVERY_DEADLINE_MS,
-  CLICKUP_MAX_RETRY_AFTER_MS,
+  CLICKUP_MIN_REQUEST_INTERVAL_MS,
   discoverClickUpCrmApi,
 } from "./discovery-api";
 
@@ -51,8 +51,7 @@ describe("descoberta CRM pela API ClickUp", () => {
                             start_date: "1710052200000",
                             time_estimate: 0,
                             watchers: [{ id: 42, email: "nao-persistir@example.com" }],
-                            linked_tasks:
-                              index === 0 ? [{ task_id: "t1", link_id: "t101" }] : [],
+                            linked_tasks: index === 0 ? [{ task_id: "t1", link_id: "t101" }] : [],
                             attachments:
                               index === 0 ? [{ url: "https://signed.example/secret" }] : [],
                           }))
@@ -64,7 +63,12 @@ describe("descoberta CRM pela API ClickUp", () => {
         headers: { "content-type": "application/json" },
       });
     }) as typeof fetch;
-    const objects = await discoverClickUpCrmApi({ workspaceId: "w1", token: "secret", fetchImpl });
+    const objects = await discoverClickUpCrmApi({
+      workspaceId: "w1",
+      token: "secret",
+      fetchImpl,
+      minRequestIntervalMs: 0,
+    });
     expect(objects).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ source_type: "list", source_id: "l1", parent_source_id: "s1" }),
@@ -104,6 +108,7 @@ describe("descoberta CRM pela API ClickUp", () => {
   });
 
   it("repete 429/5xx, respeita Retry-After e não repete 401/403", async () => {
+    let clock = 0;
     let calls = 0;
     const sleeps: number[] = [];
     const retryFetch = (async () => {
@@ -117,7 +122,12 @@ describe("descoberta CRM pela API ClickUp", () => {
         workspaceId: "w1",
         token: "secret",
         fetchImpl: retryFetch,
-        sleep: async (ms) => void sleeps.push(ms),
+        now: () => clock,
+        sleep: async (ms) => {
+          sleeps.push(ms);
+          clock += ms;
+        },
+        minRequestIntervalMs: 0,
       }),
     ).resolves.toHaveLength(1);
     // retry da primeira passagem + passagens active/archived do workspace
@@ -136,6 +146,7 @@ describe("descoberta CRM pela API ClickUp", () => {
           token: "secret",
           fetchImpl: deniedFetch,
           sleep: async () => undefined,
+          minRequestIntervalMs: 0,
         }),
       ).rejects.toThrow(`clickup_api_http_${status}`);
       expect(calls).toBe(1);
@@ -163,12 +174,13 @@ describe("descoberta CRM pela API ClickUp", () => {
           sleeps.push(ms);
           clock += ms;
         },
+        minRequestIntervalMs: 0,
       }),
     ).rejects.toThrow("clickup_discovery_deadline_exceeded");
 
     expect(calls).toBe(1);
     expect(sleeps).toEqual([4_000]);
-    expect(sleeps[0]).toBeLessThanOrEqual(CLICKUP_MAX_RETRY_AFTER_MS);
+    expect(sleeps[0]).toBe(4_000);
   });
 
   it("bloqueia explicitamente a mesma Task vinculada a duas Lists", async () => {
@@ -194,7 +206,12 @@ describe("descoberta CRM pela API ClickUp", () => {
       return new Response(JSON.stringify(body), { status: 200 });
     }) as typeof fetch;
     await expect(
-      discoverClickUpCrmApi({ workspaceId: "w1", token: "secret", fetchImpl }),
+      discoverClickUpCrmApi({
+        workspaceId: "w1",
+        token: "secret",
+        fetchImpl,
+        minRequestIntervalMs: 0,
+      }),
     ).rejects.toThrow("clickup_task_multiple_lists:task-compartilhada");
   });
 
@@ -221,7 +238,70 @@ describe("descoberta CRM pela API ClickUp", () => {
       }
       return new Response(JSON.stringify(body), { status: 200 });
     }) as typeof fetch;
-    await discoverClickUpCrmApi({ workspaceId: "w1", token: "secret", fetchImpl });
+    await discoverClickUpCrmApi({
+      workspaceId: "w1",
+      token: "secret",
+      fetchImpl,
+      minRequestIntervalMs: 0,
+    });
     expect(maximum).toBe(CLICKUP_DISCOVERY_CONCURRENCY);
+  });
+
+  it("limita globalmente a cadência para não ultrapassar 100 requests por minuto", async () => {
+    let clock = 0;
+    const callsAt: number[] = [];
+    const sleeps: number[] = [];
+    const fetchImpl = (async () => {
+      callsAt.push(clock);
+      return new Response(JSON.stringify({ spaces: [] }), { status: 200 });
+    }) as typeof fetch;
+
+    await discoverClickUpCrmApi({
+      workspaceId: "w1",
+      token: "secret",
+      fetchImpl,
+      now: () => clock,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+        clock += ms;
+      },
+    });
+
+    expect(callsAt).toEqual([0, CLICKUP_MIN_REQUEST_INTERVAL_MS]);
+    expect(sleeps).toEqual([CLICKUP_MIN_REQUEST_INTERVAL_MS]);
+    expect(CLICKUP_MIN_REQUEST_INTERVAL_MS).toBeGreaterThan(60_000 / 100);
+  });
+
+  it("aguarda o reset informado pelo ClickUp antes de repetir um 429", async () => {
+    let clock = 1_000;
+    let calls = 0;
+    const sleeps: number[] = [];
+    const fetchImpl = (async () => {
+      calls += 1;
+      if (calls === 1) {
+        return new Response("rate", {
+          status: 429,
+          headers: { "x-ratelimit-reset": "11" },
+        });
+      }
+      return new Response("denied", { status: 401 });
+    }) as typeof fetch;
+
+    await expect(
+      discoverClickUpCrmApi({
+        workspaceId: "w1",
+        token: "secret",
+        fetchImpl,
+        now: () => clock,
+        sleep: async (ms) => {
+          sleeps.push(ms);
+          clock += ms;
+        },
+        minRequestIntervalMs: 0,
+      }),
+    ).rejects.toThrow("clickup_api_http_401");
+
+    expect(calls).toBe(2);
+    expect(sleeps).toEqual([10_250]);
   });
 });

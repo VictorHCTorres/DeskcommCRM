@@ -17,8 +17,68 @@ const folderSchema = z
 export const CLICKUP_DISCOVERY_CONCURRENCY = 4;
 /** Menor que a reserva idempotente de 15 min: nenhuma discovery pode sobreviver à reserva. */
 export const CLICKUP_DISCOVERY_DEADLINE_MS = 12 * 60 * 1000;
-/** Um `Retry-After` remoto não pode transformar a rota síncrona em job sem lease. */
-export const CLICKUP_MAX_RETRY_AFTER_MS = 5_000;
+/** 90 req/min deixam margem sob o piso de 100 req/min dos planos menores. */
+export const CLICKUP_MIN_REQUEST_INTERVAL_MS = 667;
+const CLICKUP_MAX_SERVER_BACKOFF_MS = 5_000;
+const CLICKUP_RATE_LIMIT_FALLBACK_MS = 60_000;
+const CLICKUP_RATE_LIMIT_RESET_MARGIN_MS = 250;
+
+interface ClickUpRequestGate {
+  enter(): Promise<void>;
+  blockUntil(timestamp: number): void;
+}
+
+function createRequestGate(input: {
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+  deadlineAt: number;
+  intervalMs: number;
+}): ClickUpRequestGate {
+  let nextRequestAt = input.now();
+  let blockedUntil = 0;
+  let queue = Promise.resolve();
+  return {
+    enter() {
+      const turn = queue.then(async () => {
+        while (true) {
+          const current = input.now();
+          const target = Math.max(current, nextRequestAt, blockedUntil);
+          const delay = target - current;
+          if (delay > 0) {
+            const remaining = input.deadlineAt - current;
+            if (remaining <= 0) throw new Error("clickup_discovery_deadline_exceeded");
+            await input.sleep(Math.min(delay, remaining));
+            continue;
+          }
+          if (current >= input.deadlineAt) {
+            throw new Error("clickup_discovery_deadline_exceeded");
+          }
+          nextRequestAt = current + input.intervalMs;
+          return;
+        }
+      });
+      queue = turn.catch(() => undefined);
+      return turn;
+    },
+    blockUntil(timestamp) {
+      blockedUntil = Math.max(blockedUntil, timestamp);
+    },
+  };
+}
+
+function retryAfterMs(value: string | null, now: number): number {
+  if (!value) return 0;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1_000;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? Math.max(0, timestamp - now) : 0;
+}
+
+function rateLimitResetMs(value: string | null, now: number): number {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds <= 0) return 0;
+  return Math.max(0, seconds * 1_000 - now + CLICKUP_RATE_LIMIT_RESET_MARGIN_MS);
+}
 
 async function getJson(
   fetchImpl: typeof fetch,
@@ -27,8 +87,10 @@ async function getJson(
   sleep: (ms: number) => Promise<void>,
   deadlineAt: number,
   now: () => number,
+  gate: ClickUpRequestGate,
 ) {
   for (let attempt = 0; attempt < 4; attempt += 1) {
+    await gate.enter();
     const remainingBeforeFetch = deadlineAt - now();
     if (remainingBeforeFetch <= 0) throw new Error("clickup_discovery_deadline_exceeded");
     const response = await fetchImpl(`https://api.clickup.com/api/v2${path}`, {
@@ -39,11 +101,23 @@ async function getJson(
     if (now() >= deadlineAt) throw new Error("clickup_discovery_deadline_exceeded");
     if (response.ok) return response.json();
     if ((response.status === 429 || response.status >= 500) && attempt < 3) {
-      const retryAfter = Number(response.headers.get("retry-after") ?? 0);
-      const requestedDelay = retryAfter > 0 ? retryAfter * 1_000 : 250 * 2 ** attempt;
       const remainingBeforeSleep = deadlineAt - now();
       if (remainingBeforeSleep <= 0) throw new Error("clickup_discovery_deadline_exceeded");
-      await sleep(Math.min(requestedDelay, CLICKUP_MAX_RETRY_AFTER_MS, remainingBeforeSleep));
+      const backoff = 250 * 2 ** attempt;
+      if (response.status === 429) {
+        const current = now();
+        const remoteDelay = Math.max(
+          retryAfterMs(response.headers.get("retry-after"), current),
+          rateLimitResetMs(response.headers.get("x-ratelimit-reset"), current),
+        );
+        const requestedDelay = Math.max(
+          remoteDelay > 0 ? remoteDelay : CLICKUP_RATE_LIMIT_FALLBACK_MS,
+          backoff,
+        );
+        gate.blockUntil(current + Math.min(requestedDelay, remainingBeforeSleep));
+      } else {
+        await sleep(Math.min(backoff, CLICKUP_MAX_SERVER_BACKOFF_MS, remainingBeforeSleep));
+      }
       continue;
     }
     throw new Error(`clickup_api_http_${response.status}`);
@@ -189,6 +263,8 @@ export async function discoverClickUpCrmApi(input: {
   /** Injeções exclusivas de teste para provar o teto sem usar `sleep` real. */
   now?: () => number;
   deadlineMs?: number;
+  /** Injeção de teste; produção usa uma cadência segura para planos de 100 req/min. */
+  minRequestIntervalMs?: number;
 }): Promise<ClickUpDiscoveredObject[]> {
   const fetchImpl = input.fetchImpl ?? fetch;
   const sleep = input.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
@@ -201,8 +277,18 @@ export async function discoverClickUpCrmApi(input: {
   ) {
     throw new Error("clickup_discovery_invalid_deadline");
   }
+  const minRequestIntervalMs = input.minRequestIntervalMs ?? CLICKUP_MIN_REQUEST_INTERVAL_MS;
+  if (
+    !Number.isInteger(minRequestIntervalMs) ||
+    minRequestIntervalMs < 0 ||
+    minRequestIntervalMs > 5_000
+  ) {
+    throw new Error("clickup_discovery_invalid_request_interval");
+  }
   const deadlineAt = now() + deadlineMs;
-  const request = (path: string) => getJson(fetchImpl, input.token, path, sleep, deadlineAt, now);
+  const gate = createRequestGate({ now, sleep, deadlineAt, intervalMs: minRequestIntervalMs });
+  const request = (path: string) =>
+    getJson(fetchImpl, input.token, path, sleep, deadlineAt, now, gate);
   const spaceResponseSchema = z.object({
     spaces: z.array(z.object({ id: idSchema, name: z.string() }).passthrough()),
   });
