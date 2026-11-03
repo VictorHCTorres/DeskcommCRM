@@ -16,6 +16,7 @@ import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
 import { createClient } from "@/lib/supabase/browser";
 import { randomId } from "@/lib/random-id";
+import { useT } from "@/hooks/i18n/useT";
 import {
   clickUpCoverageBlocksExecution,
   type ClickUpPreviewCoverage,
@@ -211,6 +212,7 @@ export function deriveClickUpCrmLists(manifest: unknown): ListMap[] {
 }
 
 export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boolean }) {
+  const t = useT();
   const [lists, setLists] = useState<ListMap[]>([]);
   const [assignees, setAssignees] = useState<"first" | "unassigned">("unassigned");
   const [run, setRun] = useState<Run>();
