@@ -8,6 +8,103 @@ Se você roda o DeskcommCRM numa VPS, **leia a seção da versão para a qual es
 
 ## [Não lançado]
 
+## [1.100.0] — 2026-11-03
+
+### ⚠️ Requer atenção
+
+- **A instalação passa a receber atualizações e imagens do fork da Suindara** Na instalação existente, migre o remoto `origin` para `https://github.com/VictorHCTorres/DeskcommCRM.git` antes da primeira atualização por esse canal. Não use o botão de atualização enquanto essa migração e a primeira release própria não estiverem concluídas.
+
+### Adicionado
+
+- **A pergunta do roteiro de atendimento pode gravar a resposta no card do negócio, e cada negócio responde por si** Cada pergunta do roteiro de atendimento ganhou "Onde a resposta é guardada":
+  ficha do contato (o de sempre — e o padrão, inclusive para todo roteiro já
+  publicado) ou card do negócio. Com o card, o valor entra em
+  `crm_leads.custom_fields`, que é o que o card da tela, os campos obrigatórios da
+  etapa do funil e as automações por data leem.
+
+  O card do roteiro é escolhido UMA vez, no começo da execução, e vale até ela
+  terminar: fica gravado na trilha da própria execução, então editar outro negócio
+  do mesmo contato no meio do caminho não muda o destino da resposta. Contato com
+  um único negócio aberto não é perguntado — esse é o card. Com dois ou mais, a
+  ficha do contato pede a escolha antes de gravar, sem chutar "o mais recente"; até
+  alguém escolher, as respostas de negócio ficam pendentes. Roteiro que termina não
+  deixa vínculo para o próximo: uma execução nova resolve o card de novo, e a
+  pergunta de negócio é refeita para o novo negócio — o destino da viagem anterior
+  não vale para a viagem seguinte. Atenção: quem já concluiu o roteiro só começa
+  uma execução nova se o roteiro permitir recomeçar (desligado por padrão) ou se
+  alguém recomeçar pela ficha.
+
+  Pergunta sem essa marca continua gravando no contato, byte a byte como hoje, e a
+  ficha do contato mostra "no card do negócio" em vez de "não respondido" para a
+  resposta que mora no card.
+
+- **Cada passo que envia escolhe o que fazer quando o contato tem horário marcado** A proteção da agenda segurava **todo** envio automático de quem tinha um atendimento marcado, sem escolha por regra nem por fluxo. Na clínica, isso atrasava o que não é cobrança: a paciente saía do procedimento com o retorno já marcado para 14 dias depois e só recebia os cuidados no dia do retorno; os parabéns de aniversário saíam no dia da consulta seguinte; o aviso de manutenção chegava para quem tinha acabado de fazer a sessão.
+
+  Agora cada passo que envia — a mensagem de WhatsApp e a mensagem escrita pela IA, dentro da automação — tem a escolha «Quando o contato tiver horário marcado», com três respostas e o efeito escrito embaixo de cada uma:
+
+  - **Adiar e enviar depois do horário** (padrão): a mensagem espera o atendimento e sai logo depois;
+  - **Enviar mesmo assim**: sai na hora, mesmo com atendimento marcado — o caso do pós-atendimento e do aniversário;
+  - **Não enviar**: a mensagem não sai e o pulo fica registrado na aba Atividade com o motivo «contato com horário marcado», em vez de desaparecer em silêncio.
+
+  A escolha é por passo, então a mesma regra pode adiar o lembrete de cobrança e mandar o pós-atendimento na hora. Em qualquer das três continuam valendo o descadastro do contato, a janela de envio do número e o limite diário.
+
+  Nada muda para quem já usa o sistema: a automação que nunca configurou a escolha continua adiando exatamente como antes, e abrir e salvar a regra não grava escolha nenhuma. Nenhuma migração é necessária.
+
+  Contribuição de @webtecnica (#3864).
+
+- **Funis organizados por áreas e grupos** A tela de Funis passa a permitir criar Áreas e Grupos, colocar cada funil no lugar certo e navegar no quadro com o contexto completo. Funis sem classificação continuam acessíveis em “Sem grupo”; arquivar um Grupo não apaga nem move negócios. A atualização do banco acontece automaticamente e não exige nenhuma configuração nova na VPS.
+
+- **A fila ganha cor, e o card do setor mostra (e edita) quem atende nela** A aba **Setores** cadastrava nome e descrição, e o número de atendentes era um contador mudo: para descobrir quem estava numa fila era preciso ir à aba Atendimento, e para tirar alguém dela era preciso editar a pessoa inteira — sem ver as outras filas que ela atende.
+
+  Agora cada setor tem **cor** e um **card com os membros**:
+
+  - a cor sai da mesma paleta medida das etiquetas (oito tons, separados a olho nu e sob daltonismo) e o texto do chip é escolhido pela régua de contraste do produto — nunca por quem pinta;
+  - **setor sem cor continua idêntico ao que era**: a cor é opcional, e "sem cor" apaga a escolha em vez de inventar um padrão;
+  - dentro do card aparecem os nomes de quem atende aquela fila, com **remover** ao lado de cada um e **“+ Adicionar pessoa”** para incluir alguém que ainda não está nela;
+  - adicionar e remover mexem só naquela fila: as outras filas da pessoa ficam como estão.
+
+  A escrita continua sendo a rota que já existia (`PUT /api/v1/attendants/sector/{user_id}`), que exige gerente ou administrador — quem não gerencia a equipe vê a lista, mas não muda nada.
+
+  Contribuição de @webtecnica (#3876).
+
+- **O dossiê do negócio passa a vincular e desvincular o contato principal** Negócio que nasce pelo funil sem contato não tinha conserto depois: a seção «Contato» do dossiê só sabia mostrar o vínculo ou um aviso de que ele não existia. Quem descobria mais tarde que tinha criado o card sem a pessoa certa não tinha nenhum caminho pela tela — nem para ligar o contato, nem para desfazer um vínculo errado.
+
+  Agora, no negócio sem contato, o aviso vem acompanhado do botão **Vincular contato**, que abre a busca por nome ou telefone — a mesma lista da tela de contatos, com as variações de telefone que ela já entende — e grava o vínculo na hora. Escolhida a pessoa, o dossiê passa a mostrar a ficha dela (telefone, e-mail e links) sem recarregar a página, e o bloco de pessoas relacionadas relê junto. Se o servidor recusar, o motivo que ele mandou aparece embaixo do seletor, que continua aberto para outra tentativa — sem falhar em silêncio.
+
+  Com contato vinculado, o mesmo bloco ganhou **Desvincular contato**, para desfazer o vínculo errado. Nada muda no que já funcionava: o vínculo continua sendo o mesmo `contact_id` do negócio, a edição do card não mudou, e nenhuma migração é necessária.
+
+  Contribuição de @webtecnica (#852).
+
+- **Formulário público pronto para compartilhar** Cada fonte de captação ativa e sem assinatura HMAC passa a oferecer um link de formulário público pronto para abrir ou copiar. A pessoa preenche pela página da própria instalação, recebe a confirmação sem sair dela e a resposta percorre o mesmo funil e o mesmo histórico das integrações existentes. Fontes pausadas ou protegidas por assinatura não publicam a página; não é necessária nenhuma configuração nova na VPS.
+
+- **Importação revisável do ClickUp** O Deskcomm passa a preparar snapshots do ClickUp no servidor ou em storage privado, com mapeamento explícito por List e execução retomável. CRM e Conhecimento usam leases independentes, receipts duráveis e aplicação `create_only`; Docs sem conteúdo ficam bloqueados.
+
+  A importação agora também aceita um sidecar versionado de comentários e anexos. Os arquivos passam por quarantine privada, conferência de tamanho, SHA-256 e MIME real antes da promoção; downloads revalidam o tenant e o alvo. Comentários entram como histórico sem disparar automações, CAPI ou alterar o relógio comercial. Bundles antigos continuam marcados como `unknown_not_exported`, sem inventar cobertura.
+
+- **Modelo de mensagem passa a conferir os limites da Meta e o exemplo de cada variável antes do envio** O formulário aceitava corpo de qualquer tamanho e uma variável `{{n}}` sem valor de amostra, e quem reprovava era a Meta: horas depois, com um erro genérico que não dizia qual campo estourou. Pior, o campo de texto cortava em 1024 no próprio `onChange`, então quem colava 1500 caracteres via o texto parar no meio da palavra sem saber por quê. Agora os limites da plataforma ficam num módulo puro com a fonte declarada — corpo até 1024 caracteres, cabeçalho de texto e rodapé até 60, texto de botão até 25, URL de botão até 2000, até 10 botões —, cada campo tem contador na tela e vira erro visível quando estoura, e o envio fica bloqueado com a mensagem do campo culpado. A rota responde 422 nomeando o campo antes de falar com a Meta, e cada `{{n}}` do corpo exige um exemplo não vazio: a variável que ficou sem amostra, inclusive a salteada (`{{1}}` e `{{3}}`), é apontada pelo número. Contribuição de @webtecnica (#3861).
+
+- **Tarefas passam a aceitar subtarefas e repetição automática** Uma tarefa pode ser dividida em subtarefas de um nível, exibidas dentro da tarefa principal com progresso e aviso das filhas atrasadas. A lista mantém a família na faixa do prazo aberto mais urgente, para uma etapa vencida não ficar escondida sob o prazo mais distante da tarefa principal.
+
+  Ao criar uma tarefa principal, também é possível repeti-la diariamente, semanalmente ou mensalmente, no prazo agendado ou depois da conclusão. O cálculo conserva o horário local mesmo em mudanças de horário de verão e trata os dias 29, 30 e 31 como o último dia válido do mês. Cancelar a série impede novas ocorrências sem apagar o histórico. O scheduler da instalação recebe o novo trabalho automaticamente; nenhuma configuração manual é necessária.
+
+  No modo após conclusão, a ocorrência seguinte é criada no primeiro ciclo do scheduler depois de concluir a atual, já com o prazo futuro calculado a partir daquele instante. Retentar uma configuração que falhou não duplica a tarefa.
+
+- **Visualizações salvas em cada funil** Cada funil passa a guardar visualizações pessoais ou compartilhadas com a equipe. Quadro, Lista e Calendário reabrem com seus filtros, ordenação e campos configurados; mudanças manuais ficam marcadas como “Modificada”, e links com `?view=` recuperam a mesma visão sem guardar uma data fixa do calendário.
+
+### Alterado
+
+- **A instalação passa a receber atualizações e imagens do fork da Suindara** A versão da Suindara passa a consultar releases e baixar as quatro imagens do fork `VictorHCTorres/DeskcommCRM`, preservando as funcionalidades próprias nas próximas atualizações.
+
+### Corrigido
+
+- **O agente de voz publicado volta a salvar o prompt** Ao salvar o prompt de um agente de voz com versão publicada, a tela recusava a mudança e mandava editar uma versão que as ligações nem usam. Agora o texto é salvo e passa a valer nas ligações seguintes. Os agentes de WhatsApp continuam protegidos: neles o prompt segue mudando por uma versão nova. Contribuição de @lzandonadi.
+
+- **Confirmação de consulta concluída chega à revisão da resposta** A revisão de promessas passa a receber o comprovante da reserva confirmada neste atendimento, conferido na agenda para a mesma pessoa e horário. Assim pode distinguir o relato da confirmação de uma promessa sem respaldo, mantendo a análise de descontos, cortesias e garantias adicionais. Reservas pendentes, falhas ou comprovantes desatualizados não autorizam confirmação. Não exige configuração nova na VPS.
+
+- **Menos recálculos de papel na visibilidade de conversas e negócios** As verificações de visibilidade reutilizam o papel dentro de cada chamada, sem mudar quem pode ver cada conversa ou negócio. O atalho de administrador da plataforma, as regras de responsável e os limites de acesso permanecem iguais. Crédito: @vagnerrm122.
+
+- **O agente de voz cumprimenta quem liga assim que atende** Na ligação recebida, o agente de voz ficava calado até ouvir a voz de quem ligou, e a pessoa ouvia silêncio, como se ninguém tivesse atendido. Agora ele fala primeiro: cumprimenta e se apresenta do jeito que o prompt do agente pede, e pergunta como pode ajudar. Na ligação que o CRM faz para o cliente nada muda: o agente continua esperando o "alô" de quem atende. Não há nada para configurar. Crédito: @lzandonadi.
+
 ## [1.99.0] — 2026-11-02
 
 ### Adicionado
@@ -13994,7 +14091,8 @@ Primeira versão marcada do DeskcommCRM. O projeto vinha sendo desenvolvido publ
 
 - **Node 22 é obrigatório para desenvolvimento.** A suíte de invariantes instancia o cliente do Supabase, que exige o `WebSocket` global — nativo apenas a partir do Node 22. Isso não afeta quem apenas hospeda: a VPS roda a imagem pronta.
 
-[Não lançado]: https://github.com/melgarafael/DeskcommCRM/compare/v1.99.0...HEAD
+[Não lançado]: https://github.com/melgarafael/DeskcommCRM/compare/v1.100.0...HEAD
+[1.100.0]: https://github.com/melgarafael/DeskcommCRM/compare/v1.99.0...v1.100.0
 [1.99.0]: https://github.com/melgarafael/DeskcommCRM/compare/v1.98.0...v1.99.0
 [1.98.0]: https://github.com/melgarafael/DeskcommCRM/compare/v1.97.0...v1.98.0
 [1.97.0]: https://github.com/melgarafael/DeskcommCRM/compare/v1.96.0...v1.97.0
