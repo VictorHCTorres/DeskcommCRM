@@ -130,7 +130,7 @@ test.describe("fonte de captação — assinatura pela tela", () => {
       // --- gera: o valor aparece UMA vez ---
       await sheet.getByRole("button", { name: "Gerar segredo" }).click();
       await expect(sheet.getByText("Guarde agora. Ele não será mostrado de novo.")).toBeVisible();
-      await expect(sheet.getByText("Ligada")).toBeVisible();
+      await expect(sheet.getByText("Ligada", { exact: true })).toBeVisible();
 
       // O segredo LIDO DA TELA — é isto que faz esta spec provar a tela, e não
       // um valor que o teste mesmo escolheu.

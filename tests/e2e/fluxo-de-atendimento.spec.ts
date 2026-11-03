@@ -253,7 +253,9 @@ test("liga o módulo, cria um roteiro pela tela, o cliente responde pelo WhatsAp
         for (const fy of [0.6, 0.8, 0.4]) for (const fx of [0.4, 0.6, 0.2, 0.8]) {
           const x = r.left + r.width * fx;
           const y = r.top + r.height * fy;
-          if (document.elementFromPoint(x, y) === pane) return { x, y };
+          // O Background do React Flow pode ser o alvo geométrico sem deixar de
+          // pertencer ao pane; o clique real borbulha dele para o fundo.
+          if (document.elementFromPoint(x, y)?.closest(".react-flow__pane") === pane) return { x, y };
         }
         return null;
       });
