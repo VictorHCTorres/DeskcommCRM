@@ -11,6 +11,7 @@
  * Cada `it` cai se a guarda dele for revertida.
  */
 import { render, screen } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Pipeline, Stage } from "@/lib/kanban/types";
@@ -77,16 +78,19 @@ const ETAPAS = [
 ] as unknown as Stage[];
 
 function montarPagina() {
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return import("@/app/app/pipelines/[id]/_client").then(({ PipelinePageClient }) =>
     render(
-      <PipelinePageClient
-        pipelineId="p-1"
-        initialName="Comercial 2025"
-        role="admin"
-        funis={[]}
-        funilInicial={FUNIL_LEVE}
-        etapasIniciais={ETAPAS}
-      />,
+      <QueryClientProvider client={queryClient}>
+        <PipelinePageClient
+          pipelineId="p-1"
+          initialName="Comercial 2025"
+          role="admin"
+          funis={[]}
+          funilInicial={FUNIL_LEVE}
+          etapasIniciais={ETAPAS}
+        />
+      </QueryClientProvider>,
     ),
   );
 }
