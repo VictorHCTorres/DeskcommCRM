@@ -54,19 +54,42 @@ function camposDaConfig(): string[] {
   return [...src.slice(ini, fim).matchAll(/^ {2}(\w+)\??:/gm)].map((m) => m[1]!);
 }
 
-/** Arquivos que leem o campo, fora do próprio módulo que o carrega. */
-function consumidoresDe(campo: string): string[] {
+type ArquivoConsumidor = { arquivo: string; fonte: string };
+
+let indiceDeConsumidores: ArquivoConsumidor[] | undefined;
+
+/**
+ * Lê o universo candidato uma vez. Um `git grep` por campo fazia esta cerca
+ * disputar dezenas de processos com as outras 354 cercas e estourar o teto no
+ * CI, embora isolada passasse. O índice preserva a mesma régua textual sem
+ * transformar o tempo do teste em função da quantidade de knobs.
+ */
+function arquivosQueLeemConfig(): ArquivoConsumidor[] {
+  if (indiceDeConsumidores) return indiceDeConsumidores;
   try {
     const saida = execFileSync(
       "git",
-      ["grep", "-l", "-e", `agentConfig.${campo}`, "-e", `agentConfig?.${campo}`, "--", "lib", "workers", "app"],
+      ["grep", "-l", "-e", "agentConfig.", "-e", "agentConfig?.", "--", "lib", "workers", "app"],
       { cwd: RAIZ, encoding: "utf8" },
     );
-    return saida.split("\n").filter((f) => f !== "" && !f.includes("agent-config"));
+    indiceDeConsumidores = saida
+      .split("\n")
+      .filter((arquivo) => arquivo !== "" && !arquivo.includes("agent-config"))
+      .map((arquivo) => ({ arquivo, fonte: readFileSync(path.join(RAIZ, arquivo), "utf8") }));
   } catch {
     // `git grep` sai com 1 quando não encontra nada — ausência, não falha.
-    return [];
+    indiceDeConsumidores = [];
   }
+  return indiceDeConsumidores;
+}
+
+/** Arquivos que leem o campo, fora do próprio módulo que o carrega. */
+function consumidoresDe(campo: string): string[] {
+  return arquivosQueLeemConfig()
+    .filter(({ fonte }) =>
+      fonte.includes(`agentConfig.${campo}`) || fonte.includes(`agentConfig?.${campo}`),
+    )
+    .map(({ arquivo }) => arquivo);
 }
 
 describe("knobs da versão publicada", () => {
