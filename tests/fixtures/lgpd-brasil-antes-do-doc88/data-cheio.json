@@ -45,6 +45,8 @@
   "conversation_notes": [],
   "contact_field_proposals": [],
   "lead_attachments": [],
+  "task_attachments": [],
+  "task_comments": [],
   "lead_notes": [],
   "ai_agent_runs": [],
   "lead_state": []

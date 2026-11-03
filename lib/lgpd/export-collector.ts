@@ -2776,6 +2776,8 @@ function emptyPayload(
     channel_session_groups: [],
     group_messages_authored: [],
     lead_attachments: [],
+    task_attachments: [],
+    task_comments: [],
     lead_notes: [],
     ai_agent_runs: [],
     lead_state: [],
