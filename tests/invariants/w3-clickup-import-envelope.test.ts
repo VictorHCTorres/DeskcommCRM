@@ -560,8 +560,8 @@ describe("W3.0 — envelope de importação ClickUp", () => {
       sql(`select count(*) from public.clickup_import_runs where id = '${RUN_BATCH_ACTIVE}';`),
     ).toBe("1");
 
-    for (let start = 1; start <= 2_200; start += 100) {
-      const end = start + 99;
+    for (let start = 1; start <= 2_200; start += 25) {
+      const end = start + 24;
       expect(
         sql(`set statement_timeout = '15s';
           select public.fn_append_clickup_import_preview_items(
@@ -575,7 +575,7 @@ describe("W3.0 — envelope de importação ClickUp", () => {
               'blocked_reason', case when n % 11 = 0 then 'scale_warning' else null end,
               'status', case when n % 11 = 0 then 'blocked' else 'ready' end
             )) from generate_series(${start}, ${end}) n))::text;`),
-      ).toMatch(/100$/);
+      ).toMatch(/25$/);
     }
 
     expect(() =>
@@ -594,6 +594,14 @@ describe("W3.0 — envelope de importação ClickUp", () => {
       sql(`select count(*) || ':' || count(distinct external_id)
         from public.clickup_import_items where run_id = '${RUN_BATCH_SCALE}';`),
     ).toBe("2200:2200");
+  });
+
+  it("recusa no banco um lote maior que o envelope operacional", () => {
+    expect(() =>
+      sql(`select public.fn_append_clickup_import_preview_items(
+        '${GOV_ORG}', '${RUN_BATCH_SCALE}',
+        jsonb_build_array(jsonb_build_object('description', repeat('x', 262145))));`),
+    ).toThrow(/invalid_clickup_preview_batch/);
   });
 
   it("retry recusa run sem item elegível e teto de tentativas", () => {

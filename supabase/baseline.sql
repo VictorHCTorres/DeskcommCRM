@@ -74634,7 +74634,7 @@ returns integer language plpgsql security definer set search_path = public, pg_t
 declare run_row public.clickup_import_runs%rowtype; inserted_count integer;
 begin
   if jsonb_typeof(p_items) <> 'array' or jsonb_array_length(p_items) not between 1 and 100
-     or pg_column_size(p_items) > 3145728 then
+     or octet_length(p_items::text) > 262144 then
     raise exception 'invalid_clickup_preview_batch' using errcode = '22023';
   end if;
   select * into run_row from public.clickup_import_runs
