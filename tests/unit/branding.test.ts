@@ -221,6 +221,24 @@ const MARCA_CONGELADA: Record<string, EntradaDeMarca> = {
       "header que o webhook de ENTRADA exige de quem envia. Renomear invalida a assinatura de todo integrador já configurado, e o sintoma para ele é 401 sem explicação. A rota que confere e a tela que ensina importam ESTA constante — o literal não se repete mais em nenhuma das duas",
     marcas: ["x-deskcomm-signature"],
   },
+  "lib/webhooks/formulario-publico.ts": {
+    categoria: "PROTOCOLO",
+    motivo:
+      "nome reservado do campo honeypot enviado pelo formulário público e reconhecido pelo webhook de entrada. Ele não é texto de interface: renomear somente um lado desativa a defesa antispam sem erro visível",
+    marcas: ["__deskcomm_site"],
+  },
+  "app/api/v1/webhooks/in/[token]/route.test.ts": {
+    categoria: "PROTOCOLO",
+    motivo:
+      "guarda o contrato do honeypot `__deskcomm_site`: prova que valores preenchidos são rejeitados e que o campo vazio segue o fluxo normal. Trocar o identificador apenas no teste desarmaria a proteção do protocolo",
+    marcas: [
+      "__deskcomm_site",
+      "__deskcomm_site",
+      "__deskcomm_site",
+      "__deskcomm_site",
+      "__deskcomm_site",
+    ],
+  },
   "lib/automation/actions/call-webhook.ts": {
     categoria: "PROTOCOLO",
     motivo:
@@ -341,6 +359,48 @@ const MARCA_CONGELADA: Record<string, EntradaDeMarca> = {
     motivo:
       "o caso medido da issue #2804 usa o nome do contêiner da stack local (que carrega a marca do produto) para provar que o `_` do nome de contêiner é ACEITO e chega à escrita; é fixture de teste e não embarca na imagem",
     marcas: ["supabase_inbucket_deskcomm-crm"],
+  },
+  "app/api/v1/ai/knowledge/sources/[id]/attachments/[attachmentId]/media/route.test.ts": {
+    categoria: "DEV",
+    motivo:
+      "`deskcomm.test` é a origem reservada e sintética das Request usadas para exercitar a rota de mídia; não é host acessado pelo produto e o arquivo não embarca na imagem",
+    marcas: ["deskcomm.test", "deskcomm.test"],
+  },
+  "app/api/v1/clickup/discovery/route.test.ts": {
+    categoria: "DEV",
+    motivo:
+      "`deskcomm.test` é apenas a origem reservada da Request da fixture de descoberta ClickUp; não é destino de rede e o arquivo de teste não embarca na imagem",
+    marcas: ["deskcomm.test"],
+  },
+  "app/api/v1/clickup/imports/[id]/preview-coverage/route.test.ts": {
+    categoria: "DEV",
+    motivo:
+      "`deskcomm.test` é somente a origem reservada da Request que testa a cobertura do preview; não é destino de rede nem texto apresentado ao usuário",
+    marcas: ["deskcomm.test"],
+  },
+  "app/api/v1/clickup/imports/bundle/route.test.ts": {
+    categoria: "DEV",
+    motivo:
+      "`deskcomm.test` é a origem reservada das Requests da fixture de bundle ClickUp; não é host acessado em produção e o arquivo não embarca na imagem",
+    marcas: ["deskcomm.test", "deskcomm.test"],
+  },
+  "app/api/v1/clickup/imports/preview/route.test.ts": {
+    categoria: "DEV",
+    motivo:
+      "`deskcomm.test` é somente a origem reservada da Request usada para testar o preview ClickUp; não é destino de rede nem marca exposta pelo produto",
+    marcas: ["deskcomm.test"],
+  },
+  "app/api/v1/tasks/[id]/attachments/route.test.ts": {
+    categoria: "DEV",
+    motivo:
+      "`deskcomm.test` é a origem reservada das Requests que exercitam listagem e download de anexos; não é host acessado pelo produto e o teste não embarca",
+    marcas: ["deskcomm.test", "deskcomm.test", "deskcomm.test"],
+  },
+  "app/api/v1/tasks/[id]/relations/route.test.ts": {
+    categoria: "DEV",
+    motivo:
+      "`deskcomm.test` é somente a origem reservada da Request que testa autorização da rota de relações; não é destino de rede nem texto de interface",
+    marcas: ["deskcomm.test"],
   },
   "lib/agent-engine/agent/draft-reply.test.ts": {
     categoria: "DEV",
@@ -856,6 +916,26 @@ type CategoriaDeHost =
 type EntradaDeHost = { categoria: CategoriaDeHost; motivo: string };
 
 const HOSTS_DECLARADOS: Record<string, EntradaDeHost> = {
+  "api.clickup.com": {
+    categoria: "FORNECEDOR",
+    motivo:
+      "endpoint oficial das APIs v2 e v3 do ClickUp, chamado pelos importadores de CRM, comentários e Docs com a credencial da própria organização. É destino efetivo dos requests, não marca de interface.",
+  },
+  "clickup.com": {
+    categoria: "FORNECEDOR",
+    motivo:
+      "host oficial aceito para baixar anexos referenciados pelo ClickUp. O servidor só o acessa pelo cliente endurecido que valida DNS, redirects, tamanho, MIME e hash antes de promover o arquivo.",
+  },
+  "clickupcdn.com": {
+    categoria: "FORNECEDOR",
+    motivo:
+      "CDN oficial que serve anexos do ClickUp e é acessada pelo downloader endurecido, com bloqueio de rede privada, limite de redirects, tamanho, MIME e hash. É destino do fornecedor, não domínio da instalação.",
+  },
+  "clickupusercontent.com": {
+    categoria: "FORNECEDOR",
+    motivo:
+      "host oficial de conteúdo enviado ao ClickUp, acessado somente pelo downloader endurecido de anexos com validação de DNS, redirects, tamanho, MIME e hash; não é texto de marca nem egress arbitrário.",
+  },
   "chatgpt.com": {
     categoria: "CONSOLE",
     motivo:
