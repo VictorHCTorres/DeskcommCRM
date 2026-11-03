@@ -8,6 +8,12 @@ Se você roda o DeskcommCRM numa VPS, **leia a seção da versão para a qual es
 
 ## [Não lançado]
 
+## [1.100.2] — 2026-11-03
+
+### Corrigido
+
+- **A descoberta do ClickUp deixa de falhar em contas com muitos dados** A prévia da migração passa a gravar o conteúdo em lotes pequenos, evitando o limite de tempo do banco em contas com milhares de tarefas e descrições extensas. Se um lote falhar, o rascunho incompleto é removido e nada fica disponível para execução. Crédito: @VictorHCTorres.
+
 ## [1.100.1] — 2026-11-03
 
 ### Corrigido
@@ -14097,7 +14103,8 @@ Primeira versão marcada do DeskcommCRM. O projeto vinha sendo desenvolvido publ
 
 - **Node 22 é obrigatório para desenvolvimento.** A suíte de invariantes instancia o cliente do Supabase, que exige o `WebSocket` global — nativo apenas a partir do Node 22. Isso não afeta quem apenas hospeda: a VPS roda a imagem pronta.
 
-[Não lançado]: https://github.com/melgarafael/DeskcommCRM/compare/v1.100.1...HEAD
+[Não lançado]: https://github.com/melgarafael/DeskcommCRM/compare/v1.100.2...HEAD
+[1.100.2]: https://github.com/melgarafael/DeskcommCRM/compare/v1.100.1...v1.100.2
 [1.100.1]: https://github.com/melgarafael/DeskcommCRM/compare/v1.100.0...v1.100.1
 [1.100.0]: https://github.com/melgarafael/DeskcommCRM/compare/v1.99.0...v1.100.0
 [1.99.0]: https://github.com/melgarafael/DeskcommCRM/compare/v1.98.0...v1.99.0
