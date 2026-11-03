@@ -6,6 +6,7 @@ vi.mock("@/lib/auth/require-role", () => ({ requireRole: vi.fn() }));
 vi.mock("@/lib/supabase/admin", () => ({ createAdminClient: vi.fn(() => ({})) }));
 vi.mock("@/lib/clickup/store", () => ({ stageClickUpPreview: vi.fn() }));
 vi.mock("@/lib/api/idempotency", () => ({
+  JANELA_LONGA_DA_RESERVA_MS: 15 * 60 * 1000,
   chaveDaRequisicao: vi.fn(() => "00000000-0000-4000-8000-000000000099"),
   comIdempotencia: vi.fn(async () => ({
     tipo: "executou",
@@ -19,6 +20,7 @@ vi.mock("@/lib/api/idempotency", () => ({
   })),
 }));
 
+import { comIdempotencia, JANELA_LONGA_DA_RESERVA_MS } from "@/lib/api/idempotency";
 import { requireRole } from "@/lib/auth/require-role";
 
 import { POST } from "./route";
@@ -90,5 +92,8 @@ describe("preview de Docs privados do ClickUp", () => {
     await expect(response.json()).resolves.toMatchObject({
       data: { privacy_warning: expect.stringContaining("toda a organização") },
     });
+    expect(comIdempotencia).toHaveBeenCalledWith(
+      expect.objectContaining({ reservaMs: JANELA_LONGA_DA_RESERVA_MS }),
+    );
   });
 });

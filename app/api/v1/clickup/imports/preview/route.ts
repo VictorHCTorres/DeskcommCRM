@@ -1,7 +1,11 @@
 import { randomUUID } from "node:crypto";
 
 import { fail, ok } from "@/lib/api/wrappers";
-import { chaveDaRequisicao, comIdempotencia } from "@/lib/api/idempotency";
+import {
+  chaveDaRequisicao,
+  comIdempotencia,
+  JANELA_LONGA_DA_RESERVA_MS,
+} from "@/lib/api/idempotency";
 import { audit } from "@/lib/audit";
 import { requireRole } from "@/lib/auth/require-role";
 import { escreveComoPlatformAdmin, roleAtLeast } from "@/lib/auth/types";
@@ -64,6 +68,7 @@ export async function POST(request: Request): Promise<Response> {
       endpoint: "clickup.imports.preview",
       chave: idempotencyKey,
       corpo: parsed.data,
+      reservaMs: JANELA_LONGA_DA_RESERVA_MS,
       executar: async () => ({
         resposta: await stageClickUpPreview(db, {
           organizationId: authz.org.orgId,
