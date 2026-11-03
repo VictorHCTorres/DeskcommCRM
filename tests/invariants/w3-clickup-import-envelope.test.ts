@@ -38,6 +38,12 @@ const RUN_PURGE = "90950000-0000-4000-8000-000000000026";
 const FULL_DOC_PURGE_TERMINAL = "90950000-0000-4000-8000-000000000027";
 const RUN_EXECUTE_EXPIRED = "90950000-0000-4000-8000-000000000028";
 const FULL_DOC_EXECUTE_EXPIRED = "90950000-0000-4000-8000-000000000029";
+const RUN_BATCH_FINALIZE = "90950000-0000-4000-8000-000000000030";
+const RUN_BATCH_ABORT = "90950000-0000-4000-8000-000000000031";
+const RUN_BATCH_EMPTY = "90950000-0000-4000-8000-000000000032";
+const RUN_BATCH_SCALE = "90950000-0000-4000-8000-000000000033";
+const RUN_BATCH_STALE = "90950000-0000-4000-8000-000000000034";
+const RUN_BATCH_ACTIVE = "90950000-0000-4000-8000-000000000035";
 const OUTRA_ORG = "90950000-0000-4000-8000-000000000010";
 const OUTRO_PIPELINE = "90950000-0000-4000-8000-000000000011";
 const HASH = "a".repeat(64);
@@ -439,6 +445,155 @@ describe("W3.0 — envelope de importação ClickUp", () => {
         join public.clickup_import_items i on i.run_id = r.id
         where r.snapshot_hash = '${validSnapshot}' group by r.status;`),
     ).toBe("ready:1");
+  });
+
+  it("só finaliza a prévia em lotes quando a contagem fecha e remove rascunho abortado", () => {
+    sql(`select public.fn_begin_clickup_import_preview(
+      '${GOV_ORG}', '${RUN_BATCH_FINALIZE}', '${CONNECTION}', 'wk-1', 'api', 'docs', 3,
+      '${"6".repeat(64)}', null, '${GOV_MANAGER}');
+      select public.fn_append_clickup_import_preview_items(
+        '${GOV_ORG}', '${RUN_BATCH_FINALIZE}',
+        '[{"entity_type":"task","external_id":"batch-1","source_hash":"${HASH}",
+           "source_metadata":{},"source_payload":null,"content_access":"none",
+           "execution_blocked":false,"blocked_reason":null,"status":"ready"},
+          {"entity_type":"doc","external_id":"batch-doc","source_hash":"${HASH}",
+           "source_metadata":{},"source_payload":null,"content_access":"metadata_only",
+           "execution_blocked":true,
+           "blocked_reason":"clickup_doc_content_not_authorized","status":"blocked"}]');`);
+    expect(() =>
+      sql(`insert into public.clickup_asset_sidecars
+        (organization_id, run_id, workspace_id, snapshot_hash, sidecar_version,
+         manifest_version, mode, coverage, checkpoint, status, created_by)
+        values ('${GOV_ORG}', '${RUN_BATCH_FINALIZE}', 'wk-1', '${"6".repeat(64)}',
+          1, 3, 'inventory', '{}', '{}', 'inventory', '${GOV_MANAGER}');`),
+    ).toThrow();
+
+    expect(() =>
+      sql(`select public.fn_finalize_clickup_import_preview(
+        '${GOV_ORG}', '${RUN_BATCH_FINALIZE}', 3);`),
+    ).toThrow();
+    expect(
+      sql(`select status || ':' || total_items from public.clickup_import_runs
+        where id = '${RUN_BATCH_FINALIZE}';`),
+    ).toBe("preview:2");
+    expect(
+      sql(`select public.fn_finalize_clickup_import_preview(
+        '${GOV_ORG}', '${RUN_BATCH_FINALIZE}', 2)::text;`),
+    ).toBe(RUN_BATCH_FINALIZE);
+    expect(
+      sql(`select status || ':' || total_items || ':' || applicable_items
+        from public.clickup_import_runs where id = '${RUN_BATCH_FINALIZE}';`),
+    ).toBe("blocked_missing_content:2:1");
+    expect(
+      sql(`select public.fn_finalize_clickup_import_preview(
+        '${GOV_ORG}', '${RUN_BATCH_FINALIZE}', 2)::text;`),
+    ).toBe(RUN_BATCH_FINALIZE);
+    expect(() =>
+      sql(`select public.fn_append_clickup_import_preview_items(
+        '${GOV_ORG}', '${RUN_BATCH_FINALIZE}',
+        '[{"entity_type":"task","external_id":"late","source_hash":"${HASH}",
+           "source_metadata":{},"source_payload":null,"content_access":"none",
+           "execution_blocked":false,"blocked_reason":null,"status":"ready"}]');`),
+    ).toThrow();
+    expect(() =>
+      sql(`select public.fn_finalize_clickup_import_preview(
+        '${OUTRA_ORG}', '${RUN_BATCH_FINALIZE}', 2);`),
+    ).toThrow();
+
+    sql(`select public.fn_begin_clickup_import_preview(
+      '${GOV_ORG}', '${RUN_BATCH_ABORT}', '${CONNECTION}', 'wk-1', 'api', 'crm', 3,
+      '${"7".repeat(64)}', null, '${GOV_MANAGER}');
+      select public.fn_append_clickup_import_preview_items(
+        '${GOV_ORG}', '${RUN_BATCH_ABORT}',
+        '[{"entity_type":"task","external_id":"batch-abort","source_hash":"${HASH}",
+           "source_metadata":{},"source_payload":null,"content_access":"none",
+           "execution_blocked":false,"blocked_reason":null,"status":"ready"}]');`);
+    expect(
+      sql(`select public.fn_cancel_clickup_import_run(
+        '${GOV_ORG}', '${RUN_BATCH_ABORT}')::text;`),
+    ).toBe(RUN_BATCH_ABORT);
+    expect(
+      sql(`select public.fn_abort_clickup_import_preview(
+        '${GOV_ORG}', '${RUN_BATCH_ABORT}')::text;`),
+    ).toBe("true");
+    expect(
+      sql(`select count(*) from public.clickup_import_runs where id = '${RUN_BATCH_ABORT}';`),
+    ).toBe("0");
+    expect(
+      sql(`select count(*) from public.clickup_import_items where run_id = '${RUN_BATCH_ABORT}';`),
+    ).toBe("0");
+
+    sql(`select public.fn_begin_clickup_import_preview(
+      '${GOV_ORG}', '${RUN_BATCH_EMPTY}', '${CONNECTION}', 'wk-1', 'api', 'crm', 3,
+      '${"3".repeat(64)}', null, '${GOV_MANAGER}');`);
+    expect(
+      sql(`select public.fn_finalize_clickup_import_preview(
+        '${GOV_ORG}', '${RUN_BATCH_EMPTY}', 0)::text;`),
+    ).toBe(RUN_BATCH_EMPTY);
+    expect(
+      sql(`select status || ':' || total_items from public.clickup_import_runs
+        where id = '${RUN_BATCH_EMPTY}';`),
+    ).toBe("ready:0");
+  });
+
+  it("grava 2.200 itens em lotes curtos, fecha contadores e expurga staging abandonado", () => {
+    sql(`insert into public.clickup_import_runs
+      (id, organization_id, connection_id, workspace_id, source, scope, status,
+       manifest_version, snapshot_hash, checkpoint, created_by, created_at, updated_at)
+      values ('${RUN_BATCH_STALE}', '${GOV_ORG}', '${CONNECTION}', 'wk-1', 'api', 'crm',
+        'preview', 3, '${"2".repeat(64)}', '{"staging":true}', '${GOV_MANAGER}',
+        now() - interval '2 hours', now() - interval '2 hours');
+      insert into public.clickup_import_runs
+      (id, organization_id, connection_id, workspace_id, source, scope, status,
+       manifest_version, snapshot_hash, checkpoint, created_by, created_at, updated_at)
+      values ('${RUN_BATCH_ACTIVE}', '${GOV_ORG}', '${CONNECTION}', 'wk-1', 'api', 'crm',
+        'preview', 3, '${"4".repeat(64)}', '{"staging":true}', '${GOV_MANAGER}',
+        now() - interval '2 hours', now());`);
+    expect(sql(`select public.fn_expurgar_clickup_preview_staging(25);`)).toBe("1");
+    sql(`select public.fn_begin_clickup_import_preview(
+        '${GOV_ORG}', '${RUN_BATCH_SCALE}', '${CONNECTION}', 'wk-1', 'api', 'crm', 3,
+        '${"1".repeat(64)}', null, '${GOV_MANAGER}');`);
+    expect(
+      sql(`select count(*) from public.clickup_import_runs where id = '${RUN_BATCH_STALE}';`),
+    ).toBe("0");
+    expect(
+      sql(`select count(*) from public.clickup_import_runs where id = '${RUN_BATCH_ACTIVE}';`),
+    ).toBe("1");
+
+    for (let start = 1; start <= 2_200; start += 100) {
+      const end = start + 99;
+      expect(
+        sql(`set statement_timeout = '15s';
+          select public.fn_append_clickup_import_preview_items(
+            '${GOV_ORG}', '${RUN_BATCH_SCALE}',
+            (select jsonb_agg(jsonb_build_object(
+              'entity_type', 'task', 'external_id', 'scale-' || n,
+              'source_hash', '${HASH}',
+              'source_metadata', jsonb_build_object('description', repeat(md5(n::text), 32)),
+              'source_payload', null, 'content_access', 'none',
+              'execution_blocked', n % 11 = 0,
+              'blocked_reason', case when n % 11 = 0 then 'scale_warning' else null end,
+              'status', case when n % 11 = 0 then 'blocked' else 'ready' end
+            )) from generate_series(${start}, ${end}) n))::text;`),
+      ).toMatch(/100$/);
+    }
+
+    expect(() =>
+      sql(`select public.fn_finalize_clickup_import_preview(
+        '${GOV_ORG}', '${RUN_BATCH_SCALE}', 10001);`),
+    ).toThrow();
+    expect(
+      sql(`select public.fn_finalize_clickup_import_preview(
+        '${GOV_ORG}', '${RUN_BATCH_SCALE}', 2200)::text;`),
+    ).toBe(RUN_BATCH_SCALE);
+    expect(
+      sql(`select status || ':' || total_items || ':' || applicable_items || ':' ||
+        warnings_count from public.clickup_import_runs where id = '${RUN_BATCH_SCALE}';`),
+    ).toBe("ready:2200:2000:200");
+    expect(
+      sql(`select count(*) || ':' || count(distinct external_id)
+        from public.clickup_import_items where run_id = '${RUN_BATCH_SCALE}';`),
+    ).toBe("2200:2200");
   });
 
   it("retry recusa run sem item elegível e teto de tentativas", () => {

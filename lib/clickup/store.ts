@@ -9,6 +9,7 @@ import {
 } from "@/lib/clickup/crm/contrato";
 import { encryptClickUpToken } from "@/lib/clickup/crypto";
 import { clickupHash, discoveredObjectToStaging, manifestHash } from "@/lib/clickup/manifest";
+import { logger } from "@/lib/logger";
 
 type Db = SupabaseClient;
 
@@ -19,6 +20,52 @@ export class ClickUpStoreError extends Error {
   ) {
     super(message);
   }
+}
+
+export const CLICKUP_STAGE_BATCH_MAX_ROWS = 100;
+export const CLICKUP_STAGE_BATCH_MAX_BYTES = 512 * 1024;
+export const CLICKUP_STAGE_MAX_SINGLE_ROW_BYTES = 2 * 1024 * 1024;
+
+type ClickUpStagingRow = ReturnType<typeof discoveredObjectToStaging>;
+
+/**
+ * O snapshot real pode passar de 14 MiB. PostgREST converte o JSON inteiro antes
+ * de chamar a função SQL e, nesse volume, o statement_timeout do banco encerra
+ * uma RPC monolítica. Os lotes limitam simultaneamente cardinalidade e bytes;
+ * uma linha individual maior que o teto segue sozinha para não truncar dados.
+ */
+export function splitClickUpStagingRows(
+  rows: ClickUpStagingRow[],
+  options: { maxRows?: number; maxBytes?: number } = {},
+): ClickUpStagingRow[][] {
+  const maxRows = options.maxRows ?? CLICKUP_STAGE_BATCH_MAX_ROWS;
+  const maxBytes = options.maxBytes ?? CLICKUP_STAGE_BATCH_MAX_BYTES;
+  if (!Number.isInteger(maxRows) || maxRows < 1 || !Number.isInteger(maxBytes) || maxBytes < 1) {
+    throw new Error("invalid_clickup_stage_batch_limits");
+  }
+
+  const batches: ClickUpStagingRow[][] = [];
+  let batch: ClickUpStagingRow[] = [];
+  let batchBytes = 2; // colchetes do array JSON
+  for (const row of rows) {
+    const rowBytes = Buffer.byteLength(JSON.stringify(row), "utf8");
+    if (rowBytes > CLICKUP_STAGE_MAX_SINGLE_ROW_BYTES) {
+      throw new ClickUpStoreError(
+        "invalid_state",
+        `O item ${row.external_id} excede o limite seguro da prévia do ClickUp.`,
+      );
+    }
+    const nextBytes = batchBytes + (batch.length > 0 ? 1 : 0) + rowBytes;
+    if (batch.length > 0 && (batch.length >= maxRows || nextBytes > maxBytes)) {
+      batches.push(batch);
+      batch = [];
+      batchBytes = 2;
+    }
+    batch.push(row);
+    batchBytes += (batch.length > 1 ? 1 : 0) + rowBytes;
+  }
+  if (batch.length > 0) batches.push(batch);
+  return batches;
 }
 
 function throwDb(error: { code?: string; message: string } | null, fallback: string): never {
@@ -183,22 +230,79 @@ export async function stageClickUpPreview(
   if (!connection) throw new ClickUpStoreError("not_found", "Conexão do ClickUp não encontrada.");
 
   const now = new Date();
+  const runId = randomUUID();
   const rows = input.manifest.objects.map((object) => discoveredObjectToStaging(object, now));
-  const { data: runId, error } = await db.rpc("fn_stage_clickup_import_preview", {
-    p_organization_id: input.organizationId,
-    p_connection_id: input.manifest.connection_id,
-    p_workspace_id: input.manifest.workspace_id,
-    p_source: input.manifest.source,
-    p_scope: input.manifest.scope,
-    p_manifest_version: input.manifest.manifest_version,
-    p_snapshot_hash: hash,
-    p_source_revision: input.manifest.source_revision ?? null,
-    p_created_by: input.userId,
-    p_items: rows,
-  });
-  if (error || typeof runId !== "string") {
-    throwDb(error, "Não foi possível montar a prévia do ClickUp.");
+  const batches = splitClickUpStagingRows(rows);
+  let runCreated = false;
+
+  try {
+    const { data: begunRunId, error: runError } = await db.rpc("fn_begin_clickup_import_preview", {
+      p_organization_id: input.organizationId,
+      p_run_id: runId,
+      p_connection_id: input.manifest.connection_id,
+      p_workspace_id: input.manifest.workspace_id,
+      p_source: input.manifest.source,
+      p_scope: input.manifest.scope,
+      p_manifest_version: input.manifest.manifest_version,
+      p_snapshot_hash: hash,
+      p_source_revision: input.manifest.source_revision ?? null,
+      p_created_by: input.userId,
+    });
+    if (runError || begunRunId !== runId) {
+      throwDb(runError, "Não foi possível iniciar a prévia do ClickUp.");
+    }
+    runCreated = true;
+
+    for (const batch of batches) {
+      const { data: insertedItems, error: itemsError } = await db.rpc(
+        "fn_append_clickup_import_preview_items",
+        {
+          p_organization_id: input.organizationId,
+          p_run_id: runId,
+          p_items: batch,
+        },
+      );
+      if (itemsError || insertedItems !== batch.length) {
+        throwDb(itemsError, "Não foi possível montar a prévia do ClickUp.");
+      }
+    }
+
+    const { data: finalizedRunId, error: finalizationError } = await db.rpc(
+      "fn_finalize_clickup_import_preview",
+      {
+        p_organization_id: input.organizationId,
+        p_run_id: runId,
+        p_expected_items: rows.length,
+      },
+    );
+    if (finalizationError || finalizedRunId !== runId) {
+      throwDb(finalizationError, "Não foi possível concluir a prévia do ClickUp.");
+    }
+  } catch (error) {
+    if (runCreated) {
+      try {
+        const abort = await db.rpc("fn_abort_clickup_import_preview", {
+          p_organization_id: input.organizationId,
+          p_run_id: runId,
+        });
+        if (abort.error || abort.data !== true) {
+          logger.warn("clickup.preview_cleanup_failed", {
+            organization_id: input.organizationId,
+            run_id: runId,
+            database_code: abort.error?.code ?? null,
+          });
+        }
+      } catch (abortError) {
+        logger.warn("clickup.preview_cleanup_failed", {
+          organization_id: input.organizationId,
+          run_id: runId,
+          kind: abortError instanceof Error ? abortError.name : "unknown",
+        });
+      }
+    }
+    throw error;
   }
+
   return loadRunSafe(db, input.organizationId, runId);
 }
 

@@ -20,6 +20,11 @@ async function handle(request: NextRequest) {
       p_limite: 500,
     });
     if (error) throw new Error(`clickup_asset_staging_retention:${error.message}`);
+    const { data: expiredPreviews, error: previewError } = await db.rpc(
+      "fn_expurgar_clickup_preview_staging",
+      { p_limite: 25 },
+    );
+    if (previewError) throw new Error(`clickup_preview_staging_retention:${previewError.message}`);
     const { data: orphans, error: orphanError } = await db.rpc(
       "fn_reconcile_clickup_asset_orphans",
       { p_limite: 500 },
@@ -29,6 +34,7 @@ async function handle(request: NextRequest) {
       {
         ...result,
         expired_staging: Number(expired ?? 0),
+        expired_previews: Number(expiredPreviews ?? 0),
         orphan_assets_queued: Number(orphans ?? 0),
       },
       { requestId },
