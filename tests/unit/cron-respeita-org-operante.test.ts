@@ -62,6 +62,8 @@ const SEM_FILTRO: Record<string, string> = {
     "fn_claim_clickup_import_run_for_scope junta organizations.status = active antes de conceder o lease do CRM",
   "clickup-docs-import":
     "fn_claim_clickup_import_run_for_scope junta organizations.status = active antes de conceder o lease de Docs",
+  "clickup-live-sidecar":
+    "fn_claim_clickup_live_sidecar_parent junta organizations.status = active antes de coletar da origem",
   "contact-avatars": "baixa a foto de perfil: deliberadamente não gatilhado (spec §4)",
   "contact-birthdays": "só emite contact.birthday; o consumidor (automationRulesHandler) é 'pula'",
   "contact-phones": "só consulta o transporte para achar o telefone; nenhuma mensagem ao cliente",

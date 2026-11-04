@@ -68,4 +68,18 @@ describe("paginação dos comentários ClickUp", () => {
     await cliente.listarDaTask("t");
     expect(dormir).toHaveBeenCalledWith(2_000);
   });
+
+  it("falha fechado quando a API anuncia replies que não entregou", async () => {
+    const fetchImpl = vi.fn(async (input: string | URL | Request) =>
+      String(input).includes("/reply")
+        ? resposta({ comments: [] })
+        : resposta({ comments: [comentario(1, { reply_count: 1 })] }),
+    );
+    await expect(
+      new ClienteDeComentariosClickUp({
+        token: "x",
+        fetchImpl: fetchImpl as typeof fetch,
+      }).listarDaTask("t"),
+    ).rejects.toThrow("clickup_replies_incomplete");
+  });
 });

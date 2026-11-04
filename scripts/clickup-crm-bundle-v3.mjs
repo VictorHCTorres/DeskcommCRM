@@ -35,8 +35,19 @@ function args(argv) {
 
 function safeAssignees(value) {
   return array(value).flatMap((raw) => {
-    const email = text(record(raw).email).trim().toLowerCase();
-    return email ? [{ email }] : [];
+    const assignee = record(raw);
+    const email = text(assignee.email).trim().toLowerCase();
+    const sourceUserId = text(assignee.id).trim();
+    const displayName = text(assignee.username).trim();
+    return email || sourceUserId || displayName
+      ? [
+          {
+            email: email || null,
+            source_user_id: sourceUserId || null,
+            display_name: displayName || null,
+          },
+        ]
+      : [];
   });
 }
 
@@ -95,6 +106,47 @@ function safeLocations(value) {
   });
 }
 
+function nonEmptyCustomFieldValue(value) {
+  return (
+    value !== null &&
+    value !== undefined &&
+    value !== "" &&
+    (!Array.isArray(value) || value.length > 0)
+  );
+}
+
+function taskCustomFields(value) {
+  return array(value).flatMap((rawField) => {
+    const field = record(rawField);
+    if (!nonEmptyCustomFieldValue(field.value)) return [];
+    const type = text(field.type);
+    const options = array(record(field.type_config).options).map((rawOption) => {
+      const option = record(rawOption);
+      return {
+        id: text(option.id || option.value),
+        label: text(option.name || option.label),
+      };
+    });
+    const selections =
+      type === "drop_down" ? [field.value] : type === "labels" ? array(field.value) : [];
+    const selectedOptions = selections.flatMap((selection) => {
+      const byId = options.find((candidate) => candidate.id === text(selection));
+      const byIndex = Number.isInteger(Number(selection)) ? options[Number(selection)] : null;
+      const option = byId ?? byIndex;
+      return option?.id ? [option] : [];
+    });
+    return [
+      {
+        id: text(field.id),
+        name: text(field.name),
+        type,
+        value: type === "drop_down" && selectedOptions[0]?.id ? selectedOptions[0].id : field.value,
+        selected_options: selectedOptions,
+      },
+    ];
+  });
+}
+
 function fidelityWarnings(task) {
   const warnings = [];
   if (task.archived === true) warnings.push({ code: "clickup_archived_preserved_metadata_only" });
@@ -107,13 +159,18 @@ function fidelityWarnings(task) {
   return warnings;
 }
 
-function taskMetadata(raw, listId, archiveScope) {
+function taskMetadata(raw, listId, archiveScope, hierarchy) {
   const task = record(raw);
   const attachmentsExported = Object.prototype.hasOwnProperty.call(task, "attachments");
   const attachments = array(task.attachments);
   const status = record(task.status);
   return {
     list_id: listId,
+    list_name: hierarchy.list_name,
+    space_id: hierarchy.space_id,
+    space_name: hierarchy.space_name,
+    folder_id: hierarchy.folder_id,
+    folder_name: hierarchy.folder_name,
     name: text(task.name),
     description: text(task.description ?? task.text_content),
     parent_id: text(task.parent) || null,
@@ -155,15 +212,7 @@ function taskMetadata(raw, listId, archiveScope) {
     fidelity_warnings: fidelityWarnings(task),
     assignees: safeAssignees(task.assignees),
     checklists: checklistItems(task.checklists),
-    custom_fields: array(task.custom_fields).map((rawField) => {
-      const field = record(rawField);
-      const options = array(record(field.type_config).options);
-      const option =
-        text(field.type) === "drop_down" && Number.isInteger(Number(field.value))
-          ? record(options[Number(field.value)])
-          : {};
-      return { id: text(field.id), value: text(option.id) || (field.value ?? null) };
-    }),
+    custom_fields: taskCustomFields(task.custom_fields),
     attachment_count: attachmentsExported ? attachments.length : null,
     attachment_status: attachmentsExported
       ? attachments.length > 0
@@ -195,6 +244,7 @@ export async function exportarClickUpCrmBundleV3(options) {
     },
   ];
   const listIds = new Set();
+  const hierarchyByListId = new Map();
   for (const rawSpace of array(hierarchy.spaces)) {
     const space = record(rawSpace);
     const spaceId = text(space.id);
@@ -232,20 +282,26 @@ export async function exportarClickUpCrmBundleV3(options) {
     for (const [list, folderId] of lists) {
       const listId = text(list.id);
       listIds.add(listId);
+      const listHierarchy = {
+        list_name: text(list.name),
+        space_id: spaceId,
+        space_name: text(space.name),
+        folder_id: folderId,
+        folder_name: folderId
+          ? text(record(folders.find((candidate) => text(record(candidate).id) === folderId)).name)
+          : null,
+      };
+      hierarchyByListId.set(listId, listHierarchy);
       objects.push({
         source_type: "list",
         source_id: listId,
         parent_source_id: folderId ?? spaceId,
         metadata: {
-          name: text(list.name),
-          space_id: spaceId,
-          space_name: text(space.name),
-          folder_id: folderId,
-          folder_name: folderId
-            ? text(
-                record(folders.find((candidate) => text(record(candidate).id) === folderId)).name,
-              )
-            : null,
+          name: listHierarchy.list_name,
+          space_id: listHierarchy.space_id,
+          space_name: listHierarchy.space_name,
+          folder_id: listHierarchy.folder_id,
+          folder_name: listHierarchy.folder_name,
           archived: list.archived === true,
           archive_scope: archiveScope,
         },
@@ -311,13 +367,10 @@ export async function exportarClickUpCrmBundleV3(options) {
     for (const line of lines) {
       const task = JSON.parse(line);
       const taskId = text(task.id);
-      const metadata = taskMetadata(task, listId, archiveScope);
+      const metadata = taskMetadata(task, listId, archiveScope, hierarchyByListId.get(listId));
       const previousTask = taskObjects.get(taskId);
       const sourceListIds = [
-        ...new Set([
-          ...array(previousTask?.metadata?.provenance?.source_list_ids),
-          listId,
-        ]),
+        ...new Set([...array(previousTask?.metadata?.provenance?.source_list_ids), listId]),
       ].sort();
       taskObjects.set(taskId, {
         source_type: "task",

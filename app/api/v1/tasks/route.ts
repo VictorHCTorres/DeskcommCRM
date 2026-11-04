@@ -37,13 +37,19 @@ import { registraAtividadeDaTarefa } from "@/lib/tarefas/atividade";
 import { conferirDemanda } from "@/lib/tarefas/demanda";
 import { conferirResponsavel } from "@/lib/tarefas/responsavel";
 import { COLUNAS_DA_TAREFA, gravarTarefa } from "@/lib/tarefas/gravar-tarefa";
+import { origemClickUpDaTarefa } from "@/lib/tarefas/origem-clickup";
 import { PRIORIDADES_DA_TAREFA, SITUACOES_DA_TAREFA, type Tarefa } from "@/lib/tarefas/tipos";
 import { conferirVinculosDaTarefa } from "@/lib/tarefas/vinculos";
 
 export const dynamic = "force-dynamic";
 
 /** As colunas que a tela lê. Explícitas para o `select *` não vazar coluna nova. */
-const COLUNAS = COLUNAS_DA_TAREFA;
+const COLUNAS = `${COLUNAS_DA_TAREFA}, source_metadata`;
+
+function tarefaParaResposta(tarefa: Tarefa): Tarefa {
+  const { source_metadata: sourceMetadata, ...segura } = tarefa;
+  return { ...segura, clickup_origin: origemClickUpDaTarefa(sourceMetadata) };
+}
 
 const criacaoSchema = z.object({
   title: z.string().trim().min(1).max(255),
@@ -81,6 +87,8 @@ const listaSchema = z.object({
    * da sessão e a RLS segura o resto.
    */
   assigned_to: z.union([z.literal("me"), z.literal("ninguem"), z.string().uuid()]).optional(),
+  /** Coleção operacional importada; o id vem do snapshot, nunca do nome. */
+  clickup_list_id: z.string().trim().min(1).max(512).optional(),
 });
 
 export async function GET(req: NextRequest): Promise<Response> {
@@ -109,8 +117,7 @@ export async function GET(req: NextRequest): Promise<Response> {
     .select(COLUNAS)
     .eq("organization_id", authz.org.orgId)
     .order("due_date", { ascending: true, nullsFirst: false })
-    .order("created_at", { ascending: false })
-    .limit(500);
+    .order("created_at", { ascending: false });
 
   if (filtros.status) query = query.eq("status", filtros.status);
   if (filtros.priority) query = query.eq("priority", filtros.priority);
@@ -123,6 +130,12 @@ export async function GET(req: NextRequest): Promise<Response> {
   if (filtros.assigned_to === "me") query = query.eq("assigned_to", authz.user.id);
   else if (filtros.assigned_to === "ninguem") query = query.is("assigned_to", null);
   else if (filtros.assigned_to) query = query.eq("assigned_to", filtros.assigned_to);
+  if (filtros.clickup_list_id) {
+    query = query.eq("source_metadata->clickup->hierarchy->>list_id", filtros.clickup_list_id);
+  }
+  // A maior List conhecida passa ligeiramente de 500 tarefas. Com uma coleção
+  // explícita, a tela alcança a List inteira sem afrouxar o teto geral.
+  query = query.limit(filtros.clickup_list_id ? 1_000 : 500);
 
   const { data, error } = await query;
   if (error) {
@@ -171,7 +184,7 @@ export async function GET(req: NextRequest): Promise<Response> {
       ...((filhas ?? []) as unknown as Tarefa[]),
     ].map((tarefa) => [tarefa.id, tarefa]),
   );
-  return ok({ tasks: [...porId.values()] }, { requestId });
+  return ok({ tasks: [...porId.values()].map(tarefaParaResposta) }, { requestId });
 }
 
 export async function POST(req: NextRequest): Promise<Response> {

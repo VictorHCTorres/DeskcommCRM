@@ -6,6 +6,10 @@ import { audit } from "@/lib/audit";
 import { requireRole } from "@/lib/auth/require-role";
 import { clickupExecuteSchema, clickupRunIdSchema } from "@/lib/clickup/contrato";
 import {
+  clickUpAssetSidecarSatisfiesExecutionGate,
+  clickUpSidecarSatisfiesGate,
+} from "@/lib/clickup/live-sidecar/gate";
+import {
   aggregateClickUpPreviewCoverage,
   clickUpCoverageBlocksExecution,
 } from "@/lib/clickup/presentation/coverage";
@@ -66,6 +70,30 @@ async function loadServerCoverage(
   });
 }
 
+async function completeSidecarGatePasses(
+  db: ReturnType<typeof createAdminClient>,
+  organizationId: string,
+  runId: string,
+) {
+  const [{ data: job, error: jobError }, { data: sidecar, error: sidecarError }] =
+    await Promise.all([
+      db
+        .from("clickup_sidecar_collection_jobs")
+        .select("status,mode,include_private_docs")
+        .eq("organization_id", organizationId)
+        .eq("run_id", runId)
+        .maybeSingle(),
+      db
+        .from("clickup_asset_sidecars")
+        .select("status,mode")
+        .eq("organization_id", organizationId)
+        .eq("run_id", runId)
+        .maybeSingle(),
+    ]);
+  if (jobError || sidecarError) throw new Error("clickup_sidecar_gate_unavailable");
+  return clickUpSidecarSatisfiesGate(job) && clickUpAssetSidecarSatisfiesExecutionGate(sidecar);
+}
+
 export async function POST(request: Request, context: RouteContext): Promise<Response> {
   const denied = await requireSupportWrite();
   if (denied) return denied;
@@ -87,6 +115,14 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
   }
   try {
     const db = createAdminClient();
+    if (!(await completeSidecarGatePasses(db, authz.org.orgId, runId.data))) {
+      return fail(
+        "validation_failed",
+        "A coleta completa de comentários, Docs e anexos precisa terminar sem erros antes da importação.",
+        422,
+        { requestId, details: { blocker: "clickup_complete_sidecar_required" } },
+      );
+    }
     const serverCoverage = await loadServerCoverage(db, authz.org.orgId, runId.data);
     if (clickUpCoverageBlocksExecution(serverCoverage)) {
       return fail(

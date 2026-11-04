@@ -27,7 +27,7 @@ const baseList = {
 describe("contrato CRM da importação ClickUp", () => {
   it("exige decisão explícita para todas as Lists", () => {
     const mapping = clickupCrmMappingConfigSchema.parse({
-      lists: [baseList, { list_id: "list-2", mode: "ignore" }],
+      lists: [baseList, { list_id: "list-2", mode: "crm_tasks", import_subtasks: true }],
     });
     expect(validateEveryListIsMapped(["list-1", "list-2"], mapping)).toEqual({
       ok: true,
@@ -37,6 +37,19 @@ describe("contrato CRM da importação ClickUp", () => {
       ok: false,
       missing: ["list-3"],
     });
+  });
+
+  it("bloqueia perda silenciosa de Lists ou subtarefas", () => {
+    expect(
+      clickupCrmMappingConfigSchema.safeParse({
+        lists: [{ list_id: "list-1", mode: "ignore", import_subtasks: true }],
+      }).success,
+    ).toBe(false);
+    expect(
+      clickupCrmMappingConfigSchema.safeParse({
+        lists: [{ ...baseList, import_subtasks: false }],
+      }).success,
+    ).toBe(false);
   });
 
   it("não infere won/lost e recusa tipo avançado sem text/ignore explícito", () => {

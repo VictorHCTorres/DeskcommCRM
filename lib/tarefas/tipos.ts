@@ -1,3 +1,5 @@
+import type { OrigemClickUpDaTarefa } from "./origem-clickup";
+
 /**
  * TAREFA — o lembrete de trabalho interno com prazo.
  *
@@ -69,6 +71,8 @@ export interface Tarefa {
   start_at?: string | null;
   time_estimate_ms?: number | null;
   source_metadata?: Record<string, unknown>;
+  /** Projeção segura e legível da origem; o envelope cru nunca sai pela API. */
+  clickup_origin?: OrigemClickUpDaTarefa | null;
   /**
    * Derivado (não é coluna): o negócio de `lead_id`, embutido pela rota para a
    * lista de Tarefas dizer DE QUEM é a tarefa sem uma consulta por linha. Nulo

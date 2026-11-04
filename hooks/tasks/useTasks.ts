@@ -9,6 +9,7 @@ import {
   type NovaTarefa,
   type Tarefa,
 } from "@/lib/tarefas/tipos";
+import type { ColecaoClickUpDeTarefas } from "@/lib/tarefas/origem-clickup";
 
 /**
  * As tarefas da organização, com as três mutações que a tela dispara.
@@ -33,6 +34,8 @@ export interface FiltrosDeTarefa {
   aberto?: boolean;
   /** De quem é: `me` (a rota resolve quem é), `ninguem` (sem responsável) ou o id de um membro. Ausente = de todos. */
   assigned_to?: string;
+  /** List original preservada pela importação. */
+  clickup_list_id?: string;
 }
 
 export interface OpcoesDeTarefas {
@@ -63,6 +66,7 @@ export function useTasks(filtros: FiltrosDeTarefa = {}, opcoes: OpcoesDeTarefas 
   if (filtros.demanda_id) params.set("demanda_id", filtros.demanda_id);
   if (filtros.aberto) params.set("aberto", "true");
   if (filtros.assigned_to) params.set("assigned_to", filtros.assigned_to);
+  if (filtros.clickup_list_id) params.set("clickup_list_id", filtros.clickup_list_id);
   const qs = params.toString();
 
   const query = useQuery({
@@ -161,4 +165,18 @@ export function useTasks(filtros: FiltrosDeTarefa = {}, opcoes: OpcoesDeTarefas 
         entrada: { status: proximoEstadoAoAlternar(tarefa.status) },
       }),
   };
+}
+
+export function useClickUpTaskCatalog() {
+  return useQuery({
+    queryKey: ["crm_tasks", "clickup_catalog"],
+    queryFn: async () => {
+      const response = await fetch("/api/v1/tasks/clickup-catalog");
+      return leJson<{ collections: ColecaoClickUpDeTarefas[] }>(
+        response,
+        "Não foi possível carregar as coleções do ClickUp.",
+      );
+    },
+    staleTime: 60_000,
+  });
 }

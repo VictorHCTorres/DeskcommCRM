@@ -37,6 +37,21 @@ type Run = {
 };
 type Connection = { id: string; workspace_id: string; workspace_name: string };
 type Coverage = ClickUpPreviewCoverage;
+type LiveSidecar = {
+  id: string;
+  status:
+    | "queued"
+    | "running"
+    | "finalizing"
+    | "completed"
+    | "completed_with_errors"
+    | "failed"
+    | "cancelled";
+  mode: "inventory" | "full";
+  tasks_expected: number;
+  parents_completed: number;
+  error_code: string | null;
+};
 type StatusMap = { status_id: string; name: string; terminal: "open" | "won" | "lost" };
 type FieldMap = {
   field_id: string;
@@ -204,7 +219,9 @@ export function deriveClickUpCrmLists(manifest: unknown): ListMap[] {
         area_name: String(meta.space_name ?? spaceMeta.name ?? "ClickUp"),
         group_name: String(meta.folder_name ?? folderMeta.name ?? "Sem pasta"),
         pipeline_name: String(meta.name ?? listId),
-        import_subtasks: false,
+        // Falhar para dentro é perda silenciosa: a decisão segura é trazer a
+        // árvore inteira e deixar a pessoa desligar explicitamente se quiser.
+        import_subtasks: true,
         statuses,
         fields,
       };
@@ -220,6 +237,7 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
   const [busy, setBusy] = useState(false);
   const [queued, setQueued] = useState(false);
   const [coverage, setCoverage] = useState<Coverage>();
+  const [sidecar, setSidecar] = useState<LiveSidecar>();
   const [connections, setConnections] = useState<Connection[]>([]);
   const [connectionId, setConnectionId] = useState("");
   const [workspaceId, setWorkspaceId] = useState("");
@@ -234,6 +252,18 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
       })
       .catch(() => setConnections([]));
   }, []);
+  useEffect(() => {
+    const runId = run?.id;
+    const status = sidecar?.status;
+    if (!runId || !status || !["queued", "running", "finalizing"].includes(status)) return;
+    const timer = window.setInterval(() => {
+      void fetch(`/api/v1/clickup/imports/${runId}/live-sidecar`)
+        .then((response) => data<LiveSidecar>(response))
+        .then(setSidecar)
+        .catch(() => undefined);
+    }, 3_000);
+    return () => window.clearInterval(timer);
+  }, [run?.id, sidecar?.status]);
   const updateList = (index: number, patch: Partial<ListMap>) =>
     setLists((current) =>
       current.map((item, itemIndex) => (itemIndex === index ? { ...item, ...patch } : item)),
@@ -302,6 +332,40 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
         await fetch(`/api/v1/clickup/imports/${discoveredRun.id}/preview-coverage`),
       ),
     );
+    await loadSidecarStatus(discoveredRun.id);
+  }
+  async function loadSidecarStatus(runId: string) {
+    const response = await fetch(`/api/v1/clickup/imports/${runId}/live-sidecar`);
+    if (response.status === 404) {
+      setSidecar(undefined);
+      return;
+    }
+    setSidecar(await data<LiveSidecar>(response));
+  }
+  async function startLiveSidecar() {
+    if (!run) return;
+    setBusy(true);
+    setError(undefined);
+    try {
+      await data<{ job_id: string; status: string }>(
+        await fetch(`/api/v1/clickup/imports/${run.id}/live-sidecar`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          // O objetivo desta ação é substituir a origem: omitir Docs privados
+          // produziria uma cópia aparentemente verde, mas incompleta.
+          body: JSON.stringify({ mode: "full", include_private_docs: true }),
+        }),
+      );
+      await loadSidecarStatus(run.id);
+    } catch (cause) {
+      setError(
+        cause instanceof Error
+          ? cause.message
+          : "Falha ao preservar o histórico completo do ClickUp.",
+      );
+    } finally {
+      setBusy(false);
+    }
   }
   async function uploadBundle(file?: File) {
     if (!file) return;
@@ -353,7 +417,12 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
               expected_revision: run.mapping_revision,
               mapping: {
                 objects: [],
-                crm: { lists, create_only: true, multiple_assignees: assignees },
+                crm: {
+                  lists,
+                  create_only: true,
+                  require_complete_sidecar: true,
+                  multiple_assignees: assignees,
+                },
               },
             }),
           }),
@@ -576,6 +645,45 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
                 ))}
             </section>
           ) : null}
+          {run ? (
+            <section
+              className="space-y-2 rounded-md border p-3"
+              aria-labelledby="clickup-acervo-title"
+            >
+              <div>
+                <h3 id="clickup-acervo-title" className="font-medium">
+                  {t("Histórico completo do ClickUp")}
+                </h3>
+                <p className="text-xs text-muted-foreground">
+                  {t(
+                    "Antes da importação, o CRM varre comentários, respostas, Docs e anexos diretamente da origem.",
+                  )}
+                </p>
+              </div>
+              {!sidecar ? (
+                <Button disabled={busy} variant="outline" onClick={() => void startLiveSidecar()}>
+                  {t("Preservar histórico completo")}
+                </Button>
+              ) : (
+                <p className="text-sm" role="status">
+                  {t("Coleta")}: {sidecar.status} · {sidecar.parents_completed}/
+                  {sidecar.tasks_expected} {t("Tasks concluídas")}
+                </p>
+              )}
+              {sidecar &&
+              ["completed_with_errors", "failed", "cancelled"].includes(sidecar.status) ? (
+                <p className="text-sm text-destructive" role="alert">
+                  {t("A importação permanece bloqueada porque o histórico não fechou sem erros.")}
+                  {sidecar.error_code ? ` (${sidecar.error_code})` : ""}
+                </p>
+              ) : null}
+              {sidecar?.status === "completed" ? (
+                <p className="text-sm text-success">
+                  {t("Histórico completo preservado e pronto para a importação.")}
+                </p>
+              ) : null}
+            </section>
+          ) : null}
           {run && !run.mapping_hash ? (
             <>
               <div>
@@ -756,10 +864,15 @@ export function ImportarClickUpCrm({ podeCriarConexao }: { podeCriarConexao: boo
               {t("Validar mapping")}
             </Button>
           ) : (
-            <Button disabled={busy || queued || hasBlockingCoverage} onClick={() => void execute()}>
+            <Button
+              disabled={busy || queued || hasBlockingCoverage || sidecar?.status !== "completed"}
+              onClick={() => void execute()}
+            >
               {coverage?.coverage === "partial"
                 ? t("Importação bloqueada")
-                : t("Confirmar importação")}
+                : sidecar?.status !== "completed"
+                  ? t("Preserve o histórico antes de importar")
+                  : t("Confirmar importação")}
             </Button>
           )}
         </DialogFooter>

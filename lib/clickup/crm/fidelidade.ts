@@ -6,6 +6,41 @@ const array = (value: unknown): unknown[] => (Array.isArray(value) ? value : [])
 const text = (value: unknown): string =>
   typeof value === "string" || typeof value === "number" ? String(value) : "";
 
+export const CLICKUP_TASK_CONTEXT_MAX_BYTES = 96 * 1024;
+export const CLICKUP_TASK_CONTEXT_MAX_ITEMS = 500;
+
+function boundedText(value: unknown, maxLength = 512): string | null {
+  const normalized = text(value).trim();
+  if (!normalized) return null;
+  if (normalized.length > maxLength) throw new Error("clickup_task_context_string_too_large");
+  return normalized;
+}
+
+function boundedArray(value: unknown, key: string): unknown[] {
+  const normalized = array(value);
+  if (normalized.length > CLICKUP_TASK_CONTEXT_MAX_ITEMS) {
+    throw new Error(`clickup_task_context_${key}_too_many`);
+  }
+  return normalized;
+}
+
+function hasOperationalValue(value: unknown): boolean {
+  return (
+    value !== null &&
+    value !== undefined &&
+    value !== "" &&
+    (!Array.isArray(value) || value.length > 0)
+  );
+}
+
+function boundedTaskContext<T>(context: T): T {
+  const serialized = JSON.stringify(context);
+  if (Buffer.byteLength(serialized, "utf8") > CLICKUP_TASK_CONTEXT_MAX_BYTES) {
+    throw new Error("clickup_task_context_too_large");
+  }
+  return context;
+}
+
 export type ClickUpPriority = "urgent" | "high" | "normal" | "low" | null;
 
 export function normalizeClickUpPriority(value: unknown): ClickUpPriority {
@@ -57,26 +92,110 @@ export function normalizeNonNegativeMilliseconds(value: unknown): number | null 
   return parsed;
 }
 
-export function clickUpFidelityMetadata(metadata: JsonRecord) {
-  return {
+export function clickUpFidelityMetadata(
+  metadata: JsonRecord,
+  origin: { workspaceId?: unknown; parentExternalId?: unknown } = {},
+) {
+  const provenance = record(metadata.provenance);
+  const listId = boundedText(metadata.list_id);
+  const explicitSourceListIds = boundedArray(provenance.source_list_ids, "source_lists")
+    .map((value) => boundedText(value))
+    .filter((value): value is string => value !== null);
+  const sourceListIds = explicitSourceListIds.length
+    ? explicitSourceListIds
+    : listId
+      ? [listId]
+      : [];
+  const assignees = boundedArray(metadata.assignees, "assignees").flatMap((candidate) => {
+    const assignee = record(candidate);
+    let sourceUserId = boundedText(assignee.source_user_id);
+    if (!sourceUserId) sourceUserId = boundedText(assignee.id);
+    let displayName = boundedText(assignee.display_name, 255);
+    if (!displayName) displayName = boundedText(assignee.username, 255);
+    const normalized = {
+      source_user_id: sourceUserId,
+      display_name: displayName,
+    };
+    const hasIdentity = [normalized.source_user_id, normalized.display_name].some(Boolean);
+    return hasIdentity ? [normalized] : [];
+  });
+  const nonEmptyCustomFields = array(metadata.custom_fields).filter((candidate) =>
+    hasOperationalValue(record(candidate).value),
+  );
+  const customFields = boundedArray(nonEmptyCustomFields, "custom_fields").map((candidate) => {
+    const field = record(candidate);
+    return {
+      id: boundedText(field.id),
+      name: boundedText(field.name, 255),
+      type: boundedText(field.type, 80),
+      value: field.value,
+      selected_options: boundedArray(field.selected_options, "custom_field_options").map(
+        (candidateOption) => {
+          const option = record(candidateOption);
+          return { id: boundedText(option.id), label: boundedText(option.label, 255) };
+        },
+      ),
+    };
+  });
+  const linkedTasks = boundedArray(metadata.linked_tasks, "linked_tasks").map((candidate) => {
+    const relation = record(candidate);
+    return {
+      task_id: boundedText(relation.task_id),
+      link_id: boundedText(relation.link_id),
+      date_created: epochMillisecondsToIso(relation.date_created),
+    };
+  });
+  const dependencies = boundedArray(metadata.dependencies, "dependencies").map((candidate) => {
+    const dependency = record(candidate);
+    return {
+      task_id: boundedText(dependency.task_id),
+      depends_on: boundedText(dependency.depends_on),
+    };
+  });
+  return boundedTaskContext({
+    schema_version: 1,
+    hierarchy: {
+      workspace_id: boundedText(origin.workspaceId ?? metadata.workspace_id, 255),
+      space_id: boundedText(metadata.space_id),
+      space_name: boundedText(metadata.space_name, 255),
+      folder_id: boundedText(metadata.folder_id),
+      folder_name: boundedText(metadata.folder_name, 255),
+      list_id: listId,
+      list_name: boundedText(metadata.list_name, 255),
+      source_list_ids: sourceListIds,
+      multiple_lists: provenance.multiple_lists === true || sourceListIds.length > 1,
+    },
+    status: {
+      id: boundedText(metadata.status_id),
+      name: boundedText(metadata.status_name, 255),
+      type: boundedText(metadata.status_type, 80),
+    },
+    assignees,
+    custom_fields: customFields,
+    parent_external_id: boundedText(origin.parentExternalId ?? metadata.parent_id),
     priority: normalizeClickUpPriority(metadata.priority),
     tags: normalizeClickUpTags(metadata.tags),
     start_at: epochMillisecondsToIso(metadata.start_date),
+    due_at: epochMillisecondsToIso(metadata.due_date),
+    done_at: epochMillisecondsToIso(metadata.date_done),
+    closed_at: epochMillisecondsToIso(metadata.date_closed),
     time_estimate_ms: normalizeNonNegativeMilliseconds(metadata.time_estimate),
     time_spent_ms: normalizeNonNegativeMilliseconds(metadata.time_spent),
-    watcher_ids: array(metadata.watcher_ids).map(text).filter(Boolean),
+    watcher_ids: boundedArray(metadata.watcher_ids, "watchers").map(text).filter(Boolean),
     watcher_count: Number(metadata.watcher_count ?? array(metadata.watcher_ids).length),
     archived: metadata.archived === true,
-    url: text(metadata.url) || null,
+    url: boundedText(metadata.url, 2_048),
     source_created_at: epochMillisecondsToIso(metadata.source_created_at ?? metadata.date_created),
     source_updated_at: epochMillisecondsToIso(metadata.source_updated_at ?? metadata.date_updated),
-    orderindex: text(metadata.orderindex) || null,
-    locations: array(metadata.locations),
-    archive_scope: text(metadata.archive_scope) || "unknown",
-    provenance: record(metadata.provenance),
-    warnings: array(metadata.fidelity_warnings),
-    checklists: array(metadata.checklists),
-  };
+    orderindex: boundedText(metadata.orderindex),
+    locations: boundedArray(metadata.locations, "locations"),
+    linked_tasks: linkedTasks,
+    dependencies,
+    archive_scope: boundedText(metadata.archive_scope, 80) ?? "unknown",
+    provenance,
+    warnings: boundedArray(metadata.fidelity_warnings, "warnings"),
+    checklists: boundedArray(metadata.checklists, "checklists"),
+  });
 }
 
 export type ClickUpRelation = {

@@ -67,7 +67,7 @@ describe("aplicação CRM do ClickUp", () => {
           dry_run: true,
           mapping_config: {
             crm: {
-              lists: [{ list_id: "list-1", mode: "ignore" }],
+              lists: [{ list_id: "list-1", mode: "crm_tasks", import_subtasks: true }],
             },
           },
         },
@@ -79,7 +79,9 @@ describe("aplicação CRM do ClickUp", () => {
         db,
         {
           dry_run: true,
-          mapping_config: { crm: { lists: [{ list_id: "list-1", mode: "ignore" }] } },
+          mapping_config: {
+            crm: { lists: [{ list_id: "list-1", mode: "crm_tasks", import_subtasks: true }] },
+          },
         },
         {
           entity_type: "task_relation",
@@ -251,5 +253,106 @@ describe("aplicação CRM do ClickUp", () => {
     expect(first.get("membro@example.com")).toBe("user-1");
     expect(second).toBe(first);
     expect(authLoads).toBe(1);
+  });
+
+  it("grava em crm_tasks o contexto ClickUp bounded e sem e-mail de assignee", async () => {
+    const writes: { task?: Record<string, unknown> } = {};
+    const db = {
+      from(table: string) {
+        const query = {
+          select() {
+            return query;
+          },
+          eq() {
+            return query;
+          },
+          is() {
+            return query;
+          },
+          async not() {
+            return { data: [{ user_id: "resolved-user-1" }], error: null };
+          },
+          async maybeSingle() {
+            return { data: null, error: null };
+          },
+          async upsert(value: Record<string, unknown>) {
+            if (table === "crm_tasks") writes.task = value;
+            return { error: null };
+          },
+        };
+        return query;
+      },
+      auth: {
+        admin: {
+          async listUsers() {
+            return {
+              data: { users: [{ id: "resolved-user-1", email: "privado@example.com" }] },
+              error: null,
+            };
+          },
+        },
+      },
+    } as unknown as SupabaseClient;
+    await expect(
+      applyClickUpCrmItem(
+        db,
+        {
+          id: "run-1",
+          organization_id: "org-1",
+          connection_id: "connection-1",
+          workspace_id: "workspace-1",
+          mapping_revision: 1,
+          dry_run: false,
+          mapping_config: {
+            crm: {
+              lists: [{ list_id: "list-1", mode: "crm_tasks", import_subtasks: true }],
+            },
+          },
+        },
+        {
+          entity_type: "task",
+          external_id: "task-1",
+          parent_external_id: "list-1",
+          source_hash: "a".repeat(64),
+          source_metadata: {
+            list_id: "list-1",
+            list_name: "Operação",
+            status_id: "doing",
+            status_name: "Executando",
+            status_type: "custom",
+            assignees: [
+              {
+                email: "privado@example.com",
+                source_user_id: "user-1",
+                display_name: "Operador",
+              },
+            ],
+            custom_fields: [{ id: "field-1", name: "Origem", type: "text", value: "valor" }],
+            linked_tasks: [{ task_id: "task-1", link_id: "task-2" }],
+          },
+        },
+      ),
+    ).resolves.toBe("succeeded");
+    const sourceMetadata = writes.task?.source_metadata as Record<string, unknown>;
+    expect(writes.task).toMatchObject({ parent_task_id: null });
+    expect(sourceMetadata).toMatchObject({
+      clickup_import_run_id: "run-1",
+      clickup: {
+        hierarchy: { workspace_id: "workspace-1", list_id: "list-1" },
+        status: { id: "doing", name: "Executando", type: "custom" },
+        assignees: [{ source_user_id: "user-1", display_name: "Operador" }],
+        custom_fields: [
+          {
+            id: "field-1",
+            name: "Origem",
+            type: "text",
+            value: "valor",
+            selected_options: [],
+          },
+        ],
+        linked_tasks: [{ task_id: "task-1", link_id: "task-2" }],
+      },
+    });
+    expect(JSON.stringify(sourceMetadata)).not.toContain("privado@example.com");
   });
 });

@@ -86,7 +86,9 @@ export function aggregateClickUpPreviewCoverage(input: {
       : []),
     ...(locations ? [{ code: "unsupported_locations", blocking: true, count: locations }] : []),
     ...(archived ? [{ code: "unsupported_archived_tasks", blocking: true, count: archived }] : []),
-    ...(timeSpent ? [{ code: "unsupported_time_spent", blocking: true, count: timeSpent }] : []),
+    ...(timeSpent
+      ? [{ code: "time_spent_preserved_as_provenance", blocking: false, count: timeSpent }]
+      : []),
   ];
   return {
     archive_scope: archiveScope,
@@ -129,7 +131,7 @@ export function aggregateClickUpPreviewCoverage(input: {
       { key: "dependencies", classification: "unsupported", present: dependencies },
       { key: "locations", classification: "unsupported", present: locations },
       { key: "archived", classification: "unsupported", present: archived },
-      { key: "time_spent", classification: "unsupported", present: timeSpent },
+      { key: "time_spent", classification: "provenance", present: timeSpent },
     ],
     assignees: { assignments, resolved, unresolved: assignments - resolved },
     warnings,
