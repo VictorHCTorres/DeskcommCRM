@@ -96,7 +96,7 @@ export const clickupCrmListMappingSchema = z
     area_name: z.string().trim().min(1).max(120).optional(),
     group_name: z.string().trim().min(1).max(120).optional(),
     pipeline_name: z.string().trim().min(1).max(120).optional(),
-    import_subtasks: z.boolean().default(false),
+    import_subtasks: z.literal(true).default(true),
     statuses: z.array(statusMappingSchema).max(100).default([]),
     fields: z.array(fieldMappingSchema).max(200).default([]),
   })
@@ -146,6 +146,8 @@ export const clickupCrmMappingConfigSchema = z
   .object({
     lists: z.array(clickupCrmListMappingSchema).max(500),
     create_only: z.literal(true).default(true),
+    /** Quando ligado, a API não confia apenas no botão: exige coleta live completa. */
+    require_complete_sidecar: z.literal(true).default(true),
     /** O CRM tem um único owner: múltiplos responsáveis nunca são inferidos. */
     multiple_assignees: z.enum(["first", "unassigned"]).default("unassigned"),
   })
@@ -153,6 +155,15 @@ export const clickupCrmMappingConfigSchema = z
   .superRefine((mapping, context) => {
     if (new Set(mapping.lists.map((list) => list.list_id)).size !== mapping.lists.length) {
       context.addIssue({ code: "custom", path: ["lists"], message: "List duplicada no mapping." });
+    }
+    for (const [index, list] of mapping.lists.entries()) {
+      if (list.mode === "ignore") {
+        context.addIssue({
+          code: "custom",
+          path: ["lists", index, "mode"],
+          message: "A migração completa não permite ignorar Lists do ClickUp.",
+        });
+      }
     }
     const fieldsByPipeline = new Map<string, Set<string>>();
     const statusesByPipeline = new Map<string, string>();

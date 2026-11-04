@@ -14,7 +14,7 @@ import { useUser } from "@/hooks/auth/AuthProvider";
 import { useT } from "@/hooks/i18n/useT";
 import { ArrowsClockwise, CalendarBlank, ListChecks, Plus } from "@/lib/ui/icons";
 import { cn } from "@/lib/utils";
-import { useTasks } from "@/hooks/tasks/useTasks";
+import { useClickUpTaskCatalog, useTasks } from "@/hooks/tasks/useTasks";
 import { useAssignableMembers } from "@/hooks/inbox/useAssignableMembers";
 import { responsavelDoFiltro, type FiltroDeResponsavel } from "@/lib/tarefas/filtro-de-responsavel";
 import type {
@@ -46,6 +46,7 @@ export function TarefasClient({
   const [responsavel, setResponsavel] = useState<FiltroDeResponsavel>(
     minhasDeInicio ? "eu" : "todos",
   );
+  const [colecaoClickUp, setColecaoClickUp] = useState("todas");
   // `/team/assignable` exige agent: o viewer tomaria 403 (e um authz.denied no
   // audit) a cada visita. Ele fica com Todos, Minhas e Sem responsável.
   const { data: membros } = useAssignableMembers(podeEditar);
@@ -77,7 +78,9 @@ export function TarefasClient({
   } = useTasks({
     ...(situacao === "aberto" ? { aberto: true } : { status: situacao }),
     assigned_to: responsavelDoFiltro(responsavel),
+    ...(colecaoClickUp === "todas" ? {} : { clickup_list_id: colecaoClickUp }),
   });
+  const catalogoClickUp = useClickUpTaskCatalog();
 
   function abrirNova(dia?: string) {
     tarefaCriadaPendente.current = null;
@@ -138,6 +141,24 @@ export function TarefasClient({
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
+          {(catalogoClickUp.data?.collections?.length ?? 0) > 0 ? (
+            <Select value={colecaoClickUp} onValueChange={setColecaoClickUp}>
+              <SelectTrigger
+                aria-label={t("Coleção importada do ClickUp")}
+                className="h-11 w-[240px] text-xs lg:h-9"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="todas">{t("Todas as tarefas")}</SelectItem>
+                {catalogoClickUp.data?.collections?.map((collection) => (
+                  <SelectItem key={collection.list_id} value={collection.list_id}>
+                    {collection.space_name} · {collection.list_name} ({collection.tasks})
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          ) : null}
           <Select value={situacao} onValueChange={(v) => setSituacao(v as FiltroDeSituacao)}>
             <SelectTrigger className="h-11 w-[168px] text-xs lg:h-9">
               <SelectValue />

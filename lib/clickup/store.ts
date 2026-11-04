@@ -690,3 +690,96 @@ export async function finishClickUpAsset(
   if (error) throwDb(error, "Não foi possível concluir o anexo ClickUp.");
   return data === true;
 }
+
+export async function startClickUpLiveSidecar(
+  db: Db,
+  input: {
+    organizationId: string;
+    runId: string;
+    mode: "inventory" | "full";
+    includePrivateDocs: boolean;
+    userId: string;
+  },
+) {
+  const { data, error } = await db.rpc("fn_start_clickup_live_sidecar", {
+    p_organization_id: input.organizationId,
+    p_run_id: input.runId,
+    p_mode: input.mode,
+    p_include_private_docs: input.includePrivateDocs,
+    p_created_by: input.userId,
+  });
+  if (error || typeof data !== "string")
+    throwDb(error, "Não foi possível iniciar a coleta ClickUp.");
+  return data;
+}
+
+export async function seedClickUpLiveDocPages(
+  db: Db,
+  input: {
+    organizationId: string;
+    parentId: string;
+    claimToken: string;
+    pages: Array<{ doc_id: string; page_id: string }>;
+  },
+) {
+  const { data, error } = await db.rpc("fn_seed_clickup_live_doc_pages", {
+    p_organization_id: input.organizationId,
+    p_parent_id: input.parentId,
+    p_claim_token: input.claimToken,
+    p_pages: input.pages,
+  });
+  if (error) throwDb(error, "Não foi possível registrar as páginas dos Docs ClickUp.");
+  return Number(data ?? 0);
+}
+
+export async function claimClickUpLiveSidecarParent(db: Db, workerId: string) {
+  const { data, error } = await db.rpc("fn_claim_clickup_live_sidecar_parent", {
+    p_worker_id: workerId,
+    p_lease_seconds: 300,
+  });
+  if (error) throwDb(error, "Não foi possível reivindicar a coleta ClickUp.");
+  const row = Array.isArray(data) ? data[0] : data;
+  if (!row || typeof row !== "object" || !(row as Record<string, unknown>).parent) return null;
+  return row as { job: Record<string, unknown>; parent: Record<string, unknown> };
+}
+
+export async function finishClickUpLiveSidecarParent(
+  db: Db,
+  input: {
+    organizationId: string;
+    parentId: string;
+    claimToken: string;
+    outcome: "completed" | "retry_wait" | "failed" | "cancelled";
+    result?: Record<string, unknown>;
+    retryAt?: string;
+    errorCode?: string;
+    errorMessage?: string;
+  },
+) {
+  const { data, error } = await db.rpc("fn_finish_clickup_live_sidecar_parent", {
+    p_organization_id: input.organizationId,
+    p_parent_id: input.parentId,
+    p_claim_token: input.claimToken,
+    p_outcome: input.outcome,
+    p_result: input.result ?? null,
+    p_retry_at: input.retryAt ?? null,
+    p_error_code: input.errorCode ?? null,
+    p_error_message: input.errorMessage ?? null,
+  });
+  if (error) throwDb(error, "Não foi possível concluir a coleta ClickUp.");
+  return data === true;
+}
+
+export async function heartbeatClickUpLiveSidecarParent(
+  db: Db,
+  input: { organizationId: string; parentId: string; claimToken: string },
+) {
+  const { data, error } = await db.rpc("fn_heartbeat_clickup_live_sidecar_parent", {
+    p_organization_id: input.organizationId,
+    p_parent_id: input.parentId,
+    p_claim_token: input.claimToken,
+    p_lease_seconds: 300,
+  });
+  if (error) throwDb(error, "Não foi possível renovar a coleta ClickUp.");
+  return data === true;
+}

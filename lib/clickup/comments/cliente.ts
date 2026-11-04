@@ -27,6 +27,7 @@ export class ClienteDeComentariosClickUp {
       token: string;
       fetchImpl?: typeof fetch;
       dormir?: (ms: number) => Promise<void>;
+      deadlineAt?: number;
     },
   ) {
     if (!input.token.trim()) throw new Error("clickup_token_missing");
@@ -36,15 +37,23 @@ export class ClienteDeComentariosClickUp {
     const fetchImpl = this.input.fetchImpl ?? fetch;
     const dormir = this.input.dormir ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     for (let tentativa = 0; tentativa < 4; tentativa += 1) {
+      const timeout = this.input.deadlineAt
+        ? Math.min(20_000, this.input.deadlineAt - Date.now())
+        : 20_000;
+      if (timeout <= 0) throw new Error("clickup_live_deadline");
       const resposta = await fetchImpl(`${API_V2}${path}`, {
         headers: { Authorization: this.input.token, Accept: "application/json" },
         redirect: "error",
-        signal: AbortSignal.timeout(20_000),
+        signal: AbortSignal.timeout(timeout),
       });
       if (resposta.ok) return resposta.json();
       if ((resposta.status === 429 || resposta.status >= 500) && tentativa < 3) {
         const retryAfter = Number(resposta.headers.get("retry-after") ?? 0);
-        await dormir(retryAfter > 0 ? retryAfter * 1_000 : 250 * 2 ** tentativa);
+        const espera = retryAfter > 0 ? Math.min(retryAfter * 1_000, 5_000) : 250 * 2 ** tentativa;
+        if (this.input.deadlineAt && Date.now() + espera >= this.input.deadlineAt) {
+          throw new Error("clickup_live_deadline");
+        }
+        await dormir(espera);
         continue;
       }
       throw new Error(`clickup_comments_http_${resposta.status}`);
@@ -91,6 +100,7 @@ export class ClienteDeComentariosClickUp {
       const parentId = texto(bruto.id ?? bruto.comment_id);
       const resposta = registro(await this.json(`/comment/${encodeURIComponent(parentId)}/reply`));
       const replies = lista(resposta.comments ?? resposta.replies);
+      if (replies.length !== replyCount) throw new Error("clickup_replies_incomplete");
       repliesCount += replies.length;
       comments.push(
         ...replies.map((raw) =>

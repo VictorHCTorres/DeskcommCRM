@@ -142,12 +142,31 @@ function farejarMime(bytes: Uint8Array): string | null {
   if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
     return "image/jpeg";
   }
+  if (bytes.length >= 6 && ["GIF87a", "GIF89a"].includes(Buffer.from(bytes.subarray(0, 6)).toString("ascii"))) {
+    return "image/gif";
+  }
+  if (
+    bytes.length >= 12 &&
+    Buffer.from(bytes.subarray(0, 4)).toString("ascii") === "RIFF" &&
+    Buffer.from(bytes.subarray(8, 12)).toString("ascii") === "WEBP"
+  ) {
+    return "image/webp";
+  }
   const amostra = Buffer.from(bytes.subarray(0, Math.min(bytes.length, 8_192)));
   if (!amostra.includes(0) && amostra.toString("utf8").includes("�") === false) return "text/plain";
   return null;
 }
 
-const MIME_PERMITIDO = new Set(["application/pdf", "text/plain", "text/markdown", "text/csv"]);
+const MIME_PERMITIDO = new Set([
+  "application/pdf",
+  "text/plain",
+  "text/markdown",
+  "text/csv",
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+]);
 
 export interface AnexoBaixado {
   bytes: Buffer;

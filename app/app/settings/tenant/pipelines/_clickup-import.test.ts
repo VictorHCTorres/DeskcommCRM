@@ -52,6 +52,7 @@ describe("editor de mapping ClickUp CRM", () => {
       area_name: "Comercial",
       group_name: "Inbound",
       pipeline_name: "Vendas",
+      import_subtasks: true,
       statuses: [{ status_id: "st1", terminal: "open" }],
       fields: [
         {

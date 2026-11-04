@@ -30,6 +30,7 @@ interface ClienteOpcoes {
   workspaceId: string;
   fetchImpl?: typeof fetch;
   dormir?: (ms: number) => Promise<void>;
+  deadlineAt?: number;
 }
 
 function registro(valor: unknown): Record<string, unknown> {
@@ -117,15 +118,23 @@ export class ClickUpDocsV3Client {
   private async json(path: string): Promise<unknown> {
     const url = `https://api.clickup.com/api/v3${path}`;
     for (let tentativa = 0; tentativa < 4; tentativa += 1) {
+      const timeout = this.opcoes.deadlineAt
+        ? Math.min(20_000, this.opcoes.deadlineAt - Date.now())
+        : 20_000;
+      if (timeout <= 0) throw new Error("clickup_live_deadline");
       const resposta = await this.fetchImpl(url, {
         headers: { Authorization: this.opcoes.token, Accept: "application/json" },
         cache: "no-store",
-        signal: AbortSignal.timeout(20_000),
+        signal: AbortSignal.timeout(timeout),
       });
       if (resposta.ok) return resposta.json();
       if ((resposta.status === 429 || resposta.status >= 500) && tentativa < 3) {
         const retryAfter = Number(resposta.headers.get("retry-after") ?? 0);
-        await this.dormir(retryAfter > 0 ? retryAfter * 1_000 : 250 * 2 ** tentativa);
+        const espera = retryAfter > 0 ? Math.min(retryAfter * 1_000, 5_000) : 250 * 2 ** tentativa;
+        if (this.opcoes.deadlineAt && Date.now() + espera >= this.opcoes.deadlineAt) {
+          throw new Error("clickup_live_deadline");
+        }
+        await this.dormir(espera);
         continue;
       }
       throw new Error(`clickup_v3_http_${resposta.status}`);
@@ -209,6 +218,18 @@ export class ClickUpDocsV3Client {
       ),
       warnings: warnings.sort((a, b) => a.path.localeCompare(b.path)),
     };
+  }
+
+  async listarPaginas(docId: string): Promise<string[]> {
+    const base = `/workspaces/${encodeURIComponent(this.opcoes.workspaceId)}/docs/${encodeURIComponent(docId)}/pages`;
+    const estrutura = await this.json(`${base}?max_page_depth=-1&content_format=text%2Fmd`);
+    return [
+      ...new Set(
+        paginasDaResposta(estrutura)
+          .map((page) => texto(page.id ?? page.page_id))
+          .filter(Boolean),
+      ),
+    ].sort();
   }
 }
 

@@ -1429,6 +1429,7 @@ export const AUDIT_ACTIONS = [
   "clickup.import_queued",
   "clickup.import_retried",
   "clickup.import_cancelled",
+  "clickup.live_sidecar_started",
   "clickup.asset_upload_prepared",
   "clickup.assets_staged",
 ] as const;

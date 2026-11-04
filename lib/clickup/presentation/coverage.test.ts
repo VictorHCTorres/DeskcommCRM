@@ -35,18 +35,23 @@ describe("coverage segura do preview ClickUp", () => {
     expect(JSON.stringify(coverage)).not.toContain("watcher-secret");
   });
 
-  it("bloqueia campos futuros que seriam descartados silenciosamente", () => {
+  it("bloqueia campos descartados, mas aceita time_spent preservado como proveniência", () => {
     const coverage = aggregateClickUpPreviewCoverage({
       taskMetadata: [{ dependencies: [{}], locations: [{}], archived: true, time_spent_ms: 10 }],
     });
     expect(
       coverage.warnings.filter((warning) => warning.blocking).map((warning) => warning.code),
-    ).toEqual([
-      "unsupported_dependencies",
-      "unsupported_locations",
-      "unsupported_archived_tasks",
-      "unsupported_time_spent",
-    ]);
+    ).toEqual(["unsupported_dependencies", "unsupported_locations", "unsupported_archived_tasks"]);
+    expect(coverage.warnings).toContainEqual({
+      code: "time_spent_preserved_as_provenance",
+      blocking: false,
+      count: 1,
+    });
+    expect(coverage.dimensions.find((dimension) => dimension.key === "time_spent")).toEqual({
+      key: "time_spent",
+      classification: "provenance",
+      present: 1,
+    });
   });
 
   it("conta relações staged e reconhece varredura ativa e arquivada como completa", () => {
@@ -61,7 +66,10 @@ describe("coverage segura do preview ClickUp", () => {
   });
 
   it("o gate do servidor recusa cobertura parcial e qualquer blocker unsupported", () => {
-    const partial = aggregateClickUpPreviewCoverage({ taskMetadata: [], archiveScope: "active_only" });
+    const partial = aggregateClickUpPreviewCoverage({
+      taskMetadata: [],
+      archiveScope: "active_only",
+    });
     const unsupported = aggregateClickUpPreviewCoverage({
       taskMetadata: [{ locations: [{}] }],
       archiveScope: "active_and_archived",

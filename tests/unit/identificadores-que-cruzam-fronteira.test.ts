@@ -27,7 +27,11 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { ALFABETO_DO_NOME_NO_STORAGE } from "@/lib/ai/skills/package";
-import { TETO_NOME_DE_SESSAO_WAHA, nomeCurtoDaSessao, nomeDaSessaoNovo } from "@/lib/channels/nome-da-sessao";
+import {
+  TETO_NOME_DE_SESSAO_WAHA,
+  nomeCurtoDaSessao,
+  nomeDaSessaoNovo,
+} from "@/lib/channels/nome-da-sessao";
 import { randomId } from "@/lib/random-id";
 import { nomeDaSessaoDeVoz } from "@/lib/wacalls/nome-da-sessao";
 
@@ -180,7 +184,10 @@ const SITES: { arquivo: string; fronteira: string; papel?: "gerador" | "validado
   // aqui (`${orgId}/templates/${templateId}/uuid.jpg|png`) — a forma é a mesma do
   // registro acima: UUID v4 de alfabeto ASCII + `.jpg`/`.png` conhecido pela
   // ASSINATURA dos bytes, nunca pelo content-type que o cliente diz.
-  { arquivo: "app/api/v1/message-templates/[id]/midias/route.ts", fronteira: "storage.chave-de-objeto" },
+  {
+    arquivo: "app/api/v1/message-templates/[id]/midias/route.ts",
+    fronteira: "storage.chave-de-objeto",
+  },
   { arquivo: "app/api/v1/cron/contact-avatars/route.ts", fronteira: "storage.chave-de-objeto" },
   // #3635: o upload do cabeçalho saiu da rota do parceiro para `lib/` quando o
   // canal oficial direto passou a gerenciar modelo pela tela — a lógica é a
@@ -197,10 +204,16 @@ const SITES: { arquivo: string; fronteira: string; papel?: "gerador" | "validado
   { arquivo: "app/api/v1/conversations/[id]/media/route.ts", fronteira: "storage.chave-de-objeto" },
   // O anexo da nota interna (#1863, F3): MESMO molde de chave da rota irmã
   // (`{org}/{conversa}/note-{uuid}.{ext}`), bucket próprio `internal-media`.
-  { arquivo: "app/api/v1/conversations/[id]/notes/media/route.ts", fronteira: "storage.chave-de-objeto" },
+  {
+    arquivo: "app/api/v1/conversations/[id]/notes/media/route.ts",
+    fronteira: "storage.chave-de-objeto",
+  },
   // O anexo de lead (#2829): anexo em campo customizado do lead, bucket `internal-media`.
   { arquivo: "app/api/v1/leads/[id]/attachments/route.ts", fronteira: "storage.chave-de-objeto" },
-  { arquivo: "app/api/v1/ai/knowledge/sources/upload/route.ts", fronteira: "storage.chave-de-objeto" },
+  {
+    arquivo: "app/api/v1/ai/knowledge/sources/upload/route.ts",
+    fronteira: "storage.chave-de-objeto",
+  },
   { arquivo: "app/api/v1/ai/knowledge/sources/route.ts", fronteira: "storage.chave-de-objeto" },
   // O PDF da proposta comercial (#1832): `<org>/<proposta>.pdf`, dois uuids.
   { arquivo: "lib/propostas/storage.ts", fronteira: "storage.chave-de-objeto" },
@@ -216,14 +229,41 @@ const SITES: { arquivo: string; fronteira: string; papel?: "gerador" | "validado
   // Documentos ClickUp: a porta recebe o caminho validado pelo contrato de importação
   // e só o entrega ao Storage com `upsert: false`.
   { arquivo: "lib/clickup/docs/porta-supabase.ts", fronteira: "storage.chave-de-objeto" },
+  // Coleta live ClickUp: a quarantine usa somente UUIDs internos e o hash SHA-256
+  // farejado dos bytes; nome e URL da origem nunca compõem a chave persistida.
+  { arquivo: "lib/clickup/live-sidecar/worker.ts", fronteira: "storage.chave-de-objeto" },
   // Chave de idempotência: os geradores (manda UUID) e os validadores (exige UUID).
-  { arquivo: "app/onboarding/connect-whatsapp/_client.tsx", fronteira: "api.idempotency-key", papel: "gerador" },
-  { arquivo: "components/extensions/ExtensionsManager.tsx", fronteira: "api.idempotency-key", papel: "gerador" },
-  { arquivo: "components/modulos/ModulosManager.tsx", fronteira: "api.idempotency-key", papel: "gerador" },
+  {
+    arquivo: "app/onboarding/connect-whatsapp/_client.tsx",
+    fronteira: "api.idempotency-key",
+    papel: "gerador",
+  },
+  {
+    arquivo: "components/extensions/ExtensionsManager.tsx",
+    fronteira: "api.idempotency-key",
+    papel: "gerador",
+  },
+  {
+    arquivo: "components/modulos/ModulosManager.tsx",
+    fronteira: "api.idempotency-key",
+    papel: "gerador",
+  },
   { arquivo: "hooks/ai/useSkills.ts", fronteira: "api.idempotency-key", papel: "gerador" },
-  { arquivo: "hooks/contacts/useImportContacts.ts", fronteira: "api.idempotency-key", papel: "gerador" },
-  { arquivo: "hooks/contacts/useSyncPhoneContacts.ts", fronteira: "api.idempotency-key", papel: "gerador" },
-  { arquivo: "hooks/clickup/useClickUpDocsImport.ts", fronteira: "api.idempotency-key", papel: "gerador" },
+  {
+    arquivo: "hooks/contacts/useImportContacts.ts",
+    fronteira: "api.idempotency-key",
+    papel: "gerador",
+  },
+  {
+    arquivo: "hooks/contacts/useSyncPhoneContacts.ts",
+    fronteira: "api.idempotency-key",
+    papel: "gerador",
+  },
+  {
+    arquivo: "hooks/clickup/useClickUpDocsImport.ts",
+    fronteira: "api.idempotency-key",
+    papel: "gerador",
+  },
   {
     arquivo: "app/app/settings/tenant/pipelines/_clickup-import.tsx",
     fronteira: "api.idempotency-key",
@@ -232,10 +272,26 @@ const SITES: { arquivo: string; fronteira: string; papel?: "gerador" | "validado
   { arquivo: "lib/api/client.ts", fronteira: "api.idempotency-key", papel: "gerador" },
   { arquivo: "lib/api/idempotency.ts", fronteira: "api.idempotency-key", papel: "validador" },
   { arquivo: "lib/extensions/http.ts", fronteira: "api.idempotency-key", papel: "validador" },
-  { arquivo: "app/api/v1/admin/tenants/route.ts", fronteira: "api.idempotency-key", papel: "validador" },
-  { arquivo: "app/api/v1/channel-sessions/route.ts", fronteira: "api.idempotency-key", papel: "validador" },
-  { arquivo: "app/api/v1/lgpd/requests/[id]/approve/route.ts", fronteira: "api.idempotency-key", papel: "validador" },
-  { arquivo: "app/api/v1/onboarding/whatsapp/session/route.ts", fronteira: "api.idempotency-key", papel: "validador" },
+  {
+    arquivo: "app/api/v1/admin/tenants/route.ts",
+    fronteira: "api.idempotency-key",
+    papel: "validador",
+  },
+  {
+    arquivo: "app/api/v1/channel-sessions/route.ts",
+    fronteira: "api.idempotency-key",
+    papel: "validador",
+  },
+  {
+    arquivo: "app/api/v1/lgpd/requests/[id]/approve/route.ts",
+    fronteira: "api.idempotency-key",
+    papel: "validador",
+  },
+  {
+    arquivo: "app/api/v1/onboarding/whatsapp/session/route.ts",
+    fronteira: "api.idempotency-key",
+    papel: "validador",
+  },
 ];
 
 describe("todo identificador que cruza fronteira cabe no que o terceiro aceita", () => {
@@ -253,10 +309,15 @@ describe("todo identificador que cruza fronteira cabe no que o terceiro aceita",
       expect(valores.length, `${f.id}: nada medido`).toBeGreaterThan(0);
       for (const v of valores) {
         if (f.teto !== null) {
-          expect(v.length, `${f.id}: ${JSON.stringify(v)} tem ${v.length}, teto ${f.teto}`).toBeLessThanOrEqual(f.teto);
+          expect(
+            v.length,
+            `${f.id}: ${JSON.stringify(v)} tem ${v.length}, teto ${f.teto}`,
+          ).toBeLessThanOrEqual(f.teto);
         }
         if (f.forma) {
-          expect(v, `${f.id}: ${JSON.stringify(v)} fora da forma que o terceiro aceita`).toMatch(f.forma as RegExp);
+          expect(v, `${f.id}: ${JSON.stringify(v)} fora da forma que o terceiro aceita`).toMatch(
+            f.forma as RegExp,
+          );
         }
       }
     });
@@ -273,7 +334,10 @@ describe("todo identificador que cruza fronteira cabe no que o terceiro aceita",
   it("o teste de banco e o teste de tela conferem a forma, pela mesma fonte", () => {
     // #686: o invariante media estabilidade; o e2e inseria `prego_` à mão e
     // passava ao lado do gerador. Os dois agora citam a validação.
-    const invariante = readFileSync(join(RAIZ, "tests", "invariants", "pre-go-live-reservation.test.ts"), "utf8");
+    const invariante = readFileSync(
+      join(RAIZ, "tests", "invariants", "pre-go-live-reservation.test.ts"),
+      "utf8",
+    );
     expect(invariante).toContain("TETO_NOME_DE_SESSAO_WAHA");
     expect(invariante).toMatch(/waha_session_name\.length\)\.toBeLessThanOrEqual/);
     const e2e = readFileSync(join(RAIZ, "tests", "e2e", "pre-go-live-whatsapp.spec.ts"), "utf8");
@@ -306,7 +370,9 @@ describe("todo identificador que cruza fronteira cabe no que o terceiro aceita",
     // O id da entrega (X-Webhook-Delivery) é uuid v5 de um namespace fixo:
     // trocar o namespace muda o id de entrega de evento já entregue.
     expect(FONTE_DO_WEBHOOK).toMatch(/const entrega = idDaEntrega\(/);
-    expect(FONTE_DO_WEBHOOK).toContain('const NAMESPACE_DA_ENTREGA = "ce410f0a-ca5e-4a06-89a0-bfe57222d74f"');
+    expect(FONTE_DO_WEBHOOK).toContain(
+      'const NAMESPACE_DA_ENTREGA = "ce410f0a-ca5e-4a06-89a0-bfe57222d74f"',
+    );
     expect("ce410f0a-ca5e-4a06-89a0-bfe57222d74f").toHaveLength(36);
   });
 
@@ -353,10 +419,14 @@ describe("a varredura é de classe: site novo de fronteira reprova", () => {
     (arquivo) => {
       const raiz = mkdtempSync(join(tmpdir(), "fronteiras-de-producao-"));
       try {
-        for (const dir of [...DIRS_DE_CODIGO, "tests/provas"]) mkdirSync(join(raiz, dir), { recursive: true });
+        for (const dir of [...DIRS_DE_CODIGO, "tests/provas"])
+          mkdirSync(join(raiz, dir), { recursive: true });
         mkdirSync(join(raiz, arquivo, ".."), { recursive: true });
         writeFileSync(join(raiz, arquivo), "armazenamento.upload('chave', bytes);\n");
-        writeFileSync(join(raiz, "tests/provas/bancada.ts"), "armazenamento.upload('fixture', bytes);\n");
+        writeFileSync(
+          join(raiz, "tests/provas/bancada.ts"),
+          "armazenamento.upload('fixture', bytes);\n",
+        );
         // Nem retirar scripts da varredura, nem ignorar scripts/provas passa.
         // O site novo permanece fora do catálogo e seria recusado pelo gate.
         expect(caminhosCom(/\.upload\(/, raiz)).toEqual([arquivo]);
@@ -369,7 +439,9 @@ describe("a varredura é de classe: site novo de fronteira reprova", () => {
 
   it("todo `.upload(` do código de produção está registrado, e na fronteira certa", () => {
     const achados = caminhosCom(/\.upload\(/);
-    const registrados = SITES.filter((s) => s.fronteira === "storage.chave-de-objeto").map((s) => s.arquivo);
+    const registrados = SITES.filter((s) => s.fronteira === "storage.chave-de-objeto").map(
+      (s) => s.arquivo,
+    );
     expect(achados.sort()).toEqual([...registrados].sort());
   });
 
@@ -377,7 +449,9 @@ describe("a varredura é de classe: site novo de fronteira reprova", () => {
     // Só o cabeçalho como tal (`'Idempotency-Key'`/`"Idempotency-Key"`), não a
     // prosa dos comentários: o que cruza fronteira é o cabeçalho.
     const achados = caminhosCom(/['"]Idempotency-Key['"]/);
-    const registrados = SITES.filter((s) => s.fronteira === "api.idempotency-key").map((s) => s.arquivo);
+    const registrados = SITES.filter((s) => s.fronteira === "api.idempotency-key").map(
+      (s) => s.arquivo,
+    );
     expect(achados.sort()).toEqual([...registrados].sort());
   });
 
@@ -391,9 +465,10 @@ describe("a varredura é de classe: site novo de fronteira reprova", () => {
         const v = (expr as string).trim();
         const ehUuid = /random(Id|UUID)\(/.test(v);
         const ehVariavel = /^[A-Za-z_$][\w$.]*(\s*\?\?=.*)?$/.test(v);
-        expect(ehUuid || ehVariavel, `${arquivo}: chave literal ou forma desconhecida → ${JSON.stringify(v)}`).toBe(
-          true,
-        );
+        expect(
+          ehUuid || ehVariavel,
+          `${arquivo}: chave literal ou forma desconhecida → ${JSON.stringify(v)}`,
+        ).toBe(true);
       }
     }
   });
