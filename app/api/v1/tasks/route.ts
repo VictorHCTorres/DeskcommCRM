@@ -29,7 +29,7 @@ import { z } from "zod";
 
 import { ok, fail } from "@/lib/api/wrappers";
 import { audit, isServiceRoleConfigured } from "@/lib/audit";
-import { requireRole } from "@/lib/auth/require-role";
+import { resolveAuthDual, tetoDeEscritaDoToken, type AuthDual } from "@/lib/api/auth-dual";
 import { traduzir } from "@/lib/i18n/dicionario";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { createClient } from "@/lib/supabase/server";
@@ -41,6 +41,18 @@ import { PRIORIDADES_DA_TAREFA, SITUACOES_DA_TAREFA, type Tarefa } from "@/lib/t
 import { conferirVinculosDaTarefa } from "@/lib/tarefas/vinculos";
 
 export const dynamic = "force-dynamic";
+
+/**
+ * Sessão de navegador OU token de servidor (`dsk_…`), mesma dualidade de
+ * `PATCH /api/v1/leads/[id]`: os robôs que antes criavam a rotina do mês e a
+ * obrigação no ClickUp passam a criar a tarefa aqui, sem navegador. A org sai
+ * da sessão ou da LINHA DO TOKEN, nunca do corpo. No ramo do token não há
+ * usuário: `created_by` fica nulo (a coluna aceita) e "minhas" não existe.
+ */
+type Autorizado = Extract<AuthDual, { ok: true }>;
+function usuarioDaSessao(authz: Autorizado): string | null {
+  return authz.via === "session" && authz.actor.type === "user" ? authz.actor.id : null;
+}
 
 /** As colunas que a tela lê. Explícitas para o `select *` não vazar coluna nova. */
 const COLUNAS = COLUNAS_DA_TAREFA;
@@ -86,9 +98,16 @@ const listaSchema = z.object({
 export async function GET(req: NextRequest): Promise<Response> {
   const requestId = randomUUID();
 
-  const authz = await requireRole("viewer", { requestId, resource: "crm_tasks" });
+  const authz = await resolveAuthDual(req, {
+    requestId,
+    resource: "crm_tasks",
+    role: "viewer",
+    scope: "mcp:read",
+  });
   if (!authz.ok) return authz.response;
-  const t = (texto: string) => traduzir(texto, authz.user.idioma);
+  const t = (texto: string) => traduzir(texto, authz.idioma ?? "pt-BR");
+  const orgId = authz.organizationId;
+  const usuario = usuarioDaSessao(authz);
 
   const parsed = listaSchema.safeParse(Object.fromEntries(new URL(req.url).searchParams));
   if (!parsed.success) {
@@ -98,8 +117,14 @@ export async function GET(req: NextRequest): Promise<Response> {
     });
   }
   const filtros = parsed.data;
+  if (filtros.assigned_to === "me" && !usuario) {
+    return fail("validation_failed", t("Parâmetros inválidos."), 422, {
+      requestId,
+      details: { assigned_to: ["'me' só existe na sessão de navegador"] },
+    });
+  }
 
-  const supabase = await createClient();
+  const supabase = authz.supabase;
 
   // ⚠️ `organization_id` à mão mesmo com RLS ligada: é a regra do CLAUDE.md, e
   // ela não é redundante — o dia em que esta rota trocar para o admin client
@@ -107,7 +132,7 @@ export async function GET(req: NextRequest): Promise<Response> {
   let query = supabase
     .from("crm_tasks")
     .select(COLUNAS)
-    .eq("organization_id", authz.org.orgId)
+    .eq("organization_id", orgId)
     .order("due_date", { ascending: true, nullsFirst: false })
     .order("created_at", { ascending: false })
     .limit(500);
@@ -120,7 +145,7 @@ export async function GET(req: NextRequest): Promise<Response> {
   if (filtros.due_from) query = query.gte("due_date", filtros.due_from);
   if (filtros.due_to) query = query.lte("due_date", filtros.due_to);
   if (filtros.aberto === "true") query = query.in("status", ["pending", "in_progress"]);
-  if (filtros.assigned_to === "me") query = query.eq("assigned_to", authz.user.id);
+  if (filtros.assigned_to === "me") query = query.eq("assigned_to", usuario!);
   else if (filtros.assigned_to === "ninguem") query = query.is("assigned_to", null);
   else if (filtros.assigned_to) query = query.eq("assigned_to", filtros.assigned_to);
 
@@ -145,7 +170,7 @@ export async function GET(req: NextRequest): Promise<Response> {
     ? await supabase
         .from("crm_tasks")
         .select(COLUNAS)
-        .eq("organization_id", authz.org.orgId)
+        .eq("organization_id", orgId)
         .in("id", paisAusentes)
     : { data: [], error: null };
   if (erroPais) return fail("internal_error", t("Erro ao listar as tarefas."), 500, { requestId });
@@ -159,7 +184,7 @@ export async function GET(req: NextRequest): Promise<Response> {
     ? await supabase
         .from("crm_tasks")
         .select(COLUNAS)
-        .eq("organization_id", authz.org.orgId)
+        .eq("organization_id", orgId)
         .in("parent_task_id", raizes)
     : { data: [], error: null };
   if (erroFilhas)
@@ -181,9 +206,19 @@ export async function POST(req: NextRequest): Promise<Response> {
   const requestId = randomUUID();
 
   // `agent` e não `manager`: criar tarefa é o gesto de quem ATENDE, todo dia.
-  const authz = await requireRole("agent", { requestId, resource: "crm_tasks" });
+  const authz = await resolveAuthDual(req, {
+    requestId,
+    resource: "crm_tasks",
+    role: "agent",
+    scope: "mcp:write",
+  });
   if (!authz.ok) return authz.response;
-  const t = (texto: string) => traduzir(texto, authz.user.idioma);
+  const t = (texto: string) => traduzir(texto, authz.idioma ?? "pt-BR");
+  const orgId = authz.organizationId;
+  const usuario = usuarioDaSessao(authz);
+
+  const tetoEstourado = await tetoDeEscritaDoToken(authz, "tasks", requestId);
+  if (tetoEstourado) return tetoEstourado;
 
   const parsed = criacaoSchema.safeParse(await req.json().catch(() => null));
   if (!parsed.success) {
@@ -198,7 +233,7 @@ export async function POST(req: NextRequest): Promise<Response> {
     // outra organização (ou de quem saiu da equipe) gravaria sem erro. A régua
     // e o porquê do admin client estão em `lib/tarefas/responsavel.ts`.
     const equipe = isServiceRoleConfigured() ? createAdminClient() : await createClient();
-    const veredito = await conferirResponsavel(equipe, authz.org.orgId, parsed.data.assigned_to);
+    const veredito = await conferirResponsavel(equipe, orgId, parsed.data.assigned_to);
     if (veredito === "falha_na_consulta") {
       return fail("internal_error", t("Erro ao salvar a tarefa."), 500, { requestId });
     }
@@ -209,7 +244,7 @@ export async function POST(req: NextRequest): Promise<Response> {
     }
   }
 
-  const supabase = await createClient();
+  const supabase = authz.supabase;
 
   let contextoHerdado: {
     lead_id: string | null;
@@ -221,7 +256,7 @@ export async function POST(req: NextRequest): Promise<Response> {
       .from("crm_tasks")
       .select("id, parent_task_id, lead_id, contact_id, demanda_id")
       .eq("id", parsed.data.parent_task_id)
-      .eq("organization_id", authz.org.orgId)
+      .eq("organization_id", orgId)
       .maybeSingle();
     if (erroPai) return fail("internal_error", t("Erro ao salvar a tarefa."), 500, { requestId });
     if (!pai)
@@ -240,7 +275,7 @@ export async function POST(req: NextRequest): Promise<Response> {
 
   const vereditoDosVinculos = await conferirVinculosDaTarefa(
     supabase,
-    authz.org.orgId,
+    orgId,
     contextoHerdado ?? parsed.data,
   );
   if (vereditoDosVinculos === "falha_na_consulta") {
@@ -259,7 +294,7 @@ export async function POST(req: NextRequest): Promise<Response> {
   if (demandaParaConferir) {
     // A chave estrangeira não passa pela RLS: sem esta conferência, a demanda
     // de outra organização gravaria sem erro. A régua está em `lib/tarefas/demanda.ts`.
-    const veredito = await conferirDemanda(supabase, authz.org.orgId, demandaParaConferir);
+    const veredito = await conferirDemanda(supabase, orgId, demandaParaConferir);
     if (veredito === "falha_na_consulta") {
       return fail("internal_error", t("Erro ao salvar a tarefa."), 500, { requestId });
     }
@@ -288,8 +323,8 @@ export async function POST(req: NextRequest): Promise<Response> {
   const { tarefa, erro: error } = await gravarTarefa(supabase, {
     ...parsed.data,
     ...(contextoHerdado ?? {}),
-    organization_id: authz.org.orgId,
-    created_by: authz.user.id,
+    organization_id: orgId,
+    created_by: usuario,
     recurrence_id: null,
     recurrence_generation: 0,
     recurrence_scheduled_for: null,
@@ -314,8 +349,10 @@ export async function POST(req: NextRequest): Promise<Response> {
   if (!tarefa) return fail("internal_error", t("Erro ao salvar a tarefa."), 500, { requestId });
 
   await audit({
-    organizationId: authz.org.orgId,
-    actorUserId: authz.user.id,
+    organizationId: orgId,
+    actorUserId: usuario,
+    actorApiTokenId: authz.apiTokenId ?? null,
+    bypassedRls: authz.via === "token",
     action: "crm_task.created",
     resourceType: "crm_tasks",
     resourceId: tarefa.id,
@@ -325,10 +362,10 @@ export async function POST(req: NextRequest): Promise<Response> {
 
   // O laço de retorno: tarefa presa a um negócio aparece na linha do tempo dele.
   await registraAtividadeDaTarefa(supabase, {
-    organizationId: authz.org.orgId,
+    organizationId: orgId,
     tarefa,
     tipo: "task_created",
-    actor: { type: "user", id: authz.user.id },
+    actor: authz.actor,
   });
 
   return ok({ task: tarefa }, { requestId, status: 201 });

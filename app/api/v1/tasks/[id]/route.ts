@@ -18,6 +18,7 @@ import { z } from "zod";
 
 import { ok, fail } from "@/lib/api/wrappers";
 import { audit, isServiceRoleConfigured } from "@/lib/audit";
+import { resolveAuthDual, tetoDeEscritaDoToken } from "@/lib/api/auth-dual";
 import { requireRole } from "@/lib/auth/require-role";
 import { traduzir } from "@/lib/i18n/dicionario";
 import { createAdminClient } from "@/lib/supabase/admin";
@@ -62,9 +63,22 @@ export async function PATCH(req: NextRequest, ctx: Contexto): Promise<Response> 
   const requestId = randomUUID();
   const { id } = await ctx.params;
 
-  const authz = await requireRole("agent", { requestId, resource: "crm_tasks" });
+  // Sessão OU token de servidor (`dsk_…` com `mcp:write`): o robô que vigia a
+  // CND muda a situação da tarefa por aqui. O DELETE abaixo continua só de tela.
+  const authz = await resolveAuthDual(req, {
+    requestId,
+    resource: "crm_tasks",
+    role: "agent",
+    scope: "mcp:write",
+  });
   if (!authz.ok) return authz.response;
-  const t = (texto: string) => traduzir(texto, authz.user.idioma);
+  const t = (texto: string) => traduzir(texto, authz.idioma ?? "pt-BR");
+  const orgId = authz.organizationId;
+  const usuario =
+    authz.via === "session" && authz.actor.type === "user" ? authz.actor.id : null;
+
+  const tetoEstourado = await tetoDeEscritaDoToken(authz, "tasks", requestId);
+  if (tetoEstourado) return tetoEstourado;
 
   const parsed = edicaoSchema.safeParse(await req.json().catch(() => null));
   if (!parsed.success) {
@@ -79,7 +93,7 @@ export async function PATCH(req: NextRequest, ctx: Contexto): Promise<Response> 
     // outra organização (ou de quem saiu da equipe) gravaria sem erro. A régua
     // e o porquê do admin client estão em `lib/tarefas/responsavel.ts`.
     const equipe = isServiceRoleConfigured() ? createAdminClient() : await createClient();
-    const veredito = await conferirResponsavel(equipe, authz.org.orgId, parsed.data.assigned_to);
+    const veredito = await conferirResponsavel(equipe, orgId, parsed.data.assigned_to);
     if (veredito === "falha_na_consulta") {
       return fail("internal_error", t("Erro ao salvar a tarefa."), 500, { requestId });
     }
@@ -90,11 +104,11 @@ export async function PATCH(req: NextRequest, ctx: Contexto): Promise<Response> 
     }
   }
 
-  const supabase = await createClient();
+  const supabase = authz.supabase;
 
   const vereditoDosVinculos = await conferirVinculosDaTarefa(
     supabase,
-    authz.org.orgId,
+    orgId,
     parsed.data,
   );
   if (vereditoDosVinculos === "falha_na_consulta") {
@@ -112,7 +126,7 @@ export async function PATCH(req: NextRequest, ctx: Contexto): Promise<Response> 
   if (parsed.data.demanda_id) {
     // A chave estrangeira não passa pela RLS: sem esta conferência, a demanda
     // de outra organização gravaria sem erro. A régua está em `lib/tarefas/demanda.ts`.
-    const veredito = await conferirDemanda(supabase, authz.org.orgId, parsed.data.demanda_id);
+    const veredito = await conferirDemanda(supabase, orgId, parsed.data.demanda_id);
     if (veredito === "falha_na_consulta") {
       return fail("internal_error", t("Erro ao salvar a tarefa."), 500, { requestId });
     }
@@ -145,14 +159,14 @@ export async function PATCH(req: NextRequest, ctx: Contexto): Promise<Response> 
     .from("crm_tasks")
     .select("status, recurrence_id")
     .eq("id", id)
-    .eq("organization_id", authz.org.orgId)
+    .eq("organization_id", orgId)
     .maybeSingle();
 
   const { data, error } = await supabase
     .from("crm_tasks")
     .update(parsed.data)
     .eq("id", id)
-    .eq("organization_id", authz.org.orgId)
+    .eq("organization_id", orgId)
     .select(COLUNAS)
     .single();
 
@@ -176,8 +190,10 @@ export async function PATCH(req: NextRequest, ctx: Contexto): Promise<Response> 
   const tarefa = data as unknown as Tarefa;
 
   await audit({
-    organizationId: authz.org.orgId,
-    actorUserId: authz.user.id,
+    organizationId: orgId,
+    actorUserId: usuario,
+    actorApiTokenId: authz.apiTokenId ?? null,
+    bypassedRls: authz.via === "token",
     action: "crm_task.updated",
     resourceType: "crm_tasks",
     resourceId: tarefa.id,
@@ -189,10 +205,10 @@ export async function PATCH(req: NextRequest, ctx: Contexto): Promise<Response> 
     tarefa.status === "done" && (antes as { status?: string } | null)?.status !== "done";
   if (fechouAgora) {
     await registraAtividadeDaTarefa(supabase, {
-      organizationId: authz.org.orgId,
+      organizationId: orgId,
       tarefa,
       tipo: "task_completed",
-      actor: { type: "user", id: authz.user.id },
+      actor: authz.actor,
     });
 
     const recurrenceId = (antes as { recurrence_id?: string | null } | null)?.recurrence_id;
@@ -201,7 +217,7 @@ export async function PATCH(req: NextRequest, ctx: Contexto): Promise<Response> 
         .from("crm_task_recurrences" as never)
         .select("id, frequency, interval, mode, timezone, active, current_task_id" as never)
         .eq("id", recurrenceId)
-        .eq("organization_id", authz.org.orgId)
+        .eq("organization_id", orgId)
         .maybeSingle();
       const regra = recorrencia as unknown as {
         id: string;
@@ -219,7 +235,7 @@ export async function PATCH(req: NextRequest, ctx: Contexto): Promise<Response> 
           .from("crm_task_recurrences" as never)
           .update({ next_run_at: agora.toISOString(), next_due_at: proxima } as never)
           .eq("id", regra.id)
-          .eq("organization_id", authz.org.orgId)
+          .eq("organization_id", orgId)
           .eq("current_task_id", id)
           .is("next_run_at", null);
       }

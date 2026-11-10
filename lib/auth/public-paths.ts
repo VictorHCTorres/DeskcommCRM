@@ -133,6 +133,18 @@ export const PUBLIC_PATHS: RegExp[] = [
   // `reactivations`) que `[^/]+$` alcançaria por engano, tornando-os "públicos"
   // (proxy não decide) quando nenhum deles tem suporte a Bearer.
   /^\/api\/v1\/leads\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+  // TAREFAS SERVER-TO-SERVER. Mesma dualidade de `/api/v1/leads/[id]` acima:
+  // sessão OU Bearer `dsk_…`, resolvidos por `lib/api/auth-dual.ts` DENTRO das
+  // rotas (`app/api/v1/tasks/route.ts` GET/POST e `app/api/v1/tasks/[id]/route.ts`
+  // PATCH). Existe para os robôs do n8n que criavam rotina do mês, obrigação e
+  // CND no ClickUp. O DELETE de `tasks/[id]` continua em `requireRole` (só
+  // cookie), então o Bearer que chegar nele morre em 401 dentro da rota.
+  //
+  // Âncora `$` e FORMA DE UUID: os irmãos literais e os sub-paths
+  // (`[id]/comments`, `[id]/recurrence`, `[id]/attachments`, `[id]/relations`)
+  // não têm suporte a Bearer e não podem nascer públicos de carona.
+  /^\/api\/v1\/tasks$/,
+  /^\/api\/v1\/tasks\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
   // MARCAR/REMARCAR/CANCELAR COMPROMISSO SERVER-TO-SERVER. Mesma dualidade dos
   // dois de cima: sessão OU Bearer `dsk_…`, resolvidos por `lib/api/auth-dual.ts`
   // DENTRO da rota (`app/api/v1/agenda/agendamentos/route.ts`, função
