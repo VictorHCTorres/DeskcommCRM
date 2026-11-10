@@ -126,9 +126,11 @@ export async function GET(req: NextRequest): Promise<Response> {
 
   const supabase = authz.supabase;
 
-  // ⚠️ `organization_id` à mão mesmo com RLS ligada: é a regra do CLAUDE.md, e
-  // ela não é redundante — o dia em que esta rota trocar para o admin client
-  // (que bypassa RLS) o filtro já está aqui.
+  // ⚠️ `organization_id` à mão SEMPRE: no ramo do token o cliente é o admin
+  // (bypassa RLS) e este filtro é a única coisa que segura a organização. Na
+  // sessão ele também é a regra do CLAUDE.md, não redundância. Consequência
+  // aceita: o token enxerga todas as tarefas da org (é credencial de org); a
+  // visibilidade por pessoa da RLS (`fn_can_view_task`) vale só para a sessão.
   let query = supabase
     .from("crm_tasks")
     .select(COLUNAS)

@@ -74,8 +74,7 @@ export async function PATCH(req: NextRequest, ctx: Contexto): Promise<Response> 
   if (!authz.ok) return authz.response;
   const t = (texto: string) => traduzir(texto, authz.idioma ?? "pt-BR");
   const orgId = authz.organizationId;
-  const usuario =
-    authz.via === "session" && authz.actor.type === "user" ? authz.actor.id : null;
+  const usuario = authz.via === "session" && authz.actor.type === "user" ? authz.actor.id : null;
 
   const tetoEstourado = await tetoDeEscritaDoToken(authz, "tasks", requestId);
   if (tetoEstourado) return tetoEstourado;
@@ -106,11 +105,7 @@ export async function PATCH(req: NextRequest, ctx: Contexto): Promise<Response> 
 
   const supabase = authz.supabase;
 
-  const vereditoDosVinculos = await conferirVinculosDaTarefa(
-    supabase,
-    orgId,
-    parsed.data,
-  );
+  const vereditoDosVinculos = await conferirVinculosDaTarefa(supabase, orgId, parsed.data);
   if (vereditoDosVinculos === "falha_na_consulta") {
     return fail("internal_error", t("Erro ao salvar a tarefa."), 500, { requestId });
   }

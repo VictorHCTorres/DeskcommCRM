@@ -18,10 +18,15 @@ vi.mock("@/lib/api/auth-dual", () => ({
   resolveAuthDual: vi.fn(),
   tetoDeEscritaDoToken: vi.fn(async () => null),
 }));
-vi.mock("@/lib/audit", () => ({ audit: vi.fn(async () => undefined), isServiceRoleConfigured: () => true }));
+vi.mock("@/lib/audit", () => ({
+  audit: vi.fn(async () => undefined),
+  isServiceRoleConfigured: () => true,
+}));
 vi.mock("@/lib/supabase/admin", () => ({ createAdminClient: vi.fn(() => ({})) }));
 vi.mock("@/lib/supabase/server", () => ({ createClient: vi.fn(async () => ({})) }));
-vi.mock("@/lib/tarefas/atividade", () => ({ registraAtividadeDaTarefa: vi.fn(async () => undefined) }));
+vi.mock("@/lib/tarefas/atividade", () => ({
+  registraAtividadeDaTarefa: vi.fn(async () => undefined),
+}));
 vi.mock("@/lib/tarefas/vinculos", () => ({ conferirVinculosDaTarefa: vi.fn(async () => "ok") }));
 vi.mock("@/lib/tarefas/demanda", () => ({ conferirDemanda: vi.fn(async () => "ok") }));
 vi.mock("@/lib/tarefas/responsavel", () => ({ conferirResponsavel: vi.fn(async () => "ok") }));
