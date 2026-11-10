@@ -66,6 +66,21 @@ describe("isPublicPath", () => {
     expect(isPublicPath("/api/v1/leads/11111111-1111-4111-8111-111111111111")).toBe(true);
   });
 
+  it("libera /api/v1/tasks e /api/v1/tasks/[id] (bearer, forma de UUID)", () => {
+    expect(isPublicPath("/api/v1/tasks")).toBe(true);
+    expect(isPublicPath("/api/v1/tasks/11111111-1111-4111-8111-111111111111")).toBe(true);
+  });
+
+  it("mas NÃO os sub-paths de tarefa, que não têm Bearer", () => {
+    const id = "11111111-1111-4111-8111-111111111111";
+    expect(isPublicPath(`/api/v1/tasks/${id}/comments`)).toBe(false);
+    expect(isPublicPath(`/api/v1/tasks/${id}/recurrence`)).toBe(false);
+    expect(isPublicPath(`/api/v1/tasks/${id}/attachments`)).toBe(false);
+    expect(isPublicPath(`/api/v1/tasks/${id}/relations`)).toBe(false);
+    expect(isPublicPath("/api/v1/tasks/qualquer")).toBe(false);
+    expect(isPublicPath("/api/v1/tasks/")).toBe(false);
+  });
+
   it("mas NÃO os irmãos literais de /api/v1/leads/, que não têm Bearer", () => {
     expect(isPublicPath("/api/v1/leads/bulk")).toBe(false);
     expect(isPublicPath("/api/v1/leads/at-risk")).toBe(false);
