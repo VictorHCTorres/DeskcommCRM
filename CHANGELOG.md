@@ -8,6 +8,12 @@ Se você roda o DeskcommCRM numa VPS, **leia a seção da versão para a qual es
 
 ## [Não lançado]
 
+## [1.101.0] — 2026-11-10
+
+### Adicionado
+
+- **Integrações criam, listam e atualizam tarefas com token de API** `GET` e `POST /api/v1/tasks` e `PATCH /api/v1/tasks/{id}` passam a aceitar `Authorization: Bearer dsk_…`, além da sessão do navegador, pelo mesmo caminho de `PATCH /api/v1/leads/{id}`. Ler pede o escopo `mcp:read`, e criar ou alterar pede `mcp:write`. A organização vem do token, nunca do corpo da requisição. Como não há usuário nesse modo, a tarefa nasce sem autor e o registro de auditoria guarda o token. O filtro "minhas" (`assigned_to=me`) é recusado. Apagar tarefa, comentários, recorrência, anexos e relações continuam disponíveis só pela tela. Existe para robôs que antes criavam rotinas e prazos no ClickUp. Crédito: @VictorHCTorres.
+
 ## [1.100.3] — 2026-11-03
 
 ### Corrigido
@@ -14109,7 +14115,8 @@ Primeira versão marcada do DeskcommCRM. O projeto vinha sendo desenvolvido publ
 
 - **Node 22 é obrigatório para desenvolvimento.** A suíte de invariantes instancia o cliente do Supabase, que exige o `WebSocket` global — nativo apenas a partir do Node 22. Isso não afeta quem apenas hospeda: a VPS roda a imagem pronta.
 
-[Não lançado]: https://github.com/melgarafael/DeskcommCRM/compare/v1.100.3...HEAD
+[Não lançado]: https://github.com/melgarafael/DeskcommCRM/compare/v1.101.0...HEAD
+[1.101.0]: https://github.com/melgarafael/DeskcommCRM/compare/v1.100.3...v1.101.0
 [1.100.3]: https://github.com/melgarafael/DeskcommCRM/compare/v1.100.2...v1.100.3
 [1.100.2]: https://github.com/melgarafael/DeskcommCRM/compare/v1.100.1...v1.100.2
 [1.100.1]: https://github.com/melgarafael/DeskcommCRM/compare/v1.100.0...v1.100.1
