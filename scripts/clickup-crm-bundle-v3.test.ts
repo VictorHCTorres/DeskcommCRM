@@ -37,7 +37,40 @@ describe("bundle ClickUp CRM v3", () => {
     );
     await writeFile(
       join(root, "tasks/l1.jsonl"),
-      `${JSON.stringify({ id: "t1", name: "Negócio", status: { id: "shared", type: "done" }, date_done: "1730619000000", due_date: "1730619000000", start_date: "1710052200000", time_estimate: 0, priority: { priority: "normal" }, tags: [{ name: "VIP", tag_bg: "#fff" }], watchers: [{ id: 42, email: "nao-persistir@example.com" }], linked_tasks: [{ task_id: "t1", link_id: "t2", date_created: "1730619000000" }], checklists: [{ id: "c-empty", name: "Vazio", resolved: 0, unresolved: 0, items: [] }], status: { id: "shared", type: "done" }, parent: null, attachments: [{ url: "https://signed.example/secret" }], custom_fields: [{ id: "f-dropdown", type: "drop_down", value: 0, type_config: { options: [{ id: "option-stable", name: "Primeira" }] } }] })}\n${JSON.stringify({ id: "t2", name: "Backup sem chave attachments", status: { id: "shared" }, parent: null, custom_fields: [], linked_tasks: [{ task_id: "t1", link_id: "t2", date_created: "1730619000000" }] })}\n`,
+      `${JSON.stringify({
+        id: "t1",
+        name: "Negócio",
+        status: { id: "shared", type: "done" },
+        date_done: "1730619000000",
+        due_date: "1730619000000",
+        start_date: "1710052200000",
+        time_estimate: 0,
+        priority: { priority: "normal" },
+        tags: [{ name: "VIP", tag_bg: "#fff" }],
+        watchers: [{ id: 42, email: "nao-persistir@example.com" }],
+        linked_tasks: [{ task_id: "t1", link_id: "t2", date_created: "1730619000000" }],
+        checklists: [{ id: "c-empty", name: "Vazio", resolved: 0, unresolved: 0, items: [] }],
+        status: { id: "shared", type: "done" },
+        parent: null,
+        attachments: [{ url: "https://signed.example/secret" }],
+        custom_fields: [
+          {
+            id: "f-dropdown",
+            name: "Segmento",
+            type: "drop_down",
+            value: 0,
+            type_config: { options: [{ id: "option-stable", name: "Primeira" }] },
+          },
+          {
+            id: "f-labels",
+            name: "Marcadores",
+            type: "labels",
+            value: ["1"],
+            type_config: { options: [{ id: "1", label: "Retenção" }] },
+          },
+          { id: "f-empty", name: "Vazio", type: "text", value: null },
+        ],
+      })}\n${JSON.stringify({ id: "t2", name: "Backup sem chave attachments", status: { id: "shared" }, parent: null, custom_fields: [], linked_tasks: [{ task_id: "t1", link_id: "t2", date_created: "1730619000000" }] })}\n`,
     );
     const manifest = await exportarClickUpCrmBundleV3({
       backup: root,
@@ -78,7 +111,22 @@ describe("bundle ClickUp CRM v3", () => {
             watcher_count: 1,
             archive_scope: "active_and_archived",
             attachment_status: "skipped_not_imported",
-            custom_fields: [{ id: "f-dropdown", value: "option-stable" }],
+            custom_fields: [
+              {
+                id: "f-dropdown",
+                name: "Segmento",
+                type: "drop_down",
+                value: "option-stable",
+                selected_options: [{ id: "option-stable", label: "Primeira" }],
+              },
+              {
+                id: "f-labels",
+                name: "Marcadores",
+                type: "labels",
+                value: ["1"],
+                selected_options: [{ id: "1", label: "Retenção" }],
+              },
+            ],
           }),
         }),
       ]),

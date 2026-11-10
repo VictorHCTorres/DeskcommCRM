@@ -17,6 +17,7 @@ import {
   type PrioridadeDaTarefa,
   type Tarefa,
 } from "@/lib/tarefas/tipos";
+import { formatarValorCampoClickUp } from "@/lib/tarefas/origem-clickup";
 import {
   ArrowsClockwise,
   Check,
@@ -192,6 +193,49 @@ function Linha({
               </span>
             ))}
           </div>
+        ) : null}
+        {tarefa.clickup_origin ? (
+          <div className="mt-1.5 flex flex-wrap items-center gap-1 text-[10px] text-muted-foreground">
+            <span className="rounded-full border px-2 py-0.5">
+              {[
+                tarefa.clickup_origin.space_name,
+                tarefa.clickup_origin.folder_name,
+                tarefa.clickup_origin.list_name,
+              ]
+                .filter(Boolean)
+                .join(" › ")}
+            </span>
+            <span className="rounded-full border px-2 py-0.5">
+              {t("Status no ClickUp")}: {tarefa.clickup_origin.status.name}
+            </span>
+            {tarefa.clickup_origin.assignees.length ? (
+              <span className="rounded-full border px-2 py-0.5">
+                {t("Responsável original")}:{" "}
+                {tarefa.clickup_origin.assignees.map((a) => a.display_name).join(", ")}
+              </span>
+            ) : null}
+            {tarefa.clickup_origin.time_spent_ms ? (
+              <span className="rounded-full border px-2 py-0.5">
+                {t("Tempo registrado")}:{" "}
+                {Math.round(tarefa.clickup_origin.time_spent_ms / 3_600_000)}h
+              </span>
+            ) : null}
+          </div>
+        ) : null}
+        {tarefa.clickup_origin?.custom_fields.length ? (
+          <details className="mt-1.5 text-xs">
+            <summary className="cursor-pointer text-[11px] text-muted-foreground">
+              {t("Campos do ClickUp")} ({tarefa.clickup_origin.custom_fields.length})
+            </summary>
+            <dl className="mt-1 grid gap-x-3 gap-y-1 rounded-md border bg-muted/20 p-2 sm:grid-cols-[minmax(8rem,auto)_1fr]">
+              {tarefa.clickup_origin.custom_fields.map((field) => (
+                <div key={field.id} className="contents">
+                  <dt className="font-medium text-muted-foreground">{field.name}</dt>
+                  <dd className="min-w-0 break-words">{formatarValorCampoClickUp(field)}</dd>
+                </div>
+              ))}
+            </dl>
+          </details>
         ) : null}
         <ComentariosImportados taskId={tarefa.id} />
         <AssetsImportados taskId={tarefa.id} />

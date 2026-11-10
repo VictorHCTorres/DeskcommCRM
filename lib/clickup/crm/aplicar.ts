@@ -394,7 +394,13 @@ async function aplicarTask(
   const org = String(run.organization_id);
   const meta = metadata(item);
   const externalId = String(item.external_id);
-  const parentExternalId = item.parent_external_id ? String(item.parent_external_id) : null;
+  const listId = String(meta.list_id ?? "");
+  const stagedParentExternalId = item.parent_external_id ? String(item.parent_external_id) : null;
+  const parentExternalId = meta.parent_id
+    ? String(meta.parent_id)
+    : stagedParentExternalId && stagedParentExternalId !== listId
+      ? stagedParentExternalId
+      : null;
   const title = String(meta.name ?? meta.title ?? `ClickUp ${externalId}`).trim();
   const attachmentStatus = String(meta.attachment_status ?? "none");
   const attachmentCount =
@@ -427,7 +433,10 @@ async function aplicarTask(
   const priority = clickUpPriorityToCrm(meta.priority);
   const startAt = epochMillisecondsToIso(meta.start_date);
   const timeEstimateMs = normalizeNonNegativeMilliseconds(meta.time_estimate);
-  const clickupMetadata = clickUpFidelityMetadata(meta);
+  const clickupMetadata = clickUpFidelityMetadata(meta, {
+    workspaceId: run.workspace_id,
+    parentExternalId,
+  });
 
   if (parentExternalId && !mapping.import_subtasks) return "skipped" as const;
 

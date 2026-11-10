@@ -72,6 +72,7 @@ CRONS="
 * * * * *|45|api/v1/cron/clickup-crm-import
 * * * * *|45|api/v1/cron/clickup-docs-import
 * * * * *|45|api/v1/cron/clickup-assets-import
+* * * * *|50|api/v1/cron/clickup-live-sidecar
 */5 * * * *|60|api/v1/cron/webhook-log-retention
 */5 * * * *|45|api/v1/cron/channel-health
 # A JANELA DE MANUTENÇÃO (#2388). Minuto a minuto porque o que ela decide é a

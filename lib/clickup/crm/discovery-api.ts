@@ -147,12 +147,68 @@ function safeTags(value: unknown) {
   return [...unique.values()].sort((a, b) => a.name.localeCompare(b.name, "pt-BR"));
 }
 
-function safeTaskMetadata(raw: Record<string, unknown>, listId: string) {
+function nonEmptyCustomFieldValue(value: unknown) {
+  return (
+    value !== null &&
+    value !== undefined &&
+    value !== "" &&
+    (!Array.isArray(value) || value.length > 0)
+  );
+}
+
+function safeTaskCustomFields(value: unknown) {
+  return array(value).flatMap((candidate) => {
+    const field = record(candidate);
+    if (!nonEmptyCustomFieldValue(field.value)) return [];
+    const type = text(field.type);
+    const options = array(record(field.type_config).options).map((rawOption) => {
+      const option = record(rawOption);
+      return {
+        id: text(option.id ?? option.value),
+        label: text(option.name ?? option.label),
+      };
+    });
+    const selections =
+      type === "drop_down" ? [field.value] : type === "labels" ? array(field.value) : [];
+    const selectedOptions = selections.flatMap((selection) => {
+      const byId = options.find((candidateOption) => candidateOption.id === text(selection));
+      const byIndex = Number.isInteger(Number(selection)) ? options[Number(selection)] : null;
+      const option = byId ?? byIndex;
+      return option?.id ? [option] : [];
+    });
+    return [
+      {
+        id: text(field.id),
+        name: text(field.name),
+        type,
+        value: type === "drop_down" && selectedOptions[0]?.id ? selectedOptions[0].id : field.value,
+        selected_options: selectedOptions,
+      },
+    ];
+  });
+}
+
+function safeTaskMetadata(
+  raw: Record<string, unknown>,
+  hierarchy: {
+    listId: string;
+    listName: string;
+    spaceId: string;
+    spaceName: string;
+    folderId: string | null;
+    folderName: string | null;
+  },
+) {
   const status = record(raw.status);
   const attachmentsExported = Object.prototype.hasOwnProperty.call(raw, "attachments");
   const attachments = array(raw.attachments);
   return {
-    list_id: listId,
+    list_id: hierarchy.listId,
+    list_name: hierarchy.listName,
+    space_id: hierarchy.spaceId,
+    space_name: hierarchy.spaceName,
+    folder_id: hierarchy.folderId,
+    folder_name: hierarchy.folderName,
     name: text(raw.name),
     description: text(raw.description ?? raw.text_content),
     parent_id: text(raw.parent) || null,
@@ -215,8 +271,19 @@ function safeTaskMetadata(raw: Record<string, unknown>, listId: string) {
         : []),
     ],
     assignees: array(raw.assignees).flatMap((candidate) => {
-      const email = text(record(candidate).email).trim().toLowerCase();
-      return email ? [{ email }] : [];
+      const assignee = record(candidate);
+      const email = text(assignee.email).trim().toLowerCase();
+      const sourceUserId = text(assignee.id).trim();
+      const displayName = text(assignee.username).trim();
+      return email || sourceUserId || displayName
+        ? [
+            {
+              email: email || null,
+              source_user_id: sourceUserId || null,
+              display_name: displayName || null,
+            },
+          ]
+        : [];
     }),
     checklists: array(raw.checklists).map((candidate) => {
       const checklist = record(candidate);
@@ -236,15 +303,7 @@ function safeTaskMetadata(raw: Record<string, unknown>, listId: string) {
         }),
       };
     }),
-    custom_fields: array(raw.custom_fields).map((candidate) => {
-      const field = record(candidate);
-      const options = array(record(field.type_config).options);
-      const option =
-        text(field.type) === "drop_down" && Number.isInteger(Number(field.value))
-          ? record(options[Number(field.value)])
-          : {};
-      return { id: text(field.id), value: text(option.id) || (field.value ?? null) };
-    }),
+    custom_fields: safeTaskCustomFields(raw.custom_fields),
     attachment_count: attachmentsExported ? attachments.length : null,
     attachment_status: attachmentsExported
       ? attachments.length > 0
@@ -464,7 +523,14 @@ export async function discoverClickUpCrmApi(input: {
               throw new Error(`clickup_task_multiple_lists:${taskId}`);
             }
             taskIdsInList.add(taskId);
-            const metadata = safeTaskMetadata(task, list.id);
+            const metadata = safeTaskMetadata(task, {
+              listId: list.id,
+              listName: list.name,
+              spaceId: space.id,
+              spaceName: space.name,
+              folderId: folder?.id ?? null,
+              folderName: folder?.name ?? null,
+            });
             objects.push({
               source_type: "task",
               source_id: taskId,
