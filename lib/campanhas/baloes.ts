@@ -42,8 +42,9 @@ export function pausaEntreBaloes(
 
 /**
  * Envia os balões em ordem. Cada balão enviado passa por `registrar`, com o
- * índice (o `recordSend` da rodada: cada balão é uma mensagem física, conta no
- * teto do número e é a base do throttle do próximo envio). Para no primeiro balão `failed` e o devolve como desfecho: mandar o
+ * índice e o desfecho dele (o `recordSend` da rodada: cada balão é uma mensagem
+ * física, conta no teto do número e é a base do throttle do próximo envio; a
+ * rodada não conta o que o canal segurou sem chamar o provedor, F4j). Para no primeiro balão `failed` e o devolve como desfecho: mandar o
  * resto depois de uma falha entregaria a mensagem pela metade e fora de ordem.
  *
  * `continuar` (opcional) é perguntado antes de cada balão seguinte, depois da
@@ -56,14 +57,16 @@ export function pausaEntreBaloes(
  * 1º balão não há "último que saiu", e o laço recusa.
  *
  * `parar` (opcional) é perguntado depois de cada balão: `true` para ali, como a
- * falha. A prospecção o usa para o balão que o canal segurou na fila física
- * (F4i, A1): se o canal voltasse na pausa, o seguinte sairia sem ele.
+ * falha, e esse balão é o desfecho. A prospecção o usa para o balão que não
+ * saiu: o que o canal segurou na fila física (F4i, A1), porque se o canal
+ * voltasse na pausa o seguinte sairia sem ele; e o incerto (F4j, J04), porque o
+ * seguinte que saísse viraria o desfecho e esconderia a incerteza.
  */
 export async function enviarEmBaloes<T extends { status?: string }>(
   baloes: readonly string[],
   passos: {
     enviar: (corpo: string, indice: number) => Promise<T | null>;
-    registrar?: (indice: number) => Promise<void>;
+    registrar?: (indice: number, desfecho: T) => Promise<void>;
     esperar: () => Promise<void>;
     continuar?: (indice: number) => Promise<boolean>;
     parar?: (desfecho: T) => boolean;
@@ -85,7 +88,7 @@ export async function enviarEmBaloes<T extends { status?: string }>(
     desfecho = resultado;
     indiceDoDesfecho = indice;
     primeira ??= desfecho;
-    await passos.registrar?.(indice);
+    await passos.registrar?.(indice, desfecho);
     if (desfecho.status === "failed" || passos.parar?.(desfecho)) break;
   }
   return { primeira: primeira!, desfecho: desfecho!, indiceDoDesfecho };

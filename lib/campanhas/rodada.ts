@@ -51,6 +51,7 @@ import {
 import { feriadosDoBrasilDoAno } from "@/lib/lgpd/holidays-br";
 import { logger } from "@/lib/logger";
 import { OrgNaoOperanteError, STATUS_OPERANTE, ehOperante, statusDaOrgEmbutida } from "@/lib/organizacao/operante";
+import type { Message } from "@/lib/types/messaging";
 
 import { baloesDaCampanha, enviarEmBaloes, pausaEntreBaloes } from "./baloes";
 import {
@@ -302,7 +303,7 @@ async function pendentesDaCampanha(
   agora: Date,
   quantos: number,
 ): Promise<DestinatarioRow[]> {
-  const { data } = await admin
+  const { data, error } = await admin
     .from("campaign_recipients")
     .select(COLUNAS_DO_DESTINATARIO)
     .eq("campaign_id", campanhaId)
@@ -310,6 +311,11 @@ async function pendentesDaCampanha(
     .or(`next_attempt_at.is.null,next_attempt_at.lte.${agora.toISOString()}`)
     .order("created_at", { ascending: true })
     .limit(quantos);
+  // Sem conseguir ler a fila, ninguém sabe se ela acabou (F4j, J11 do cxj): lida
+  // como vazia, a campanha era concluída com gente pendente, e a vigia deixava de
+  // vê-la. A exceção sobe ao laço da rodada, que registra e segue com a campanha
+  // em andamento; a rajada para no mesmo laço.
+  if (error) throw new Error(`a fila da campanha não foi lida: ${error.message}`);
   return (data ?? []) as unknown as DestinatarioRow[];
 }
 
@@ -397,12 +403,16 @@ async function rodarUmaCampanha(
   if (!alvo) {
     // Nada pendente AGORA não é o mesmo que nada pendente: pode haver gente
     // esperando `next_attempt_at`. Só conclui quem não tem mais nenhum em voo.
-    const { count } = await admin
+    const { count, error } = await admin
       .from("campaign_recipients")
       .select("id", { count: "exact", head: true })
       .eq("campaign_id", campanha.id)
       .in("status", ["pending", "queued", "sending"]);
-    if ((count ?? 0) > 0) return { enviadas: 0, pulados: 0, concluidas: 0, detalhe: "aguardando" };
+    // Só a contagem LIDA conclui: o erro, ou a contagem que não veio, não é zero (F4j, J11).
+    if (error || typeof count !== "number") {
+      throw new Error(`a contagem da fila da campanha não foi lida: ${error?.message ?? "sem contagem"}`);
+    }
+    if (count > 0) return { enviadas: 0, pulados: 0, concluidas: 0, detalhe: "aguardando" };
 
     const { data } = await admin
       .from("campaigns")
@@ -681,7 +691,9 @@ async function rodarUmaCampanha(
     // `maxBaloes = baloesPrevistos`: o teto foi conferido para esse número.
     const baloes = comModelo ? [corpo] : baloesDaCampanha(corpo, dividir, baloesPrevistos);
     const relogioDosBaloes = Date.now();
-    const { primeira, desfecho: mensagem, indiceDoDesfecho } = await enviarEmBaloes(baloes, {
+    // O tipo vai explícito: com o `registrar` e o `parar` lendo o desfecho, o
+    // compilador não o tira mais do retorno do `enviar`.
+    const { primeira, desfecho: mensagem, indiceDoDesfecho } = await enviarEmBaloes<Message>(baloes, {
       enviar: async (texto, i) => {
         try {
           return await sendMessageHandler(
@@ -734,13 +746,19 @@ async function rodarUmaCampanha(
       // `agora` da rodada deixava o destinatário seguinte sair a menos de
       // `throttleMs` do último balão (medido na prova de tela: 941 ms). O 1º
       // balão segue com `agora`, como o envio único de antes.
-      registrar: (i) =>
-        recordSend(
-          pool,
-          campanha.organization_id,
-          sessionEscolhida,
-          i === 0 ? agora : new Date(agora.getTime() + (Date.now() - relogioDosBaloes)),
-        ),
+      // A mensagem da prospecção que o canal segurou com certeza (o handler não
+      // chamou o provedor) não entra: ela não sai nunca (F4i, A1), e contá-la
+      // gastava o teto do dia do número com uma tentativa que não falou com
+      // ninguém (F4j, J05/J09 do cxj). A incerta entra: pode ter saído.
+      registrar: (i, desfecho) =>
+        ehProspeccao(campanha) && retidaPeloCanal(desfecho)
+          ? Promise.resolve()
+          : recordSend(
+              pool,
+              campanha.organization_id,
+              sessionEscolhida,
+              i === 0 ? agora : new Date(agora.getTime() + (Date.now() - relogioDosBaloes)),
+            ),
       // Pausa curta e fixa no ritmo anti-ban do número, nunca o intervalo da
       // campanha: este laço é dividido por todas as campanhas da instalação.
       esperar: () => new Promise((ok) => setTimeout(ok, pausaEntreBaloes(knobs))),
@@ -752,9 +770,12 @@ async function rodarUmaCampanha(
       ...(ehProspeccao(campanha)
         ? {
             continuar: async () => (await conferenciaFinal(admin, entrega, agora, ESTADOS_DE_QUEM_RECEBEU)) === null,
-            // O balão que o canal segurou na fila física (F4i, A1) para os
-            // seguintes: se o canal voltasse na pausa, o próximo sairia sem ele.
-            parar: retidaPeloCanal,
+            // O balão que não saiu para os seguintes: o que o canal segurou na
+            // fila física (F4i, A1), porque se o canal voltasse na pausa o
+            // próximo sairia sem ele; e o incerto (`queued` sem o motivo), porque
+            // o seguinte que saísse viraria o desfecho e esconderia a incerteza
+            // (F4j, J04 do cxj).
+            parar: (desfecho) => !SAIU.has(desfecho.status ?? ""),
           }
         : {}),
     });
@@ -880,7 +901,14 @@ export function retidaPeloCanal(m: { status?: string | null; metadata?: unknown 
  *    1º balão, retido com o motivo gravado pelo handler. Sem o motivo, o handler
  *    pode ter mandado e só não ter conseguido marcar `sent` — voltar à fila
  *    repetiria a mensagem; num balão seguinte, o começo já saiu. Nos dois casos
- *    o destinatário fica `failed`, e ninguém recebe de novo.
+ *    o destinatário fica `failed`, e ninguém recebe de novo. O código diz a
+ *    certeza: `canal_indisponivel` quando o canal segurou, `envio_incerto`
+ *    quando pode ter saído.
+ * 3. Escrita recusada pelo banco não passa por desfecho normal (F4j, J06 do cxj):
+ *    a da mensagem fica no log (ela segue `queued`, e o resgate não manda
+ *    prospecção); a do destinatário fica no log e no desfecho
+ *    (`fila:sem_registro`). Ele segue reservado (`sending`): nenhuma rodada o
+ *    pega de novo, e nada sai — o mesmo do veto sem registro (`aplicarVeto`).
  */
 async function desfechoDaFilaDoCanal(
   admin: SupabaseClient,
@@ -895,7 +923,7 @@ async function desfechoDaFilaDoCanal(
   },
 ): Promise<{ enviadas: number; pulados: number; concluidas: number; detalhe: string; numero?: string }> {
   if (d.retida.id) {
-    await admin
+    const { error } = await admin
       .from("messages")
       .update({
         status: "failed",
@@ -905,10 +933,26 @@ async function desfechoDaFilaDoCanal(
       .eq("id", d.retida.id)
       .eq("organization_id", d.organizationId)
       .eq("status", "queued");
+    if (error) {
+      logger.error("[campanha] a mensagem retida não saiu da fila física", {
+        mensagem: d.retida.id,
+        destinatario: d.destinatarioId,
+        erro: error.message,
+      });
+    }
   }
   const motivo = (d.retida.metadata as { queued_reason?: string } | null | undefined)?.queued_reason ?? null;
-  if (d.indiceDoDesfecho === 0 && retidaPeloCanal(d.retida)) {
-    await admin
+  const certa = retidaPeloCanal(d.retida);
+  const semRegistro = (codigo: string, erro: string) => {
+    logger.error("[campanha] o desfecho da fila do canal não foi gravado", {
+      destinatario: d.destinatarioId,
+      codigo,
+      erro,
+    });
+    return { enviadas: 0, pulados: 0, concluidas: 0, detalhe: "fila:sem_registro" };
+  };
+  if (d.indiceDoDesfecho === 0 && certa) {
+    const { error } = await admin
       .from("campaign_recipients")
       .update({
         status: "pending",
@@ -919,10 +963,11 @@ async function desfechoDaFilaDoCanal(
       })
       .eq("id", d.destinatarioId)
       .eq("status", "sending");
+    if (error) return semRegistro("canal_indisponivel", error.message);
     return { enviadas: 0, pulados: 0, concluidas: 0, detalhe: "fila:canal_indisponivel" };
   }
-  const codigo = d.indiceDoDesfecho === 0 ? "envio_incerto" : "canal_indisponivel";
-  await admin
+  const codigo = certa ? "canal_indisponivel" : "envio_incerto";
+  const { error } = await admin
     .from("campaign_recipients")
     .update({
       status: "failed",
@@ -932,6 +977,8 @@ async function desfechoDaFilaDoCanal(
     })
     .eq("id", d.destinatarioId)
     .eq("status", "sending");
+  // O número conta como usado nos dois casos: o começo, ou a própria mensagem, pode ter saído.
+  if (error) return { ...semRegistro(codigo, error.message), numero: d.numero };
   return { enviadas: 0, pulados: 0, concluidas: 0, detalhe: `fila:${codigo}`, numero: d.numero };
 }
 

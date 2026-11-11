@@ -106,9 +106,14 @@ function valorDaColuna(l: Linha, coluna: string): unknown {
  */
 function fakeAdmin(
   tabelas: Tabelas,
-  opcoes: { depoisDoUpdate?: (n: number) => Promise<void>; falhas?: readonly string[] } = {},
+  opcoes: {
+    depoisDoUpdate?: (n: number) => Promise<void>;
+    falhas?: readonly string[];
+    /** A escrita que o banco recusa (F4j, J06): só o `update` cujo patch casar, e não a leitura da tabela. */
+    recusar?: (tabela: string, patch: Linha) => boolean;
+  } = {},
 ) {
-  const { depoisDoUpdate, falhas = [] } = opcoes;
+  const { depoisDoUpdate, falhas = [], recusar } = opcoes;
   let updates = 0;
   const de = (tabela: string) => {
     const filtros: Array<(l: Linha) => boolean> = [];
@@ -119,6 +124,9 @@ function fakeAdmin(
     const falhou = () => falhas.some((f) => f === tabela || [...colunas].some((c) => f === `${tabela}|${c}`));
     const resolver = async () => {
       if (falhou()) return { data: null, error: { message: `leitura de ${tabela} falhou` }, count: null };
+      if (patch && recusar?.(tabela, patch)) {
+        return { data: null, error: { message: `o banco recusou a escrita em ${tabela}` }, count: null };
+      }
       const linhas = (tabelas[tabela] ?? []).filter((l) => filtros.every((f) => f(l))).slice(0, limite);
       if (patch) {
         for (const l of linhas) Object.assign(l, patch);
@@ -1309,23 +1317,46 @@ function cadeiaComErro(mensagem: string): Record<string, unknown> {
   return cadeia;
 }
 
-describe("6. os contratos da revisão F4i do cxj (11/11/2026): a fila do canal, todos os balões, a passagem", () => {
-  const APROVADO = "+5588999990000";
-  const emBaloes = (texto = "Primeiro parágrafo.\n\nSegundo parágrafo.") =>
-    cenario(campanha("legitimate_interest", { split_messages: true }), pendente("ana", ["funil-a"], { rendered_body: texto }));
-  /** O handler devolve a mensagem que ficou na fila física (`queued`), com o motivo que o handler grava, ou sem ele. */
-  const naFila = (tabelas: Tabelas, id: string, motivo: string | null = "channel_session_not_working") => {
-    const linha: Linha = {
-      id,
-      organization_id: "org-1",
-      status: "queued",
-      metadata: { source: "campaign", campaign_id: "camp", ...(motivo ? { queued_reason: motivo } : {}) },
-    };
-    tabelas.messages!.push(linha);
-    return structuredClone(linha);
+const APROVADO = "+5588999990000";
+const emBaloes = (texto = "Primeiro parágrafo.\n\nSegundo parágrafo.") =>
+  cenario(campanha("legitimate_interest", { split_messages: true }), pendente("ana", ["funil-a"], { rendered_body: texto }));
+/** O handler devolve a mensagem que ficou na fila física (`queued`), com o motivo que o handler grava, ou sem ele. */
+const naFila = (tabelas: Tabelas, id: string, motivo: string | null = "channel_session_not_working") => {
+  const linha: Linha = {
+    id,
+    organization_id: "org-1",
+    status: "queued",
+    metadata: { source: "campaign", campaign_id: "camp", ...(motivo ? { queued_reason: motivo } : {}) },
   };
-  const mensagemDe = (tabelas: Tabelas, id: string) => tabelas.messages!.find((m) => m.id === id);
+  tabelas.messages!.push(linha);
+  return structuredClone(linha);
+};
+const mensagemDe = (tabelas: Tabelas, id: string) => tabelas.messages!.find((m) => m.id === id);
+/** Duas campanhas de prospecção com os principais fora do ar: o único número que fala é o vinculado comum (#3112). */
+const duasCampanhasNoVinculado = (): Tabelas => {
+  const sessao = (id: string, status: string): Linha => ({ id, organization_id: "org-1", status, daily_message_limit: null });
+  return {
+    campaigns: [
+      campanha("legitimate_interest", { id: "camp-a", channel_session_id: "principal-a" }),
+      campanha("legitimate_interest", { id: "camp-b", channel_session_id: "principal-b", started_at: "2026-11-18T11:55:05.000Z" }),
+    ],
+    campaign_recipients: [
+      pendente("ana", ["funil-a"], { campaign_id: "camp-a" }),
+      pendente("bia", ["funil-a"], { campaign_id: "camp-b", recipient_address: "+5588999991111" }, { phone_number: "+5588999991111" }),
+    ],
+    campaign_channel_sessions: [
+      { organization_id: "org-1", campaign_id: "camp-a", channel_session_id: "vinculado" },
+      { organization_id: "org-1", campaign_id: "camp-b", channel_session_id: "vinculado" },
+    ],
+    channel_sessions: [sessao("principal-a", "STOPPED"), sessao("principal-b", "STOPPED"), sessao("vinculado", "WORKING")],
+    campaign_suppressions: [],
+    messages: [],
+    crm_leads: [],
+    conversations: [],
+  };
+};
 
+describe("6. os contratos da revisão F4i do cxj (11/11/2026): a fila do canal, todos os balões, a passagem", () => {
   it("I05 ⭐ o canal segurou a mensagem (queued, com o motivo): não conta como enviada, sai da fila física, e a pessoa volta à fila da campanha", async () => {
     const { tabelas, admin } = cenario(campanha("legitimate_interest"), pendente("ana"));
     mundo.aoEnviar = async () => naFila(tabelas, "m-retida");
@@ -1567,27 +1598,7 @@ describe("6. os contratos da revisão F4i do cxj (11/11/2026): a fila do canal, 
   );
 
   it("A1 o envio incerto conta o número como usado: a outra campanha que divide o vinculado não fala por ele na mesma rodada", async () => {
-    const sessao = (id: string, status: string): Linha => ({ id, organization_id: "org-1", status, daily_message_limit: null });
-    const tabelas: Tabelas = {
-      campaigns: [
-        campanha("legitimate_interest", { id: "camp-a", channel_session_id: "principal-a" }),
-        campanha("legitimate_interest", { id: "camp-b", channel_session_id: "principal-b", started_at: "2026-11-18T11:55:05.000Z" }),
-      ],
-      campaign_recipients: [
-        pendente("ana", ["funil-a"], { campaign_id: "camp-a" }),
-        pendente("bia", ["funil-a"], { campaign_id: "camp-b", recipient_address: "+5588999991111" }, { phone_number: "+5588999991111" }),
-      ],
-      // Os dois principais fora do ar: o único número que fala é o vinculado comum.
-      campaign_channel_sessions: [
-        { organization_id: "org-1", campaign_id: "camp-a", channel_session_id: "vinculado" },
-        { organization_id: "org-1", campaign_id: "camp-b", channel_session_id: "vinculado" },
-      ],
-      channel_sessions: [sessao("principal-a", "STOPPED"), sessao("principal-b", "STOPPED"), sessao("vinculado", "WORKING")],
-      campaign_suppressions: [],
-      messages: [],
-      crm_leads: [],
-      conversations: [],
-    };
+    const tabelas = duasCampanhasNoVinculado();
     mundo.aoEnviar = async () => naFila(tabelas, `m-${mundo.envios.length}`, null);
     await rodarUmaRodadaDeCampanha(fakeAdmin(tabelas), QUARTA);
     expect(mundo.envios).toEqual(["conv:ana:vinculado"]);
@@ -1631,5 +1642,191 @@ describe("6. os contratos da revisão F4i do cxj (11/11/2026): a fila do canal, 
     await expect(entregaPeloAtor(admin, doAtor("org-1", "webhook_source"), { campaign_recipient_id: "r-ana" })).rejects.toMatchObject({
       veto: { esperar: "sem_leitura" },
     });
+  });
+});
+
+describe("7. os contratos da revisão F4j do cxj (11/11/2026): a fila que não se lê, a escrita recusada, o teto do número, o balão incerto", () => {
+  // ─── J11: a campanha não conclui sem a prova de que a fila acabou ───
+
+  it("J11 ⭐ sem conseguir ler a fila, a campanha não conclui: segue em andamento, a pessoa segue pendente, e nada sai", async () => {
+    const { tabelas, admin } = cenario(campanha("legitimate_interest"), pendente("ana"), [], { falhas: ["campaign_recipients"] });
+    const r = await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(unica(tabelas, "campaigns").status).toBe("running");
+    expect(unica(tabelas, "campaign_recipients").status).toBe("pending");
+    expect(mundo.envios).toEqual([]);
+    expect(r).toMatchObject({ concluidas: 0 });
+  });
+
+  it("J11 ⭐ só a leitura dos pendentes falha (a contagem funciona): a rodada diz erro, e não espera normal", async () => {
+    // Sem esta prova, a leitura que falha viraria fila vazia e a contagem diria “aguardando”: a campanha não
+    // concluiria, mas o erro sumiria do resultado e do log.
+    const { tabelas, admin } = cenario(campanha("legitimate_interest"), pendente("ana"));
+    const inteiro = admin as unknown as { from: (t: string) => Record<string, unknown> };
+    const semLeitura = {
+      from: (tabela: string) => {
+        const consulta = inteiro.from(tabela);
+        if (tabela !== "campaign_recipients") return consulta;
+        return new Proxy(consulta, {
+          get: (alvo, metodo) =>
+            metodo === "select"
+              ? (colunas: string, opcoes?: { head?: boolean }) =>
+                  opcoes?.head
+                    ? (alvo.select as (c: string, o?: unknown) => unknown)(colunas, opcoes)
+                    : cadeiaComErro("leitura da fila falhou")
+              : alvo[metodo as string],
+        });
+      },
+    };
+    const r = await rodarUmaRodadaDeCampanha(semLeitura as never, QUARTA);
+    expect(r).toMatchObject({ detalhe: "camp:erro", concluidas: 0 });
+    expect(unica(tabelas, "campaigns").status).toBe("running");
+    expect(unica(tabelas, "campaign_recipients").status).toBe("pending");
+    expect(mundo.envios).toEqual([]);
+  });
+
+  it("J11 ⭐ ninguém pendente agora, mas a contagem dos que faltam falha (há um em voo): não conclui", async () => {
+    const { tabelas, admin } = cenario(campanha("legitimate_interest"), pendente("ana", ["funil-a"], { status: "sending" }));
+    const inteiro = admin as unknown as { from: (t: string) => Record<string, unknown> };
+    const semContagem = {
+      from: (tabela: string) => {
+        const consulta = inteiro.from(tabela);
+        if (tabela !== "campaign_recipients") return consulta;
+        return new Proxy(consulta, {
+          get: (alvo, metodo) =>
+            metodo === "select"
+              ? (colunas: string, opcoes?: { head?: boolean }) =>
+                  opcoes?.head ? cadeiaComErro("contagem da fila falhou") : (alvo.select as (c: string) => unknown)(colunas)
+              : alvo[metodo as string],
+        });
+      },
+    };
+    const r = await rodarUmaRodadaDeCampanha(semContagem as never, QUARTA);
+    expect(unica(tabelas, "campaigns").status).toBe("running");
+    expect(r).toMatchObject({ concluidas: 0 });
+  });
+
+  it("J11 controle: a fila está mesmo vazia (todos já receberam): conclui", async () => {
+    const { tabelas, admin } = cenario(campanha("legitimate_interest"), pendente("ana", ["funil-a"], { status: "sent" }));
+    const r = await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(unica(tabelas, "campaigns").status).toBe("completed");
+    expect(r).toMatchObject({ concluidas: 1 });
+  });
+
+  // ─── J06: a escrita do desfecho que o banco recusa não passa por espera normal ───
+
+  it.each([
+    ["a volta à fila (retida, com o motivo)", "channel_session_not_working", "pending"],
+    ["a falha do envio incerto", null, "failed"],
+  ] as const)(
+    "J06 ⭐ o banco recusa %s: a rodada diz que ficou sem registro, deixa log, e o destinatário segue reservado",
+    async (_caso, motivo, statusRecusado) => {
+      const { tabelas } = cenario(campanha("legitimate_interest"), pendente("ana"));
+      const admin = fakeAdmin(tabelas, { recusar: (t, p) => t === "campaign_recipients" && p.status === statusRecusado });
+      mundo.aoEnviar = async () => naFila(tabelas, "m-retida", motivo);
+      const r = await rodarUmaRodadaDeCampanha(admin, QUARTA);
+      expect(unica(tabelas, "campaign_recipients").status).toBe("sending");
+      expect(r.detalhe).toBe("camp:fila:sem_registro");
+      expect(mundo.erros).toEqual([
+        ["[campanha] o desfecho da fila do canal não foi gravado", expect.objectContaining({ destinatario: "r-ana" })],
+      ]);
+    },
+  );
+
+  it("J06 o banco recusa a falha do envio incerto: o número conta como usado do mesmo jeito (a mensagem pode ter saído)", async () => {
+    const tabelas = duasCampanhasNoVinculado();
+    const admin = fakeAdmin(tabelas, { recusar: (t, p) => t === "campaign_recipients" && p.status === "failed" });
+    mundo.aoEnviar = async () => naFila(tabelas, `m-${mundo.envios.length}`, null);
+    await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(mundo.envios).toEqual(["conv:ana:vinculado"]);
+  });
+
+  it("J06 o banco recusa tirar a mensagem retida da fila física: deixa log, e a pessoa volta à fila da campanha (o resgate não manda prospecção)", async () => {
+    const { tabelas } = cenario(campanha("legitimate_interest"), pendente("ana"));
+    const admin = fakeAdmin(tabelas, { recusar: (t, p) => t === "messages" && p.status === "failed" });
+    mundo.aoEnviar = async () => naFila(tabelas, "m-retida");
+    const r = await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(mensagemDe(tabelas, "m-retida")).toMatchObject({ status: "queued" });
+    expect(unica(tabelas, "campaign_recipients")).toMatchObject({ status: "pending", last_error_code: "canal_indisponivel" });
+    expect(r.detalhe).toBe("camp:fila:canal_indisponivel");
+    expect(mundo.erros).toEqual([
+      ["[campanha] a mensagem retida não saiu da fila física", expect.objectContaining({ mensagem: "m-retida" })],
+    ]);
+  });
+
+  // ─── J05/J09: a tentativa que o canal segurou não gasta o teto do número ───
+
+  it("J05 ⭐ a mensagem que o canal segurou (o handler não chamou o provedor) não entra no registro de envios do número", async () => {
+    const { tabelas, admin } = cenario(campanha("legitimate_interest"), pendente("ana"));
+    mundo.aoEnviar = async () => naFila(tabelas, "m-retida");
+    await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(mundo.ledger.get("chip") ?? []).toEqual([]);
+  });
+
+  it("J05 controle: o envio incerto (pode ter saído) entra no registro do número; e, na campanha de consentimento, a retida também (o resgate a manda)", async () => {
+    const incerto = cenario(campanha("legitimate_interest"), pendente("ana"));
+    mundo.aoEnviar = async () => naFila(incerto.tabelas, "m-incerta", null);
+    await rodarUmaRodadaDeCampanha(incerto.admin, QUARTA);
+    expect(mundo.ledger.get("chip")).toHaveLength(1);
+    mundo.ledger.clear();
+    const consentimento = cenario(campanha("consent"), pendente("ana"));
+    mundo.aoEnviar = async () => naFila(consentimento.tabelas, "m-retida");
+    await rodarUmaRodadaDeCampanha(consentimento.admin, QUARTA);
+    expect(mundo.ledger.get("chip")).toHaveLength(1);
+  });
+
+  const comUmaVagaNoDia = (usadas: number) => {
+    const c = cenario(campanha("legitimate_interest"), pendente("ana"));
+    // Sem provider conhecido, o número conta como de risco (fail-closed de `canalTemRiscoDeBanimento`): o teto do
+    // dia vale, sem nomear o provider fora de lib/channels/ (doutrina restricao-de-canal).
+    Object.assign(c.tabelas.channel_sessions![0]!, { daily_message_limit: 60 });
+    mundo.knobs = { ...mundo.knobs, warmupDailyCaps: [{ minAgeDays: 0, cap: null }] } as PacingKnobs;
+    mundo.ledger.set("chip", Array.from({ length: usadas }, () => new Date(QUARTA.getTime() - 3_600_000)));
+    return c;
+  };
+
+  it("J09 ⭐ com uma vaga no dia, a retenção não a gasta: o canal volta, e a pessoa recebe na rodada seguinte", async () => {
+    const { tabelas, admin } = comUmaVagaNoDia(59);
+    mundo.aoEnviar = async () => naFila(tabelas, "m-retida");
+    await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(unica(tabelas, "campaign_recipients").status).toBe("pending");
+    mundo.aoEnviar = null;
+    await rodarUmaRodadaDeCampanha(admin, new Date(QUARTA.getTime() + 120_000));
+    expect(unica(tabelas, "campaign_recipients")).toMatchObject({ status: "sent" });
+  });
+
+  it("J09 controle do cenário: com o teto do dia cheio (60 de 60), não sai", async () => {
+    const { tabelas, admin } = comUmaVagaNoDia(60);
+    await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(mundo.envios).toEqual([]);
+    expect(unica(tabelas, "campaign_recipients").status).toBe("pending");
+  });
+
+  // ─── J04: o balão que não saiu, retido ou incerto, para os seguintes ───
+
+  it("J04 ⭐ balões: o 1º voltou incerto (queued sem o motivo), e o 2º não sai: a incerteza não fica escondida atrás de um balão que saiu", async () => {
+    const { tabelas, admin } = emBaloes();
+    mundo.aoEnviar = async () => (mundo.envios.length === 1 ? naFila(tabelas, "m-1", null) : { id: "m-2", status: "sent" });
+    const r = await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(mundo.envios).toEqual(["conv:ana:chip"]);
+    expect(unica(tabelas, "campaign_recipients")).toMatchObject({
+      status: "failed",
+      last_error_code: "envio_incerto",
+      message_id: "m-1",
+    });
+    expect(r).toMatchObject({ enviadas: 0 });
+  });
+
+  it("J04 balões: o 2º voltou incerto: o 3º não sai, e o destinatário fica com o envio incerto (o começo saiu)", async () => {
+    const { tabelas, admin } = emBaloes("Um.\n\nDois.\n\nTrês.");
+    mundo.aoEnviar = async () =>
+      mundo.envios.length === 1 ? { id: "m-1", status: "sent" } : naFila(tabelas, `m-${mundo.envios.length}`, null);
+    await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(mundo.envios).toHaveLength(2);
+    expect(unica(tabelas, "campaign_recipients")).toMatchObject({
+      status: "failed",
+      last_error_code: "envio_incerto",
+      message_id: "m-1",
+    });
+    expect(mensagemDe(tabelas, "m-2")).toMatchObject({ status: "failed", error_code: "campanha_sem_reenvio" });
   });
 });
