@@ -27,50 +27,64 @@ export const TAMANHO_MAXIMO_DA_CHAVE = 200;
 export const MAXIMO_DE_CHAVES_NO_FILTRO = 100;
 
 /**
- * Os caracteres proibidos em QUALQUER posição da chave (e do prefixo). A MESMA lista está na
- * constraint `crm_tasks_external_id_formato` (migration 9252) — se mudar aqui, mude lá:
- *  · controles C0 (U+0000–U+001F), DEL (U+007F) e controles C1 (U+0080–U+009F);
- *  · os espaços Unicode: categoria Zs menos o U+0020 (U+00A0, U+1680, U+2000–U+200A, U+202F,
- *    U+205F, U+3000), mais U+2028, U+2029 e U+FEFF;
- *  · o `*`, que o PostgREST traduz como curinga no LIKE do filtro por prefixo.
- * Ficam permitidos, de propósito, os invisíveis de formatação que não são espaço (U+200B–U+200D,
- * U+2060): o ZWJ compõe emojis. Quem monta chave canônica não deve usá-los.
+ * O DOMÍNIO da chave: uma LISTA DE CARACTERES PERMITIDOS, idêntica à da constraint
+ * `crm_tasks_external_id_formato` (migration 9252) — se mudar aqui, mude lá (o invariante
+ * `tests/invariants/tarefas-chave-externa.test.ts` compara, ponto de código a ponto de código,
+ * o que o Postgres aceita com o que esta regra aceita, de U+0001 a U+10FFFF):
+ *  · ASCII: letras A–Z e a–z, dígitos 0–9 (a classe explícita, nunca `\d`, que no Unicode casa
+ *    dígitos de outras escritas) e a pontuação `| / . : -`;
+ *  · as letras pré-compostas do Latin-1, U+00C0–U+00FF, menos o `×` (U+00D7) e o `÷` (U+00F7);
+ *  · NENHUM espaço (decisão do coordenador, 11/11/2026: começar estreito — alargar depois é
+ *    compatível, estreitar não é; as chaves reais não têm espaço).
+ * Fica de fora tudo o mais: espaço, marcas combinantes, outras escritas, largura zero, surrogate
+ * isolado, emoji, e `* " \ , ( ) + % ? # & = _` e a crase. Por que uma lista e não "tudo menos o
+ * proibido": a forma normal NFC não é a mesma no PostgreSQL 15 e no Node (Unicode 17): o cxj achou
+ * 20 caracteres em que as duas divergem (D9v2-2). A letra pré-composta do Latin-1 é NFC em qualquer
+ * versão do Unicode, então a questão deixa de existir; ninguém precisa de `normalize()`.
  */
-const CARACTERE_PROIBIDO =
-  /[\u0000-\u001f\u007f-\u009f\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff*]/;
+const LETRAS = "A-Za-z0-9\\u00c0-\\u00d6\\u00d8-\\u00f6\\u00f8-\\u00ff";
+// O hífen vai por ÚLTIMO na classe (literal).
+const CLASSE = `[${LETRAS}|/.:-]`;
+
+/** A chave inteira e o prefixo têm o mesmo domínio (sem espaço, não há regra de pontas). */
+export const REGEX_DA_CHAVE = new RegExp(`^${CLASSE}+$`);
+export const REGEX_DO_PREFIXO = REGEX_DA_CHAVE;
 
 /** Conta pontos de código, como o `char_length` do Postgres (não unidades UTF-16). */
 function tamanho(valor: string): number {
   return Array.from(valor).length;
 }
 
-/** O que a chave e o prefixo têm em comum: tamanho, caracteres proibidos e a forma NFC. */
-function comRegrasComuns(base: z.ZodString) {
+const MENSAGEM_DO_DOMINIO =
+  "A chave só pode ter letras (A–Z, a–z e as acentuadas do Latin-1, como ç e ã), dígitos de 0 a 9 " +
+  "e os sinais | / . : - (sem espaço).";
+
+function comRegrasComuns(base: z.ZodString, regex: RegExp) {
   return base
     .refine((v) => tamanho(v) >= 1, { message: "A chave não pode ser vazia." })
     .refine((v) => tamanho(v) <= TAMANHO_MAXIMO_DA_CHAVE, {
       message: `A chave tem no máximo ${TAMANHO_MAXIMO_DA_CHAVE} caracteres.`,
     })
-    .refine((v) => !v.startsWith(" "), { message: "A chave não pode ter espaço no início." })
-    .refine((v) => !CARACTERE_PROIBIDO.test(v), {
-      message:
-        "A chave não pode ter caractere de controle, espaço Unicode (como o NBSP), separador de linha ou asterisco.",
-    })
-    .refine((v) => v === v.normalize("NFC"), {
-      message: "A chave precisa estar em NFC (letra acentuada composta, não decomposta).",
-    });
+    .refine((v) => regex.test(v), { message: MENSAGEM_DO_DOMINIO });
 }
 
-/** A chave de uma tarefa: a regra inteira, idêntica à constraint do banco. */
-export const chaveExternaSchema = comRegrasComuns(z.string()).refine((v) => !v.endsWith(" "), {
-  message: "A chave não pode ter espaço no fim.",
-});
+/** A chave de uma tarefa: o domínio inteiro, idêntico à constraint do banco. */
+export const chaveExternaSchema = comRegrasComuns(z.string(), REGEX_DA_CHAVE);
+
+/** O prefixo do filtro: o mesmo domínio (um pedaço de chave). */
+export const prefixoDeChaveSchema = comRegrasComuns(z.string(), REGEX_DO_PREFIXO);
 
 /**
- * O prefixo do filtro: a mesma regra, exceto o espaço no FIM — um prefixo é um pedaço de chave e
- * pode legitimamente terminar em espaço ("Folha de "); só a chave inteira não pode.
+ * O valor do filtro `in` na gramática do PostgREST: `("a","b")`, cada valor SEMPRE entre aspas, com
+ * `\` e `"` escapados (nessa ordem). O `.in()` do supabase-js só põe aspas em valor com `,()` e não
+ * escapa `"` nem `\`: o PostgREST então lê OUTRA expressão (D9v2-1: 200 com total 0 e a linha
+ * existindo, ou a chave de outra linha). Com o domínio fechado, `"` e `\` nem chegam aqui (422);
+ * a serialização correta fica como defesa e é provada no gate por uma tabela sem a constraint.
  */
-export const prefixoDeChaveSchema = comRegrasComuns(z.string());
+export function valorDoFiltroIn(valores: readonly string[]): string {
+  const um = (v: string) => `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+  return `(${valores.map(um).join(",")})`;
+}
 
 /** Escapa `\`, `%` e `_` para o valor entrar num `ilike`/`like` como texto literal. */
 export function escaparParaLike(texto: string): string {

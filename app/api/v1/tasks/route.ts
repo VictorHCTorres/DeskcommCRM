@@ -42,6 +42,7 @@ import {
   escaparParaLike,
   MAXIMO_DE_CHAVES_NO_FILTRO,
   prefixoDeChaveSchema,
+  valorDoFiltroIn,
 } from "@/lib/tarefas/chave-externa";
 import { buscarDonaDaChave } from "@/lib/tarefas/dona-da-chave";
 import { conferirDemanda } from "@/lib/tarefas/demanda";
@@ -214,7 +215,9 @@ async function listar(req: NextRequest): Promise<Response> {
   if (filtros.assigned_to === "me") query = query.eq("assigned_to", usuario!);
   else if (filtros.assigned_to === "ninguem") query = query.is("assigned_to", null);
   else if (filtros.assigned_to) query = query.eq("assigned_to", filtros.assigned_to);
-  if (filtros.external_id) query = query.in("external_id", filtros.external_id);
+  // NÃO usar `.in()` do supabase-js: ele não escapa `"` e `\` nos valores (D9v2-1). `valorDoFiltroIn`
+  // põe cada valor entre aspas e escapa as duas, na gramática do PostgREST.
+  if (filtros.external_id) query = query.filter("external_id", "in", valorDoFiltroIn(filtros.external_id));
   if (filtros.external_id_prefix) {
     query = query.like("external_id", `${escaparParaLike(filtros.external_id_prefix)}%`);
   }

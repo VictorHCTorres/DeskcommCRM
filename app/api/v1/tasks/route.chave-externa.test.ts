@@ -78,6 +78,7 @@ function banco(roteiro: Resultado[]) {
         "select",
         "eq",
         "in",
+        "filter",
         "is",
         "like",
         "ilike",
@@ -297,7 +298,13 @@ describe("POST /api/v1/tasks — external_id", () => {
     ["NBSP no fim", "ab\u00a0"],
     ["NFD (ó decomposto)", "contab|rotina|6249|Pro\u0301-labore"],
     ["controle C1", "a\u0085b"],
-  ])("D9 v2: POST recusa com 422: %s", async (_nome, valor) => {
+    ["aspa dupla", 'a"b'],
+    ["barra invertida", "a\\b"],
+    ["vírgula e parênteses", "a,(b)"],
+    ["surrogate isolado (antes: 500)", "k:\ud800"],
+    ["emoji", "a😀"],
+    ["o par do cxj (U+105D2 + ponto)", "k:\u{105D2}\u0307"],
+  ])("D9 v3: POST recusa com 422: %s", async (_nome, valor) => {
     const { cliente } = banco([]);
     mockedAuth.mockResolvedValue(autorizado(cliente) as never);
 
@@ -307,17 +314,17 @@ describe("POST /api/v1/tasks — external_id", () => {
     expect(mockedGravar).not.toHaveBeenCalled();
   });
 
-  it("aceita 200 caracteres e chave com espaço no MEIO", async () => {
+  it("aceita 200 caracteres e recusa espaço no MEIO (sem espaço nenhum)", async () => {
     const { cliente } = banco([]);
     mockedAuth.mockResolvedValue(autorizado(cliente) as never);
     mockedGravar.mockResolvedValue({ tarefa: { id: TAREFA_ID } as never, erro: null });
 
     expect((await postar({ title: "x", external_id: "x".repeat(200) })).status).toBe(201);
-    expect((await postar({ title: "x", external_id: "a b" })).status).toBe(201);
+    expect((await postar({ title: "x", external_id: "a b" })).status).toBe(422);
     const gravadas = mockedGravar.mock.calls.map(
       (c) => (c[1] as Record<string, unknown>).external_id,
     );
-    expect(gravadas).toEqual(["x".repeat(200), "a b"]);
+    expect(gravadas).toEqual(["x".repeat(200)]);
   });
 
   it("a recusa da autenticação também leva o cabeçalho de capacidade", async () => {
@@ -355,7 +362,7 @@ describe("GET /api/v1/tasks — filtros por chave e meta.total", () => {
     expect(corpo.meta.total).toBe(1);
     expect(cadeias).toHaveLength(1); // nada de pais/filhas
     expect(sobrou()).toBe(0);
-    expect(cadeias[0]!.chamadas).toContainEqual(["in", ["external_id", ["a", "b"]]]);
+    expect(cadeias[0]!.chamadas).toContainEqual(["filter", ["external_id", "in", '("a","b")']]);
     expect(cadeias[0]!.chamadas).toContainEqual(["eq", ["organization_id", ORG]]);
   });
 
@@ -366,7 +373,7 @@ describe("GET /api/v1/tasks — filtros por chave e meta.total", () => {
     const res = await GET(pedido("https://crm.test/api/v1/tasks?external_id=so-uma"));
 
     expect(res.status).toBe(200);
-    expect(cadeias[0]!.chamadas).toContainEqual(["in", ["external_id", ["so-uma"]]]);
+    expect(cadeias[0]!.chamadas).toContainEqual(["filter", ["external_id", "in", '("so-uma")']]);
   });
 
   it("aceita 100 chaves e recusa 101 com 422", async () => {
@@ -389,20 +396,32 @@ describe("GET /api/v1/tasks — filtros por chave e meta.total", () => {
     expect(res.status).toBe(422);
   });
 
-  it("external_id_prefix casa por prefixo com %, _ e \\ escapados, sem expandir a família", async () => {
+  it("external_id_prefix casa por prefixo, sem expandir a família", async () => {
     const { cliente, cadeias } = banco([
       { data: [linha(TAREFA_ID, { parent_task_id: OUTRA_TAREFA_ID })], count: 1 },
     ]);
     mockedAuth.mockResolvedValue(autorizado(cliente) as never);
 
     const res = await GET(
-      pedido(`https://crm.test/api/v1/tasks?external_id_prefix=${encodeURIComponent("100%_a\\b")}`),
+      pedido(`https://crm.test/api/v1/tasks?external_id_prefix=${encodeURIComponent("contab|rotina|6249|")}`),
     );
 
     expect(res.status).toBe(200);
     expect(cadeias).toHaveLength(1);
-    expect(cadeias[0]!.chamadas).toContainEqual(["like", ["external_id", "100\\%\\_a\\\\b%"]]);
+    expect(cadeias[0]!.chamadas).toContainEqual(["like", ["external_id", "contab|rotina|6249|%"]]);
   });
+
+  it.each(["100%_a", "a\\b", 'a"b', "a,b", "a(b)"])(
+    "prefixo e chave exata fora do domínio (%j) são 422 antes de tocar o banco",
+    async (valor) => {
+      const { cliente } = banco([]);
+      mockedAuth.mockResolvedValue(autorizado(cliente) as never);
+      for (const param of ["external_id_prefix", "external_id"]) {
+        const res = await GET(pedido(`https://crm.test/api/v1/tasks?${param}=${encodeURIComponent(valor)}`));
+        expect(res.status).toBe(422);
+      }
+    },
+  );
 
   it("external_id_prefix vazio ou repetido é 422", async () => {
     const { cliente } = banco([]);

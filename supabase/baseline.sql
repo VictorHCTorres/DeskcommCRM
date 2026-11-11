@@ -75122,23 +75122,23 @@ create trigger trg_clickup_knowledge_attachment_revive
 -- leitura da lista corta em 500 linhas, então uma tarefa fora do corte também parece "não
 -- existir". Só um índice único fecha as duas portas: a rota apenas traduz o 23505 em 409.
 --
--- ─── A forma da chave (a rota recusa com 422 antes; a constraint é o último muro)
+-- ─── O domínio da chave (a rota recusa com 422 antes; a constraint é o último muro)
 --
--- UMA regra, idêntica no zod (`lib/tarefas/chave-externa.ts`) e aqui:
+-- UMA lista de caracteres PERMITIDOS, idêntica no zod (`lib/tarefas/chave-externa.ts`) e aqui
+-- (decisão do coordenador, 11/11/2026, depois do achado D9v2-2 do cxj):
 --   · de 1 a 200 pontos de código;
---   · espaço ASCII (U+0020) nas pontas: proibido (o `btrim` do Postgres só apara ele);
---   · proibidos em qualquer posição: controles C0 (U+0001–U+001F; o U+0000 o Postgres já não
---     guarda em `text`), U+007F e os controles C1 (U+0080–U+009F); os espaços Unicode (categoria
---     Zs menos o U+0020: U+00A0, U+1680, U+2000–U+200A, U+202F, U+205F, U+3000) mais U+2028,
---     U+2029 e U+FEFF; e o `*`, que o PostgREST traduz como curinga no operador LIKE do prefixo
---     (um `*` na chave faria o filtro por prefixo devolver tarefas que não têm o prefixo);
---   · a chave tem de estar em NFC (`is nfc normalized`): "ó" composto e decomposto seriam duas
---     chaves distintas para o mesmo texto, e o índice único não os reconheceria como iguais.
--- Nada é aparado nem normalizado em silêncio: quem manda a chave errada recebe 422.
--- Fica PERMITIDO o que a lista acima não nomeia: acentos em NFC, `|`, `/`, `:`, `%`, `_`, `\`
--- (o filtro por prefixo os escapa) e os caracteres invisíveis de formatação que não são espaço
--- (U+200B–U+200D, U+2060): o ZWJ é parte de emojis compostos, e proibir só uma parte deles seria
--- decisão sem lastro. Quem monta chave canônica não deve usá-los.
+--   · ASCII: letras A–Z e a–z, dígitos 0–9 (classe explícita; nunca `\d`) e `| / . : -`;
+--   · as letras pré-compostas do Latin-1, U+00C0–U+00FF, menos `×` (U+00D7) e `÷` (U+00F7);
+--   · NENHUM espaço (decisão do coordenador: começar estreito; alargar depois é compatível, estreitar não é).
+-- Fica de fora todo o resto: marcas combinantes, outras escritas, largura zero, surrogate, emoji, e
+-- `* " \ , ( ) + % ? # & = _` e a crase. Não há `normalize()` nem `is nfc normalized`: a forma NFC
+-- NÃO é a mesma no PostgreSQL 15 e no Node (Unicode 17: o cxj achou 20 caracteres em que divergem), e
+-- duas representações canonicamente equivalentes ocupariam duas linhas. A letra pré-composta do
+-- Latin-1 é NFC em qualquer versão do Unicode, então a questão some; as chaves reais do C1 e da F5
+-- (`contab|rotina|6249|Folha/Pró-labore|09/2026`) só usam esse repertório.
+-- `*` (curinga do LIKE no PostgREST), `"` e `\` (a gramática do filtro `in`) saem do domínio por
+-- construção. Nada é aparado nem normalizado em silêncio: quem manda a chave errada recebe 422.
+-- A igualdade das duas camadas é PROVADA por varredura de U+0001 a U+10FFFF (invariante do banco).
 --
 -- ─── O índice
 --
@@ -75199,33 +75199,13 @@ create trigger trg_clickup_knowledge_attachment_revive
 --   drop function if exists public.fn_crm_tasks_chave_externa_guarda();
 --   drop index if exists public.crm_tasks_org_external_id_unique;
 --   alter table public.crm_tasks drop constraint if exists crm_tasks_external_id_formato;
---   alter table public.crm_tasks drop column if exists external_id;
---
--- Com chaves já gravadas, o DROP COLUMN apaga o mapa de idempotência: exporte antes
--- `organization_id, id, external_id` (ver docs/D9-tarefas-chave-unica/VOLTA-D9.md). A volta de
--- software NÃO exige desfazer o schema: ele é aditivo.
---
--- Aditiva: nenhuma linha existente muda (a coluna nasce nula).
-
-alter table public.crm_tasks
-  add column if not exists external_id text;
-
--- Reaplicação auto-curativa: a constraint é derrubada e recriada, para que um banco que recebeu
--- uma versão anterior da regra (sem Unicode, só ASCII) fique com a regra desta. `not valid` +
--- `validate`: a coluna nasce toda nula, então validar é imediato, mas o par evita segurar o
--- bloqueio mais forte sobre uma tabela já em uso se um dia houver dado (o `validate` ainda toma
--- `share update exclusive`; o `add column` e o `create index` tomam bloqueios próprios: a migração
--- não é "sem bloqueio", só curta).
-alter table public.crm_tasks drop constraint if exists crm_tasks_external_id_formato;
 alter table public.crm_tasks
   add constraint crm_tasks_external_id_formato
   check (
     external_id is null
     or (
       char_length(external_id) between 1 and 200
-      and external_id = btrim(external_id)
-      and external_id !~ '[\x01-\x1f\x7f\u0080-\u009f\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff*]'
-      and external_id is nfc normalized
+      and external_id ~ '^[A-Za-z0-9\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u00ff|/.:-]+$'
     )
   ) not valid;
 alter table public.crm_tasks validate constraint crm_tasks_external_id_formato;
