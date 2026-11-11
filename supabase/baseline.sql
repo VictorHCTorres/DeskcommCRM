@@ -75113,7 +75113,7 @@ create trigger trg_clickup_knowledge_attachment_revive
 
 -- ---- chave externa única da tarefa (migration 9252) ----
 -- manifest: `crm_tasks.external_id` — chave externa única por organização, para que quem grava tarefa por token (robôs do n8n, importador) não crie a mesma tarefa em dobro (D9).
--- 9252: coluna nula + constraint de forma + índice único parcial `crm_tasks_org_external_id_unique`.
+-- 9252: coluna nula + constraint de forma + índice único parcial `crm_tasks_org_external_id_unique` + trava de quem escreve a chave.
 --
 -- ─── Por que o banco, e não a rota
 --
@@ -75145,8 +75145,31 @@ create trigger trg_clickup_knowledge_attachment_revive
 -- pessoal da pessoa física na chave (use o CNPJ/ID da obrigação, o mês, o tipo; nunca nome ou
 -- telefone). A tarefa em si continua sendo redigida (título e descrição) como antes.
 --
+-- ─── A trava: a chave é do servidor, e uma vez posta não muda
+--
+-- Sem isto, uma pessoa logada poderia pôr numa tarefa QUALQUER a chave que o robô vai precisar (o
+-- POST do robô levaria 409, "adotaria" a tarefa errada e a rotina nunca nasceria), ou limpar a
+-- chave de uma tarefa do robô (o robô recriaria: duplicata). E o navegador fala direto com o
+-- PostgREST, com o JWT da pessoa: a policy de update da 0210 deixa um `agent` escrever em
+-- qualquer coluna, então a rota sozinha não segura nada. O trigger segura nos dois caminhos:
+--   · `authenticated` e `anon` (a sessão e a chave pública) NÃO gravam chave nenhuma, nem no
+--     insert, nem no update;
+--   · chave não nula é IMUTÁVEL para todos, inclusive `service_role`: trocar ou limpar é exceção
+--     (42501). Apagar a tarefa libera a chave. Quem for administrar o banco de verdade pode
+--     desligar o trigger na própria sessão; a API nunca o faz.
+-- Mecanismo: `current_user` num trigger INVOKER (o mesmo de `fn_crm_proposals_transicao_da_sessao`,
+-- 0464): o PostgREST troca de papel com `SET ROLE`, então `current_user` é o papel da requisição
+-- (`authenticated`/`anon`/`service_role`); função `security definer` e `postgres` não são
+-- `authenticated` e passam. Não usa `auth.role()` (não existe fora de um Supabase real; ver o
+-- baseline) nem lê claims do JWT (o claim é texto que o cliente do banco pode forjar no psql).
+-- Anonimização (LGPD): o trigger 0210 só mexe em `title` e `description`, e o trigger daqui só
+-- dispara em `update of external_id`; a cascata de exclusão apaga a linha. Nenhum dos dois toca a
+-- chave, então seguem funcionando (provado em Postgres, ver PROVAS-D9.md).
+--
 -- ─── Reversão (se for preciso voltar)
 --
+--   drop trigger if exists trg_crm_tasks_chave_externa on public.crm_tasks;
+--   drop function if exists public.fn_crm_tasks_chave_externa_guarda();
 --   drop index if exists public.crm_tasks_org_external_id_unique;
 --   alter table public.crm_tasks drop constraint if exists crm_tasks_external_id_formato;
 --   alter table public.crm_tasks drop column if exists external_id;
@@ -75186,6 +75209,34 @@ create unique index if not exists crm_tasks_org_external_id_unique
 
 comment on column public.crm_tasks.external_id is
   'Chave externa de idempotência, única por organização (índice crm_tasks_org_external_id_unique). NULL = tarefa feita à mão. Escolhida por quem grava por token; não pôr dado pessoal nela: não é redigida na anonimização (zerá-la liberaria a chave e permitiria a tarefa em dobro).';
+
+create or replace function public.fn_crm_tasks_chave_externa_guarda()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+begin
+  if tg_op = 'UPDATE' and new.external_id is not distinct from old.external_id then
+    return new;
+  end if;
+  if tg_op = 'UPDATE' and old.external_id is not null then
+    raise exception 'tarefa_chave_externa_imutavel' using errcode = '42501';
+  end if;
+  if new.external_id is not null and current_user in ('authenticated', 'anon') then
+    raise exception 'tarefa_chave_externa_e_do_servidor' using errcode = '42501';
+  end if;
+  return new;
+end;
+$$;
+
+-- Função de trigger não exige EXECUTE de quem dispara o comando (mesmo raciocínio da 0210).
+revoke execute on function public.fn_crm_tasks_chave_externa_guarda() from public, anon, authenticated;
+grant  execute on function public.fn_crm_tasks_chave_externa_guarda() to service_role;
+
+drop trigger if exists trg_crm_tasks_chave_externa on public.crm_tasks;
+create trigger trg_crm_tasks_chave_externa
+  before insert or update of external_id on public.crm_tasks
+  for each row execute function public.fn_crm_tasks_chave_externa_guarda();
 
 -- ---- VARREDURA anon: função nova nasce exposta em quem ATUALIZA (migration 0116) ----
 --
