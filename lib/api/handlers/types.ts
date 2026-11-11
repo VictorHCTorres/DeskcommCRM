@@ -13,6 +13,7 @@ import type { ServiceBoundary } from "@/lib/atendimento/fronteira";
  * humano (cookie session) ou agente de IA (Bearer token com actor_type='ai_agent').
  */
 import type { Idioma } from "@/lib/i18n/idiomas";
+import type { CampaignDelivery } from "@/lib/campanhas/entrega";
 
 export type Actor =
   | { type: "user"; id: string; role?: string }
@@ -78,6 +79,14 @@ export type Actor =
 
 export interface HandlerCtx {
   prospectingDelivery?: ProspectingDelivery;
+  /**
+   * A entrega de uma campanha de PROSPECÇÃO (`lib/campanhas/entrega.ts`), que só
+   * a rodada põe, e só no 1º balão. Com ela, o handler refaz a conferência final
+   * no começo e no instante do efeito, e manda só para `destinoAprovado` — o
+   * número que a preparação conferiu, e não o LID nem o telefone extra (F4g).
+   * Nunca vem do corpo de uma requisição.
+   */
+  campaignDelivery?: CampaignDelivery;
   agentOperation?: AgentOperationContext;
   meetingDelivery?: MeetingDeliveryContext;
   approvedReply?: ApprovedReplyContext;

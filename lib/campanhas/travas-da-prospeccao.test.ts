@@ -32,6 +32,10 @@ const mundo = vi.hoisted(() => ({
   aoLerKnobs: null as null | (() => void),
   /** Roda dentro do envio; o que devolver vira a resposta do handler (F4f, F10 e F13). */
   aoEnviar: null as null | (() => Promise<Record<string, unknown> | void>),
+  /** Roda dentro da abertura da conversa: o meio do caminho entre a reserva e o handler (F4g, A3). */
+  aoAbrir: null as null | (() => void),
+  /** O contexto que a rodada entregou ao handler, um por balão (F4g, A3 e A5). */
+  ctxs: [] as Array<Record<string, unknown>>,
 }));
 
 vi.mock("@/lib/logger", () => ({ logger: { info: () => undefined, warn: () => undefined, error: () => undefined } }));
@@ -50,18 +54,23 @@ vi.mock("@/lib/agent-engine/pacing/store", () => ({
   },
 }));
 vi.mock("@/lib/atendimento/origem", () => ({
-  beginServiceAtOrigin: async (_admin: unknown, _org: string, contato: string, sessionId: string) => ({
-    conversation_id: `conv:${contato}:${sessionId}`,
-  }),
+  beginServiceAtOrigin: async (_admin: unknown, _org: string, contato: string, sessionId: string) => {
+    mundo.aoAbrir?.();
+    return { conversation_id: `conv:${contato}:${sessionId}` };
+  },
 }));
 vi.mock("@/app/api/v1/messages/_handler", () => ({
   sendMessageHandler: async (_admin: unknown, ctx: { serviceBoundary: { conversation_id: string } }) => {
+    mundo.ctxs.push(ctx as unknown as Record<string, unknown>);
     mundo.envios.push(ctx.serviceBoundary.conversation_id);
     return (await mundo.aoEnviar?.()) ?? { id: `msg-${mundo.envios.length}`, status: "queued" };
   },
 }));
 
 import { cancelarAcao } from "@/lib/campanhas/acoes";
+import { aplicarVeto } from "@/lib/campanhas/conferencia";
+import { VetoDaCampanhaError, assertCampaignDelivery } from "@/lib/campanhas/entrega";
+import { hashDoEndereco } from "@/lib/campanhas/exclusoes";
 import { desfechoParaARajada } from "@/lib/campanhas/rajada";
 import { reservarDestinatario, rodarUmaRodadaDeCampanha } from "@/lib/campanhas/rodada";
 
@@ -121,8 +130,12 @@ function fakeAdmin(
             case "then":
               return (ok: (v: unknown) => unknown, falha?: (e: unknown) => unknown) => resolver().then(ok, falha);
             case "maybeSingle":
+              // Como o PostgREST: mais de uma linha é erro (PGRST116), e não a primeira delas.
               return async () => {
                 const r = await resolver();
+                if (!r.error && (r.data?.length ?? 0) > 1) {
+                  return { data: null, error: { message: "JSON object requested, multiple rows returned" } };
+                }
                 return { data: r.data?.[0] ?? null, error: r.error };
               };
             case "update":
@@ -219,6 +232,7 @@ const pendente = (contato: string, tags: string[] = ["funil-a"], mudar: Linha = 
     consent: null,
     tags,
     force_human: false,
+    ai_opt_out: false,
     is_merged_into: null,
     ...doContato,
   },
@@ -259,6 +273,8 @@ beforeEach(() => {
   mundo.envios.length = 0;
   mundo.aoLerKnobs = null;
   mundo.aoEnviar = null;
+  mundo.aoAbrir = null;
+  mundo.ctxs.length = 0;
   vi.useRealTimers();
 });
 
@@ -820,5 +836,436 @@ describe("4. os contratos da revisão F4f do cxj (11/11/2026)", () => {
     expect(unica(tabelas, "campaign_recipients").status).toBe("pending");
     await rodarUmaRodadaDeCampanha(admin, new Date(QUARTA.getTime() + 120_000));
     expect(mundo.envios).toHaveLength(1);
+  });
+});
+
+describe("5. os contratos da revisão F4g do cxj (11/11/2026): a conferência final", () => {
+  const NUMERO = "+5588999990000";
+  const naLista = (endereco = NUMERO): Linha => ({
+    organization_id: "org-1",
+    recipient_address_hash: hashDoEndereco(endereco),
+  });
+  const contatoDe = (tabelas: Tabelas) => unica(tabelas, "campaign_recipients").contacts as Linha;
+  const emBaloes = () =>
+    cenario(
+      campanha("legitimate_interest", { split_messages: true }),
+      pendente("ana", ["funil-a"], { rendered_body: "Primeiro parágrafo.\n\nSegundo parágrafo." }),
+    );
+
+  it("A1 ⭐ o contato pediu para não falar com a IA (ai_opt_out): não recebe", async () => {
+    const { tabelas, admin } = cenario(campanha("legitimate_interest"), pendente("ana", ["funil-a"], {}, { ai_opt_out: true }));
+    await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(mundo.envios).toEqual([]);
+    expect(unica(tabelas, "campaign_recipients")).toMatchObject({ status: "skipped", exclusion_reason: "atendimento_humano" });
+  });
+
+  it("A1 ⭐ o ai_opt_out chega entre a 1ª conferência e a reserva: a releitura pega", async () => {
+    const { tabelas, admin } = cenario(campanha("legitimate_interest"), pendente("ana"));
+    mundo.aoLerKnobs = () => {
+      contatoDe(tabelas).ai_opt_out = true;
+    };
+    await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(mundo.envios).toEqual([]);
+    expect(unica(tabelas, "campaign_recipients")).toMatchObject({ status: "skipped", sending_at: null });
+  });
+
+  it("A2 ⭐ recusou marketing entre a 1ª conferência e a reserva: não recebe", async () => {
+    const { tabelas, admin } = cenario(campanha("legitimate_interest"), pendente("ana"));
+    mundo.aoLerKnobs = () => {
+      contatoDe(tabelas).consent = { marketing: { declined_at: "2026-11-18T13:59:00.000Z" } };
+    };
+    await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(mundo.envios).toEqual([]);
+    expect(unica(tabelas, "campaign_recipients")).toMatchObject({
+      status: "skipped",
+      exclusion_reason: "recusou_marketing",
+      sending_at: null,
+    });
+  });
+
+  it("A2 ⭐ bloqueou entre a 1ª conferência e a reserva: sai como opt-out, e não recebe", async () => {
+    const { tabelas, admin } = cenario(campanha("legitimate_interest"), pendente("ana"));
+    mundo.aoLerKnobs = () => {
+      contatoDe(tabelas).is_blocked = true;
+    };
+    await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(mundo.envios).toEqual([]);
+    expect(unica(tabelas, "campaign_recipients")).toMatchObject({
+      status: "opted_out",
+      exclusion_reason: "opt_out",
+      opted_out_at: QUARTA.toISOString(),
+    });
+  });
+
+  it("A2 ⭐ bloqueou entre a 1ª conferência e a reserva: a conversa nem é aberta", async () => {
+    // A conferência depois da reserva roda ANTES de abrir a conversa: abrir também mexe no banco (a conversa e o
+    // vínculo do destinatário com ela), e por uma pessoa que não vai receber.
+    const { tabelas, admin } = cenario(campanha("legitimate_interest"), pendente("ana"));
+    let aberturas = 0;
+    mundo.aoLerKnobs = () => {
+      contatoDe(tabelas).is_blocked = true;
+    };
+    mundo.aoAbrir = () => {
+      aberturas += 1;
+    };
+    await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(aberturas).toBe(0);
+    expect(unica(tabelas, "campaign_recipients").conversation_id ?? null).toBeNull();
+  });
+
+  it("A2 ⭐ 1ª conferência: bloqueado sai como opt-out, com a data; quem recusou marketing, como pulado", async () => {
+    const bloqueado = cenario(campanha("legitimate_interest"), pendente("ana", ["funil-a"], {}, { is_blocked: true }));
+    await rodarUmaRodadaDeCampanha(bloqueado.admin, QUARTA);
+    expect(unica(bloqueado.tabelas, "campaign_recipients")).toMatchObject({
+      status: "opted_out",
+      exclusion_reason: "opt_out",
+      opted_out_at: QUARTA.toISOString(),
+    });
+    const recusou = cenario(
+      campanha("legitimate_interest"),
+      pendente("ana", ["funil-a"], {}, { consent: { marketing: { declined_at: "2026-11-17T10:00:00.000Z" } } }),
+    );
+    await rodarUmaRodadaDeCampanha(recusou.admin, QUARTA);
+    expect(unica(recusou.tabelas, "campaign_recipients")).toMatchObject({
+      status: "skipped",
+      exclusion_reason: "recusou_marketing",
+    });
+    expect(mundo.envios).toEqual([]);
+  });
+
+  it("A2 ⭐ entrou na lista de exclusão entre a 1ª conferência e a reserva: não recebe", async () => {
+    const { tabelas, admin } = cenario(campanha("legitimate_interest"), pendente("ana"));
+    mundo.aoLerKnobs = () => {
+      tabelas.campaign_suppressions!.push(naLista());
+    };
+    await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(mundo.envios).toEqual([]);
+    expect(unica(tabelas, "campaign_recipients")).toMatchObject({ status: "skipped", exclusion_reason: "suprimido" });
+  });
+
+  it.each(["legitimate_interest", "consent"] as const)(
+    "A2 ⭐ a leitura da lista de exclusão falhou (%s): não manda, e o destinatário continua pendente",
+    async (base) => {
+      const { tabelas, admin } = cenario(campanha(base), pendente("ana"), [], { falhas: ["campaign_suppressions"] });
+      const r = await rodarUmaRodadaDeCampanha(admin, QUARTA);
+      expect(mundo.envios).toEqual([]);
+      expect(r.detalhe).toContain("trava:sem_leitura");
+      expect(unica(tabelas, "campaign_recipients").status).toBe("pending");
+    },
+  );
+
+  it("A2 ⭐ o número aparece duas vezes na lista de exclusão: continua excluído", async () => {
+    const { tabelas, admin } = cenario(campanha("legitimate_interest"), pendente("ana"));
+    tabelas.campaign_suppressions!.push(naLista(), naLista("+55 (88) 99999-0000"));
+    await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(mundo.envios).toEqual([]);
+    expect(unica(tabelas, "campaign_recipients").exclusion_reason).toBe("suprimido");
+  });
+
+  it("A2 ⭐ a lista tem o número aprovado na preparação, e o cadastro está noutra grafia: excluído", async () => {
+    const { tabelas, admin } = cenario(
+      campanha("legitimate_interest"),
+      pendente("ana", ["funil-a"], { recipient_address: "+558899990000" }, { phone_number: NUMERO }),
+    );
+    tabelas.campaign_suppressions!.push(naLista("+558899990000"));
+    await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(mundo.envios).toEqual([]);
+    expect(unica(tabelas, "campaign_recipients").exclusion_reason).toBe("suprimido");
+  });
+
+  it("A2 ⭐ a lista tem o número da ficha, e o aprovado está sem o nono dígito: não recebe", async () => {
+    const { tabelas, admin } = cenario(
+      campanha("legitimate_interest"),
+      pendente("ana", ["funil-a"], { recipient_address: "+558899990000" }, { phone_number: NUMERO }),
+    );
+    tabelas.campaign_suppressions!.push(naLista(NUMERO));
+    await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(mundo.envios).toEqual([]);
+    expect(unica(tabelas, "campaign_recipients").exclusion_reason).toBe("suprimido");
+  });
+
+  it("A2 controle: a lista de OUTRA organização não vale aqui", async () => {
+    const { tabelas, admin } = cenario(campanha("legitimate_interest"), pendente("ana"));
+    tabelas.campaign_suppressions!.push({ ...naLista(), organization_id: "org-2" });
+    await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(mundo.envios).toEqual(["conv:ana:chip"]);
+  });
+
+  it("A3 ⭐ outro envio já levou a pessoa enquanto a conversa era aberta: este não manda, e não mexe nela", async () => {
+    const { tabelas, admin } = cenario(campanha("legitimate_interest"), pendente("ana"));
+    mundo.aoAbrir = () => {
+      unica(tabelas, "campaign_recipients").status = "sent";
+    };
+    const r = await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(mundo.envios).toEqual([]);
+    expect(unica(tabelas, "campaign_recipients").status).toBe("sent");
+    // Não é a campanha que parou (a rajada seguiria parada à toa): é este destinatário que saiu da reserva.
+    expect(r.detalhe).toBe("camp:destinatario_fora_da_reserva");
+  });
+
+  it("A3 ⭐ a pessoa responde enquanto a conversa é aberta: o handler não é chamado", async () => {
+    const { tabelas, admin } = cenario(campanha("legitimate_interest"), pendente("ana"));
+    mundo.aoAbrir = () => {
+      tabelas.messages!.push(mensagem("inbound", "2026-11-18T13:59:59.500Z"));
+    };
+    await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(mundo.envios).toEqual([]);
+    expect(unica(tabelas, "campaign_recipients")).toMatchObject({
+      status: "skipped",
+      exclusion_reason: "escreveu_depois_da_preparacao",
+      sending_at: null,
+    });
+  });
+
+  it("A3 ⭐ a campanha é cancelada enquanto a conversa é aberta: nada sai, e o destinatário é cancelado", async () => {
+    const { tabelas, admin } = cenario(campanha("legitimate_interest"), pendente("ana"));
+    mundo.aoAbrir = () => {
+      unica(tabelas, "campaigns").status = "cancelled";
+    };
+    const r = await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(mundo.envios).toEqual([]);
+    expect(r.detalhe).toContain("campanha_parou");
+    expect(unica(tabelas, "campaign_recipients").status).toBe("cancelled");
+  });
+
+  it("A3 ⭐ a campanha é pausada enquanto a conversa é aberta: nada sai, e o destinatário volta à fila", async () => {
+    const { tabelas, admin } = cenario(campanha("legitimate_interest"), pendente("ana"));
+    mundo.aoAbrir = () => {
+      unica(tabelas, "campaigns").status = "paused";
+    };
+    await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(mundo.envios).toEqual([]);
+    expect(unica(tabelas, "campaign_recipients")).toMatchObject({ status: "pending", sending_at: null });
+  });
+
+  it.each([
+    ["a etiqueta de parada", (t: Tabelas): string => ((contatoDe(t).tags as string[]).push("tem-quem-cuide"), "etiqueta_de_parada")],
+    [
+      "um atendente como dono da conversa",
+      (t: Tabelas): string => (
+        t.conversations!.push({
+          id: "c1",
+          organization_id: "org-1",
+          contact_id: "ana",
+          status: "open",
+          assigned_to_user_id: "u-1",
+          bot_silenced_until: null,
+        }),
+        "atendimento_humano"
+      ),
+    ],
+    [
+      "a recusa de marketing",
+      (t: Tabelas): string => ((contatoDe(t).consent = { marketing: { declined_at: "2026-11-18T13:59:00.000Z" } }), "recusou_marketing"),
+    ],
+  ] as const)("A3 ⭐ %s chega enquanto a conversa é aberta: nada sai", async (_nome, mexer) => {
+    const { tabelas, admin } = cenario(campanha("legitimate_interest"), pendente("ana"));
+    let esperado = "";
+    mundo.aoAbrir = () => {
+      esperado = mexer(tabelas);
+    };
+    await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(mundo.envios).toEqual([]);
+    expect(unica(tabelas, "campaign_recipients")).toMatchObject({ status: "skipped", exclusion_reason: esperado });
+  });
+
+  it("A3 a rodada entrega ao handler a conferência da campanha, com o número aprovado, só no 1º balão", async () => {
+    const { admin } = emBaloes();
+    await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(mundo.ctxs).toHaveLength(2);
+    expect(mundo.ctxs[0]!.campaignDelivery).toEqual({
+      organizationId: "org-1",
+      campaignId: "camp",
+      recipientId: "r-ana",
+      destinoAprovado: NUMERO,
+    });
+    expect(mundo.ctxs[1]!.campaignDelivery).toBeUndefined();
+  });
+
+  it("A3 controle: a campanha de consentimento não leva a conferência da prospecção ao handler", async () => {
+    const { admin } = cenario(campanha("consent"), pendente("ana"));
+    await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(mundo.ctxs).toHaveLength(1);
+    expect(mundo.ctxs[0]!.campaignDelivery).toBeUndefined();
+  });
+
+  it.each([
+    [{ pular: "recusou_marketing" }, { status: "skipped", eligibility_status: "excluded", exclusion_reason: "recusou_marketing" }],
+    [{ pular: "opt_out" }, { status: "opted_out", exclusion_reason: "opt_out" }],
+    [{ esperar: "sem_leitura" }, { status: "pending", sending_at: null }],
+    [{ parou: "paused" }, { status: "pending", sending_at: null }],
+    [{ parou: "cancelled" }, { status: "cancelled" }],
+  ] as const)("A3 ⭐ o handler recusa com o veto %j: o destinatário segue o veto, e não vira falha", async (veto, esperado) => {
+    const { tabelas, admin } = cenario(campanha("legitimate_interest"), pendente("ana"));
+    mundo.aoEnviar = async () => {
+      throw new VetoDaCampanhaError(veto);
+    };
+    await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(unica(tabelas, "campaign_recipients")).toMatchObject(esperado);
+    expect(unica(tabelas, "campaign_recipients").last_error_code).toBeUndefined();
+  });
+
+  it("A3 ⭐ a conferência do handler: o veto vira VetoDaCampanhaError; sem veto, passa", async () => {
+    const entrega = { organizationId: "org-1", campaignId: "camp", recipientId: "r-ana", destinoAprovado: NUMERO };
+    const reservado = { status: "sending" };
+    const livre = cenario(campanha("legitimate_interest"), pendente("ana", ["funil-a"], reservado));
+    await expect(assertCampaignDelivery(livre.admin, entrega, QUARTA)).resolves.toBeUndefined();
+    const semIA = cenario(campanha("legitimate_interest"), pendente("ana", ["funil-a"], reservado, { ai_opt_out: true }));
+    const erro = await assertCampaignDelivery(semIA.admin, entrega, QUARTA).catch((e: unknown) => e);
+    expect(erro).toBeInstanceOf(VetoDaCampanhaError);
+    expect((erro as VetoDaCampanhaError).veto).toEqual({ pular: "atendimento_humano" });
+    // Fora da reserva (outro worker já devolveu à fila): não manda.
+    const fora = cenario(campanha("legitimate_interest"), pendente("ana"));
+    const erroFora = await assertCampaignDelivery(fora.admin, entrega, QUARTA).catch((e: unknown) => e);
+    expect((erroFora as VetoDaCampanhaError).veto).toEqual({ parou: "destinatario" });
+  });
+
+  it.each([
+    ["a campanha não pode ser lida", { falhas: ["campaigns"] }, {}],
+    ["o destinatário não pode ser lido", { falhas: ["campaign_recipients"] }, {}],
+    ["a entrega diz outra organização", {}, { organizationId: "org-2" }],
+    ["a entrega diz outra campanha", {}, { campaignId: "camp-2" }],
+  ] as const)("A3 ⭐ a conferência do handler não passa quando %s (falha fechada)", async (_nome, opcoes, mudar) => {
+    const entrega = { organizationId: "org-1", campaignId: "camp", recipientId: "r-ana", destinoAprovado: NUMERO };
+    const { tabelas } = cenario(campanha("legitimate_interest"), pendente("ana", ["funil-a"], { status: "sending" }));
+    // Uma segunda campanha rodando, da mesma organização: o destinatário não é dela.
+    tabelas.campaigns!.push({ ...unica(tabelas, "campaigns"), id: "camp-2" });
+    const admin = fakeAdmin(tabelas, opcoes as { falhas?: readonly string[] });
+    const erro = await assertCampaignDelivery(admin, { ...entrega, ...mudar }, QUARTA).catch((e: unknown) => e);
+    expect(erro).toBeInstanceOf(VetoDaCampanhaError);
+    expect((erro as VetoDaCampanhaError).veto).toEqual({ esperar: "sem_leitura" });
+  });
+
+  it("A3 ⭐ aplicar o veto não escreve por cima de quem já saiu da reserva", async () => {
+    const { tabelas, admin } = cenario(campanha("legitimate_interest"), pendente("ana", ["funil-a"], { status: "sent" }));
+    await aplicarVeto(admin, "r-ana", { pular: "recusou_marketing" }, QUARTA);
+    expect(unica(tabelas, "campaign_recipients")).toMatchObject({ status: "sent" });
+    expect(unica(tabelas, "campaign_recipients").exclusion_reason ?? null).toBeNull();
+  });
+
+  it.each([
+    ["vai para atendimento humano", (t: Tabelas): void => void (contatoDe(t).force_human = true)],
+    ["pede para não falar com a IA", (t: Tabelas): void => void (contatoDe(t).ai_opt_out = true)],
+    ["recusa marketing", (t: Tabelas): void => void (contatoDe(t).consent = { marketing: { declined_at: "2026-11-18T14:00:00.000Z" } })],
+    ["ganha a etiqueta de parada", (t: Tabelas): void => void (contatoDe(t).tags as string[]).push("parar")],
+    ["entra na lista de exclusão", (t: Tabelas): void => void t.campaign_suppressions!.push(naLista())],
+    ["tem a campanha cancelada", (t: Tabelas): void => void (unica(t, "campaigns").status = "cancelled")],
+  ] as const)("A4 ⭐ balões: a pessoa %s depois do 1º balão: os seguintes não saem", async (_nome, mexer) => {
+    const { tabelas, admin } = emBaloes();
+    mundo.aoEnviar = async () => {
+      mexer(tabelas);
+    };
+    await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(mundo.envios).toEqual(["conv:ana:chip"]);
+    // O 1º balão saiu: a pessoa recebeu o começo, e o destinatário conta como enviado.
+    expect(unica(tabelas, "campaign_recipients").status).toBe("sent");
+  });
+
+  it.each(["sent", "delivered", "read"])("A4 controle: o ack do 1º balão já marcou o destinatário como %s: os seguintes saem", async (estado) => {
+    const { tabelas, admin } = emBaloes();
+    mundo.aoEnviar = async () => {
+      unica(tabelas, "campaign_recipients").status = estado;
+    };
+    await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(mundo.envios).toEqual(["conv:ana:chip", "conv:ana:chip"]);
+  });
+
+  it("A5 ⭐ o handler recebe o número APROVADO, mesmo com a outra grafia da mesma pessoa na ficha", async () => {
+    const { admin } = cenario(
+      campanha("legitimate_interest"),
+      pendente("ana", ["funil-a"], { recipient_address: "+558899990000" }, { phone_number: NUMERO }),
+    );
+    await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(mundo.ctxs).toHaveLength(1);
+    expect((mundo.ctxs[0]!.campaignDelivery as { destinoAprovado: string }).destinoAprovado).toBe("+558899990000");
+  });
+
+  it("A3 ⭐ a conferência do handler não deixa sair de novo para quem já recebeu", async () => {
+    const entrega = { organizationId: "org-1", campaignId: "camp", recipientId: "r-ana", destinoAprovado: NUMERO };
+    const { admin } = cenario(campanha("legitimate_interest"), pendente("ana", ["funil-a"], { status: "sent" }));
+    const erro = await assertCampaignDelivery(admin, entrega, QUARTA).catch((e: unknown) => e);
+    expect((erro as VetoDaCampanhaError).veto).toEqual({ parou: "destinatario" });
+  });
+
+  it("controle: na campanha de consentimento, os balões seguem como antes, sem reler a campanha entre eles", async () => {
+    // As travas da conferência final são da abordagem fria; a campanha de consentimento não ganha leitura nova.
+    const { tabelas, admin } = cenario(
+      campanha("consent", { split_messages: true }),
+      pendente("ana", ["funil-a"], { rendered_body: "Primeiro parágrafo.\n\nSegundo parágrafo." }),
+    );
+    const inteiro = admin as unknown as { from: (t: string) => unknown };
+    const semCampanha = fakeAdmin(tabelas, { falhas: ["campaigns"] }) as unknown as { from: (t: string) => unknown };
+    let caiu = false;
+    mundo.aoEnviar = async () => {
+      caiu = true;
+    };
+    await rodarUmaRodadaDeCampanha({ from: (t: string) => (caiu ? semCampanha : inteiro).from(t) } as never, QUARTA);
+    expect(mundo.envios).toEqual(["conv:ana:chip", "conv:ana:chip"]);
+  });
+
+  it("A5 ⭐ prospecção sem o número aprovado na preparação: não há destino conferido, e não manda", async () => {
+    const { tabelas, admin } = cenario(campanha("legitimate_interest"), pendente("ana", ["funil-a"], { recipient_address: null }));
+    await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(mundo.envios).toEqual([]);
+    expect(unica(tabelas, "campaign_recipients")).toMatchObject({ status: "skipped", exclusion_reason: "destino_mudou" });
+  });
+
+  it("A3 o veto da pessoa no handler conta como pulado na rodada; o de leitura, não", async () => {
+    const pula = cenario(campanha("legitimate_interest"), pendente("ana"));
+    mundo.aoEnviar = async () => {
+      throw new VetoDaCampanhaError({ pular: "recusou_marketing" });
+    };
+    expect(await rodarUmaRodadaDeCampanha(pula.admin, QUARTA)).toMatchObject({ pulados: 1, enviadas: 0 });
+    const espera = cenario(campanha("legitimate_interest"), pendente("ana"));
+    mundo.aoEnviar = async () => {
+      throw new VetoDaCampanhaError({ esperar: "sem_leitura" });
+    };
+    expect(await rodarUmaRodadaDeCampanha(espera.admin, QUARTA)).toMatchObject({ pulados: 0, enviadas: 0 });
+  });
+
+  it("A3 o veto antes do 1º balão conta como pulado; a campanha parada, não", async () => {
+    const pula = cenario(campanha("legitimate_interest"), pendente("ana"));
+    mundo.aoAbrir = () => {
+      (unica(pula.tabelas, "campaign_recipients").contacts as Linha).force_human = true;
+    };
+    expect(await rodarUmaRodadaDeCampanha(pula.admin, QUARTA)).toMatchObject({ pulados: 1, detalhe: "camp:pulado:atendimento_humano" });
+    const parou = cenario(campanha("legitimate_interest"), pendente("ana"));
+    mundo.aoAbrir = () => {
+      unica(parou.tabelas, "campaigns").status = "paused";
+    };
+    expect(await rodarUmaRodadaDeCampanha(parou.admin, QUARTA)).toMatchObject({ pulados: 0, detalhe: "camp:campanha_parou" });
+  });
+
+  it("A7 ⭐ mensagem com a marca de importação 'false' é do caminho ao vivo: conta pela hora em que chegou", async () => {
+    const { tabelas, admin } = cenario(campanha("legitimate_interest"), pendente("ana"), [
+      {
+        ...mensagem("inbound", "2026-11-18T12:30:00.000Z"),
+        type: "text",
+        sent_at: "2026-10-01T15:00:00.000Z",
+        metadata: { historico_importado: "false" },
+      },
+    ]);
+    await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(mundo.envios).toEqual([]);
+    expect(unica(tabelas, "campaign_recipients").exclusion_reason).toBe("escreveu_depois_da_preparacao");
+  });
+
+  it("G13 ⭐ rajada: o 2º do lote recusa marketing enquanto o 1º sai: não recebe", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(QUARTA);
+    const { admin, tabelas } = cenario(
+      campanha("legitimate_interest", { velocidade: "rapida", message_mode: "template" }),
+      pendente("ana", ["funil-a"], { variables: { modelo: {} } }),
+    );
+    const bia = pendente("bia", ["funil-a"], { variables: { modelo: {} } });
+    tabelas.campaign_recipients!.push(bia);
+    mundo.aoEnviar = async () => {
+      (bia.contacts as Linha).consent = { marketing: { declined_at: "2026-11-18T14:00:00.000Z" } };
+    };
+    const rodada = rodarUmaRodadaDeCampanha(admin, QUARTA);
+    await vi.runAllTimersAsync();
+    await rodada;
+    expect(mundo.envios).toEqual(["conv:ana:chip"]);
+    expect(bia).toMatchObject({ status: "skipped", exclusion_reason: "recusou_marketing" });
   });
 });

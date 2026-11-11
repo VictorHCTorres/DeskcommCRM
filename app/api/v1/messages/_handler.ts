@@ -1,4 +1,5 @@
 import { assertProspectingDelivery } from "@/lib/prospecting/guard";
+import { assertCampaignDelivery, VetoDaCampanhaError } from "@/lib/campanhas/entrega";
 import { assertAgentOperationSupabase, mesmaOperacao } from "@/lib/ai/agents/operation";
 import {
   assertApprovedReplySupabase,
@@ -447,6 +448,9 @@ export async function sendMessageHandler(
   // gate antes da suspensão. O erro é terminal (`terminal: true`).
   await assertOrgOperante(supabase, ctx.organization_id);
   if (ctx.prospectingDelivery) await assertProspectingDelivery(supabase, ctx.prospectingDelivery);
+  // A campanha de prospecção confere a pessoa de novo aqui e no `checkBoundary`
+  // (F4g, A3): o veto sobe como `VetoDaCampanhaError`, e a rodada o aplica.
+  if (ctx.campaignDelivery) await assertCampaignDelivery(supabase, ctx.campaignDelivery);
   if (ctx.meetingDelivery) await assertMeetingDeliverySupabase(supabase, ctx.meetingDelivery);
   if (ctx.approvedReply) await assertApprovedReplySupabase(supabase, ctx.approvedReply);
   if (ctx.agentOperation) await assertAgentOperationSupabase(supabase, ctx.agentOperation);
@@ -1045,21 +1049,37 @@ export async function sendMessageHandler(
   // Ficha com telefone extra: a resposta volta pelo número que a pessoa escreveu.
   // A porta de canal decide quem tem isso. A organização vem de `ctx` (fonte
   // confiável), não do corpo.
-  const ultimoRecebidoChatId = await enderecoDaUltimaRecebida(supabase, {
-    provider: c.channel_sessions?.provider,
-    isGroup: c.is_group,
-    organizationId: ctx.organization_id,
-    conversationId: c.id,
-    contactId: c.contact_id,
-  });
-  const chatId = adapter.resolveRecipient({
-    isGroup: c.is_group,
-    groupChatId: c.group_chat_id,
-    phoneNumber: c.contacts?.phone_number,
-    waIdentity: c.contacts?.wa_identity,
-    waLid: c.contacts?.wa_lid,
-    ultimoRecebidoChatId,
-  });
+  //
+  // A campanha de prospecção é a exceção (F4g, A5): a preparação conferiu UM
+  // número, e é só para ele que a mensagem fria sai — nem o LID, nem o telefone
+  // extra por onde a pessoa escreveu um dia, que ninguém conferiu.
+  const destinoAprovado = ctx.campaignDelivery?.destinoAprovado.trim() || null;
+  const ultimoRecebidoChatId = destinoAprovado
+    ? null
+    : await enderecoDaUltimaRecebida(supabase, {
+        provider: c.channel_sessions?.provider,
+        isGroup: c.is_group,
+        organizationId: ctx.organization_id,
+        conversationId: c.id,
+        contactId: c.contact_id,
+      });
+  const chatId = destinoAprovado
+    ? adapter.resolveRecipient({
+        isGroup: false,
+        groupChatId: null,
+        phoneNumber: destinoAprovado,
+        waIdentity: null,
+        waLid: null,
+        ultimoRecebidoChatId: null,
+      })
+    : adapter.resolveRecipient({
+        isGroup: c.is_group,
+        groupChatId: c.group_chat_id,
+        phoneNumber: c.contacts?.phone_number,
+        waIdentity: c.contacts?.wa_identity,
+        waLid: c.contacts?.wa_lid,
+        ultimoRecebidoChatId,
+      });
 
   // Releitura no sink: o operador pode ter fechado o canal enquanto o modelo
   // gerava a resposta. Envio humano não passa por esta restrição da IA.
@@ -1164,6 +1184,7 @@ export async function sendMessageHandler(
         await guardServiceEffect();
         await guardAgendaEffect();
         if (ctx.prospectingDelivery) await assertProspectingDelivery(supabase, ctx.prospectingDelivery);
+        if (ctx.campaignDelivery) await assertCampaignDelivery(supabase, ctx.campaignDelivery);
         if (ctx.meetingDelivery) await assertMeetingDeliverySupabase(supabase, ctx.meetingDelivery);
         if (ctx.proactiveContext) await assertAgendaEffectSupabase(supabase, ctx.proactiveContext);
         if (ctx.serviceBoundary && !fronteiraJaConferida)
@@ -1406,6 +1427,26 @@ export async function sendMessageHandler(
       if (updated) message = updated as unknown as Message;
       }
     } catch (err) {
+      if (err instanceof VetoDaCampanhaError) {
+        // O veto da conferência final da campanha no instante do efeito (F4g,
+        // A3), DEPOIS do INSERT: a linha sai de `queued` (senão o redrive do
+        // watchdog a mandaria), só se ainda estiver lá, e o erro sobe para a
+        // rodada aplicar o veto ao destinatário. Não é falha de entrega: nada
+        // de `emitirFalhaDeEntrega`.
+        await supabase
+          .from("messages")
+          .update({
+            status: "failed",
+            error_code: "campanha_vetada",
+            error_message: "Não enviada: a conferência final da campanha vetou o envio.",
+          })
+          .eq("id", message.id)
+          .eq("organization_id", ctx.organization_id)
+          .eq("status", "queued")
+          .select("id")
+          .maybeSingle();
+        throw err;
+      }
       if (err instanceof AgendaPuladoError) {
         // O pulo por compromisso chega aqui pelo recheck do corte, DEPOIS do
         // INSERT: relançar com a linha em `queued` deixava o redrive do
