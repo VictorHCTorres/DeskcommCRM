@@ -48,13 +48,15 @@ import {
   falhaDoEnvioInteiro,
   fraseDaFalha,
 } from "@/lib/channels/erro-da-plataforma";
+import { samePhone } from "@/lib/channels/phone-variants";
+import { STATUS_ENCERRADOS, silencioVigente } from "@/lib/inbox/comando-da-conversa";
 import { feriadosDoBrasilDoAno } from "@/lib/lgpd/holidays-br";
 import { logger } from "@/lib/logger";
 import { OrgNaoOperanteError, STATUS_OPERANTE, ehOperante, statusDaOrgEmbutida } from "@/lib/organizacao/operante";
 
 import { baloesDaCampanha, enviarEmBaloes, pausaEntreBaloes } from "./baloes";
 import { motivoParaExcluir, recusouMarketing, statusDaSaida } from "./elegibilidade";
-import { hashDoEndereco, normalizarEndereco } from "./exclusoes";
+import { hashDoEndereco } from "./exclusoes";
 import type { ConteudoDoEnvio } from "./modelo";
 import { renderizar } from "./renderizador";
 import { RAJADA, rodarEmRajada } from "./rajada";
@@ -308,6 +310,12 @@ function numerosQueAFalaUsou(r: { detalhe: string; numero?: string; numeros?: re
   return r.numeros ?? (r.numero ? [r.numero] : []);
 }
 
+/** O destinatário com o contato embutido: o que a fila lê e o que a prospecção relê depois da reserva. */
+const COLUNAS_DO_DESTINATARIO =
+  "id, contact_id, recipient_address, rendered_body, variables, " +
+  "contacts(id, name, display_name, phone_number, is_blocked, is_personal, is_anonymized, consent, " +
+  "tags, force_human, is_merged_into)";
+
 /** Os próximos pendentes da campanha cuja vez chegou, na ordem da fila. */
 async function pendentesDaCampanha(
   admin: SupabaseClient,
@@ -317,11 +325,7 @@ async function pendentesDaCampanha(
 ): Promise<DestinatarioRow[]> {
   const { data } = await admin
     .from("campaign_recipients")
-    .select(
-      "id, contact_id, recipient_address, rendered_body, variables, " +
-        "contacts(id, name, display_name, phone_number, is_blocked, is_personal, is_anonymized, consent, " +
-        "tags, force_human, is_merged_into)",
-    )
+    .select(COLUNAS_DO_DESTINATARIO)
     .eq("campaign_id", campanhaId)
     .eq("status", "pending")
     .or(`next_attempt_at.is.null,next_attempt_at.lte.${agora.toISOString()}`)
@@ -345,33 +349,73 @@ function ehProspeccao(campanha: CampanhaRow): boolean {
   return campanha.base_legal === "legitimate_interest";
 }
 
-/** As etiquetas que o público exclui (`sem_tags`): na prospecção, são os pedidos de parar. */
-function etiquetasExcluidas(filtro: unknown): readonly string[] {
-  const semTags = (filtro as { sem_tags?: unknown } | null)?.sem_tags;
-  return Array.isArray(semTags) ? semTags.filter((t): t is string => typeof t === "string") : [];
+/** Uma lista de textos do filtro da audiência (`sem_tags`, `funis`); o que não for lista de texto vira vazio. */
+function textosDoFiltro(filtro: unknown, chave: "sem_tags" | "funis"): readonly string[] {
+  const valor = (filtro as Record<string, unknown> | null)?.[chave];
+  return Array.isArray(valor) ? valor.filter((t): t is string => typeof t === "string") : [];
+}
+
+type Trava = { pular: MotivoDeExclusao } | { esperar: "sem_leitura" | "sem_preparacao" } | null;
+
+/**
+ * A pessoa ESCREVEU depois de `corte`? `null` = não deu para ler (quem chama não manda).
+ *
+ * Reação não é fala (`type = 'reaction'`, o 👍 no toque): conta como resposta só
+ * o que a pessoa escreveu. E o histórico importado do celular
+ * (`lib/channels/historico`) entra no banco HOJE com mensagens de meses atrás:
+ * para ele vale a hora em que a pessoa mandou (`sent_at`, a do acervo), não a
+ * da importação. A marca é `metadata.historico_importado = 'true'`, e o
+ * importador é o único que a escreve: sem ela, a linha é do caminho ao vivo.
+ */
+async function escreveuDepoisDe(
+  admin: SupabaseClient,
+  organizacaoId: string,
+  contatoId: string,
+  corte: string,
+): Promise<boolean | null> {
+  const entradas = () =>
+    admin
+      .from("messages")
+      .select("id")
+      .eq("organization_id", organizacaoId)
+      .eq("contact_id", contatoId)
+      .eq("direction", "inbound")
+      .neq("type", "reaction");
+  const aoVivo = await entradas().is("metadata->>historico_importado", null).gt("created_at", corte).limit(1);
+  if (aoVivo.error) return null;
+  if ((aoVivo.data ?? []).length > 0) return true;
+  const importadas = await entradas().eq("metadata->>historico_importado", "true").gt("sent_at", corte).limit(1);
+  if (importadas.error) return null;
+  return (importadas.data ?? []).length > 0;
 }
 
 /**
  * A fotografia da preparação, revalidada no instante do envio — só na prospecção.
+ * Roda duas vezes: antes do ritmo (pular não gasta janela) e de novo DEPOIS da
+ * reserva (`travaDepoisDaReserva`), com o destinatário relido do banco.
  *
  * A preparação escolheu quem recebe pelo cadastro daquela hora; o envio sai
  * horas depois. Nesse meio-tempo a pessoa pode ter respondido ao toque
  * anterior, ganhado a etiqueta de parada (no contato ou no negócio), ido para
- * atendimento humano, sido mesclada em outro contato ou trocado de número. A
- * resposta só fecha o destinatário que JÁ recebeu (`resposta.ts`); este ainda
- * não recebeu nada desta campanha e, sem esta conferência, recebia o toque
- * seguinte minutos depois de responder ao anterior.
+ * atendimento humano (no contato ou na conversa), sido mesclada em outro
+ * contato ou trocado de número. A resposta só fecha o destinatário que JÁ
+ * recebeu (`resposta.ts`); este ainda não recebeu nada desta campanha e, sem
+ * esta conferência, recebia o toque seguinte minutos depois de responder ao
+ * anterior.
  *
- * Falha FECHADA: sem ler as mensagens ou os negócios, não manda agora. Mensagem
- * fria que sai sem a conferência não se desfaz.
+ * Falha FECHADA: sem ler as mensagens, as conversas ou os negócios, não manda
+ * agora; sem `prepared_at` não há corte para "escreveu depois", e também não.
+ * Mensagem fria que sai sem a conferência não se desfaz.
  */
 async function travaDaProspeccao(
   admin: SupabaseClient,
   campanha: CampanhaRow,
   alvo: DestinatarioRow,
-): Promise<{ pular: MotivoDeExclusao } | { esperar: "sem_leitura" } | null> {
+  agora: Date,
+): Promise<Trava> {
+  if (!campanha.prepared_at) return { esperar: "sem_preparacao" };
   const contato = alvo.contacts;
-  const paradas = etiquetasExcluidas(campanha.audience_filter);
+  const paradas = textosDoFiltro(campanha.audience_filter, "sem_tags");
   const temParada = (tags: readonly string[] | null | undefined) => (tags ?? []).some((t) => paradas.includes(t));
 
   if (temParada(contato?.tags)) return { pular: "etiqueta_de_parada" };
@@ -379,36 +423,94 @@ async function travaDaProspeccao(
   if (contato?.is_merged_into) return { pular: "contato_mesclado" };
   // O número congelado na preparação contra o de agora: o envio resolve o
   // destino pelo cadastro ATUAL, e quem a preparação conferiu era o do antigo.
-  const congelado = normalizarEndereco(alvo.recipient_address ?? "");
-  const atual = normalizarEndereco(contato?.phone_number ?? "");
-  if (congelado !== "" && atual !== "" && congelado !== atual) return { pular: "destino_mudou" };
+  // A mesma pessoa com e sem o nono dígito, ou com outra pontuação, não é troca
+  // (`samePhone` compara só os dígitos, nas duas grafias do celular).
+  const congelado = (alvo.recipient_address ?? "").trim();
+  const atual = (contato?.phone_number ?? "").trim();
+  if (congelado !== "" && atual !== "" && !samePhone(congelado, atual)) return { pular: "destino_mudou" };
+
+  // A conversa com uma pessoa no comando: atendente dono dela, ou o automático
+  // calado (por um atendente que respondeu agora, ou pausado). É o mesmo
+  // silêncio que o inbox lê (`comandoDaConversa`). Conversa encerrada é
+  // histórico, mesmo com o dono antigo ainda gravado.
+  const { data: conversas, error: erroDasConversas } = await admin
+    .from("conversations")
+    .select("status, assigned_to_user_id, bot_silenced_until")
+    .eq("organization_id", campanha.organization_id)
+    .eq("contact_id", alvo.contact_id);
+  if (erroDasConversas) return { esperar: "sem_leitura" };
+  const comUmaPessoa = (
+    (conversas ?? []) as Array<{ status: string | null; assigned_to_user_id: string | null; bot_silenced_until: string | null }>
+  ).some(
+    (c) =>
+      !STATUS_ENCERRADOS.has(c.status ?? "") &&
+      (!!c.assigned_to_user_id || silencioVigente(c.bot_silenced_until, agora).vigente),
+  );
+  if (comUmaPessoa) return { pular: "atendimento_humano" };
 
   if (paradas.length > 0) {
-    // A operação marca a parada também no NEGÓCIO; a audiência só olhou o contato.
-    const { data: negocios, error } = await admin
+    // A operação marca a parada também no NEGÓCIO; a audiência só olhou o
+    // contato. Com funis no público, vale o negócio desses funis: a etiqueta de
+    // um negócio de outro funil fala de outro serviço. A SITUAÇÃO do negócio
+    // não recorta, de propósito: o negócio costuma ir para `lost` justamente
+    // porque a pessoa pediu para parar.
+    const funis = textosDoFiltro(campanha.audience_filter, "funis");
+    let consulta = admin
       .from("crm_leads")
       .select("tags")
       .eq("organization_id", campanha.organization_id)
       .eq("contact_id", alvo.contact_id);
+    if (funis.length > 0) consulta = consulta.in("pipeline_id", funis);
+    const { data: negocios, error } = await consulta;
     if (error) return { esperar: "sem_leitura" };
     if (((negocios ?? []) as Array<{ tags: string[] | null }>).some((n) => temParada(n.tags))) {
       return { pular: "etiqueta_de_parada" };
     }
   }
 
-  if (campanha.prepared_at) {
-    const { data: entradas, error } = await admin
-      .from("messages")
-      .select("id")
-      .eq("organization_id", campanha.organization_id)
-      .eq("contact_id", alvo.contact_id)
-      .eq("direction", "inbound")
-      .gt("created_at", campanha.prepared_at)
-      .limit(1);
-    if (error) return { esperar: "sem_leitura" };
-    if ((entradas ?? []).length > 0) return { pular: "escreveu_depois_da_preparacao" };
-  }
+  const escreveu = await escreveuDepoisDe(admin, campanha.organization_id, alvo.contact_id, campanha.prepared_at);
+  if (escreveu === null) return { esperar: "sem_leitura" };
+  if (escreveu) return { pular: "escreveu_depois_da_preparacao" };
   return null;
+}
+
+/**
+ * A prospecção relida DEPOIS da reserva, com o destinatário e o contato lidos de
+ * novo do banco. A 1ª conferência roda antes do ritmo e do rodízio, e na rajada
+ * sobre o lote buscado segundos antes: a resposta ou o comando humano que chegar
+ * nesse meio-tempo passava. Depois da reserva nenhuma outra rodada pega a
+ * pessoa, e o que chegar daqui até o envio é o mesmo intervalo de qualquer
+ * mensagem. `null` = pode mandar; senão, o desfecho, com a reserva já desfeita.
+ */
+async function travaDepoisDaReserva(
+  admin: SupabaseClient,
+  campanha: CampanhaRow,
+  destinatarioId: string,
+  agora: Date,
+): Promise<{ enviadas: 0; pulados: 0 | 1; concluidas: 0; detalhe: string } | null> {
+  const { data, error } = await admin
+    .from("campaign_recipients")
+    .select(COLUNAS_DO_DESTINATARIO)
+    .eq("id", destinatarioId)
+    .maybeSingle();
+  const relido = data as unknown as DestinatarioRow | null;
+  const trava: Trava =
+    error || !relido ? { esperar: "sem_leitura" } : await travaDaProspeccao(admin, campanha, relido, agora);
+  if (!trava) return null;
+  if ("esperar" in trava) {
+    await admin
+      .from("campaign_recipients")
+      .update({ status: "pending", sending_at: null })
+      .eq("id", destinatarioId)
+      .eq("status", "sending");
+    return { enviadas: 0, pulados: 0, concluidas: 0, detalhe: `trava:${trava.esperar}` };
+  }
+  await admin
+    .from("campaign_recipients")
+    .update({ status: "skipped", eligibility_status: "excluded", exclusion_reason: trava.pular, sending_at: null })
+    .eq("id", destinatarioId)
+    .eq("status", "sending");
+  return { enviadas: 0, pulados: 1, concluidas: 0, detalhe: `pulado:${trava.pular}` };
 }
 
 /** O dia de `agora`, no fuso dado, é um dos feriados nacionais de `lib/lgpd/holidays-br.ts`? */
@@ -557,10 +659,10 @@ async function rodarUmaCampanha(
 
   // ─── A fotografia da PROSPECÇÃO, revalidada (ver `travaDaProspeccao`) ───
   if (ehProspeccao(campanha)) {
-    const trava = await travaDaProspeccao(admin, campanha, alvo);
+    const trava = await travaDaProspeccao(admin, campanha, alvo, agora);
     if (trava && "esperar" in trava) {
-      // Sem a leitura não há como saber se a pessoa respondeu: não manda agora,
-      // e o destinatário fica pendente para o próximo tique.
+      // Sem a leitura (ou sem o corte) não há como saber se a pessoa respondeu:
+      // não manda agora, e o destinatário fica pendente para o próximo tique.
       return { enviadas: 0, pulados: 0, concluidas: 0, detalhe: `trava:${trava.esperar}` };
     }
     if (trava) {
@@ -717,8 +819,16 @@ async function rodarUmaCampanha(
       enviadas: 0,
       pulados: 0,
       concluidas: 0,
-      detalhe: reserva.erro ? `erro_na_reserva:${reserva.erro.slice(0, 40)}` : "ja_reservado",
+      detalhe: reserva.erro
+        ? `erro_na_reserva:${reserva.erro.slice(0, 40)}`
+        : reserva.parou
+          ? "campanha_parou"
+          : "ja_reservado",
     };
+  }
+  if (ehProspeccao(campanha)) {
+    const depois = await travaDepoisDaReserva(admin, campanha, alvo.id, agora);
+    if (depois) return depois;
   }
 
   // O corpo é montado DEPOIS do ritmo: a saudação ("bom dia" × "boa tarde") tem
@@ -808,6 +918,15 @@ async function rodarUmaCampanha(
       // Pausa curta e fixa no ritmo anti-ban do número, nunca o intervalo da
       // campanha: este laço é dividido por todas as campanhas da instalação.
       esperar: () => new Promise((ok) => setTimeout(ok, pausaEntreBaloes(knobs))),
+      // Na prospecção, quem respondeu ao 1º balão não recebe os seguintes; sem
+      // conseguir ler, também não (o começo já saiu, e o resto espera a pessoa).
+      ...(ehProspeccao(campanha) && campanha.prepared_at
+        ? {
+            continuar: async () =>
+              (await escreveuDepoisDe(admin, campanha.organization_id, alvo.contact_id, campanha.prepared_at!)) ===
+              false,
+          }
+        : {}),
     });
 
     // O desfecho vem do ESTADO da mensagem, nunca da ausência de exceção — o
@@ -937,12 +1056,23 @@ export async function registrarExcecaoDoEnvio(
  * ficava `running` para sempre, o destinatário `pending` com zero tentativas, e
  * o cron respondia `ja_reservado` a cada minuto. Um erro disfarçado de
  * concorrência é a pior espécie: ele descreve um sistema saudável.
+ *
+ * ═══ Por que a campanha é relida DEPOIS da reserva ═══
+ *
+ * O compare-and-set confere só o destinatário. O worker que escolheu o pendente
+ * antes de a campanha ser cancelada ou pausada o reservava depois, e a mensagem
+ * saía com a campanha já parada; cancelar a fila primeiro não fechava tudo (um
+ * 429 devolve `sending` a `pending` entre as duas escritas, e a fila pode falhar
+ * sozinha). Com a campanha caindo PRIMEIRO no cancelamento (`cancelarAcao`) e
+ * relida aqui, toda reserva feita depois da queda a enxerga e se desfaz: na
+ * cancelada, o destinatário fica cancelado; na pausada, volta à fila para a
+ * retomada. Sem conseguir ler a campanha, também se desfaz (falha fechada).
  */
 export async function reservarDestinatario(
   admin: SupabaseClient,
   destinatarioId: string,
   agora: Date,
-): Promise<{ reservado: boolean; erro?: string }> {
+): Promise<{ reservado: boolean; erro?: string; parou?: true }> {
   const { data, error } = await admin
     .from("campaign_recipients")
     .update({
@@ -953,7 +1083,7 @@ export async function reservarDestinatario(
     })
     .eq("id", destinatarioId)
     .eq("status", "pending")
-    .select("id");
+    .select("id, campaign_id");
   if (error) {
     logger.warn("[campanha] reserva do destinatário falhou", {
       destinatario: destinatarioId,
@@ -961,7 +1091,34 @@ export async function reservarDestinatario(
     });
     return { reservado: false, erro: error.message };
   }
-  return { reservado: (data ?? []).length > 0 };
+  const reservado = (data ?? [])[0] as { campaign_id?: string } | undefined;
+  if (!reservado) return { reservado: false };
+
+  const { data: campanha, error: erroDaCampanha } = await admin
+    .from("campaigns")
+    .select("status")
+    .eq("id", reservado.campaign_id ?? "")
+    .maybeSingle();
+  const status = (campanha as { status?: string } | null)?.status;
+  if (!erroDaCampanha && status === "running") return { reservado: true };
+
+  await admin
+    .from("campaign_recipients")
+    .update(
+      !erroDaCampanha && status === "cancelled"
+        ? { status: "cancelled", cancelled_at: agora.toISOString(), sending_at: null }
+        : { status: "pending", sending_at: null },
+    )
+    .eq("id", destinatarioId)
+    .eq("status", "sending");
+  if (erroDaCampanha) {
+    logger.warn("[campanha] sem ler a campanha depois da reserva; reserva desfeita", {
+      destinatario: destinatarioId,
+      motivo: erroDaCampanha.message,
+    });
+    return { reservado: false, erro: erroDaCampanha.message };
+  }
+  return { reservado: false, parou: true };
 }
 
 /**

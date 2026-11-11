@@ -45,6 +45,10 @@ export function pausaEntreBaloes(
  * índice (o `recordSend` da rodada: cada balão é uma mensagem física, conta no
  * teto do número e é a base do throttle do próximo envio). Para no primeiro balão `failed` e o devolve como desfecho: mandar o
  * resto depois de uma falha entregaria a mensagem pela metade e fora de ordem.
+ *
+ * `continuar` (opcional) é perguntado antes de cada balão seguinte, depois da
+ * pausa: `false` para ali, e o desfecho é o do último balão que saiu. A
+ * prospecção o usa para não mandar o resto a quem respondeu ao começo.
  */
 export async function enviarEmBaloes<T extends { status?: string }>(
   baloes: readonly string[],
@@ -52,17 +56,22 @@ export async function enviarEmBaloes<T extends { status?: string }>(
     enviar: (corpo: string, indice: number) => Promise<T>;
     registrar?: (indice: number) => Promise<void>;
     esperar: () => Promise<void>;
+    continuar?: (indice: number) => Promise<boolean>;
   },
 ): Promise<{ primeira: T; desfecho: T; indiceDoDesfecho: number }> {
   let primeira: T | undefined;
   let desfecho: T | undefined;
-  let indice = 0;
-  for (; indice < baloes.length; indice++) {
-    if (indice > 0) await passos.esperar();
+  let indiceDoDesfecho = 0;
+  for (let indice = 0; indice < baloes.length; indice++) {
+    if (indice > 0) {
+      await passos.esperar();
+      if (passos.continuar && !(await passos.continuar(indice))) break;
+    }
     desfecho = await passos.enviar(baloes[indice]!, indice);
+    indiceDoDesfecho = indice;
     primeira ??= desfecho;
     await passos.registrar?.(indice);
     if (desfecho.status === "failed") break;
   }
-  return { primeira: primeira!, desfecho: desfecho!, indiceDoDesfecho: Math.min(indice, baloes.length - 1) };
+  return { primeira: primeira!, desfecho: desfecho!, indiceDoDesfecho };
 }

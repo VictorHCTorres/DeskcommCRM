@@ -77,8 +77,11 @@ export interface DependenciasDaRajada<T> {
 }
 
 // `org_nao_operante` devolve o destinatário a `pending`: sem parar aqui, o lote
-// seguinte o escolheria de novo até o prazo acabar.
-const PARA_A_RAJADA = /^(pausada:|ritmo:|canal:|limite:|erro_na_reserva|org_nao_operante)/;
+// seguinte o escolheria de novo até o prazo acabar. O mesmo vale para a trava
+// da prospecção que não conseguiu ler (`trava:sem_leitura`) ou não tem o corte
+// (`trava:sem_preparacao`): o veto é de todos os envios seguintes. E a campanha
+// que parou no meio (`campanha_parou`, visto na reserva) não manda mais nada.
+const PARA_A_RAJADA = /^(pausada:|ritmo:|canal:|limite:|erro_na_reserva|org_nao_operante|trava:|campanha_parou)/;
 
 /** O desfecho vale para os envios seguintes também — a rajada não insiste. */
 export function desfechoParaARajada(detalhe: string): boolean {

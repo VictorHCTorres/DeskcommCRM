@@ -23,14 +23,22 @@ vi.mock("@/lib/logger", () => ({
   logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn(), debug: vi.fn() },
 }));
 
-/** Supabase falso: devolve o desfecho que o teste mandar para o `update`. */
+/**
+ * Supabase falso: devolve o desfecho que o teste mandar para o `update`. A campanha, que a reserva relê depois
+ * de reservar (cartão I, 11/11/2026), está em andamento; a campanha parada está em `travas-da-prospeccao.test.ts`.
+ */
 function fakeAdmin(desfecho: { data?: unknown[] | null; error?: { message: string } | null }) {
   const b: Record<string, unknown> = {
     update: () => b,
     eq: () => b,
     select: async () => ({ data: desfecho.data ?? null, error: desfecho.error ?? null }),
   };
-  return { from: () => b } as never;
+  const campanha: Record<string, unknown> = {
+    select: () => campanha,
+    eq: () => campanha,
+    maybeSingle: async () => ({ data: { status: "running" }, error: null }),
+  };
+  return { from: (tabela: string) => (tabela === "campaigns" ? campanha : b) } as never;
 }
 
 const AGORA = new Date("2026-09-19T12:00:00.000Z");
