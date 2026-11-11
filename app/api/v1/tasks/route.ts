@@ -34,6 +34,14 @@ import { traduzir } from "@/lib/i18n/dicionario";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { createClient } from "@/lib/supabase/server";
 import { registraAtividadeDaTarefa } from "@/lib/tarefas/atividade";
+import {
+  chaveExternaSchema,
+  comSinalDeCapacidade,
+  ehConflitoDaChave,
+  escaparParaLike,
+  MAXIMO_DE_CHAVES_NO_FILTRO,
+} from "@/lib/tarefas/chave-externa";
+import { buscarDonaDaChave } from "@/lib/tarefas/dona-da-chave";
 import { conferirDemanda } from "@/lib/tarefas/demanda";
 import { conferirResponsavel } from "@/lib/tarefas/responsavel";
 import { COLUNAS_DA_TAREFA, gravarTarefa } from "@/lib/tarefas/gravar-tarefa";
@@ -71,6 +79,12 @@ const criacaoSchema = z.object({
   demanda_id: z.string().uuid().nullable().optional(),
   assigned_to: z.string().uuid().nullable().optional(),
   parent_task_id: z.string().uuid().nullable().optional(),
+  /**
+   * A chave externa de idempotência (D9). Opcional; com espaço nas pontas, vazia, com
+   * caractere de controle ou com mais de 200 caracteres é 422 — nunca aparada em silêncio.
+   * A unicidade é do ÍNDICE do banco, não desta validação.
+   */
+  external_id: chaveExternaSchema.optional(),
 });
 
 const listaSchema = z.object({
@@ -93,9 +107,44 @@ const listaSchema = z.object({
    * da sessão e a RLS segura o resto.
    */
   assigned_to: z.union([z.literal("me"), z.literal("ninguem"), z.string().uuid()]).optional(),
+  /**
+   * D9 — casamento EXATO por chave externa: `?external_id=a&external_id=b`, até 100. Com este
+   * filtro ou o de prefixo a resposta traz só as linhas que casaram, sem a expansão de família.
+   */
+  external_id: z
+    .array(z.string().min(1).max(200))
+    .min(1)
+    .max(MAXIMO_DE_CHAVES_NO_FILTRO)
+    .optional(),
+  /** D9 — casamento por PREFIXO da chave (com `%`, `_` e `\` tratados como texto). */
+  external_id_prefix: z.string().min(1).max(200).optional(),
 });
 
+/** O sinal de capacidade (contrato D9 §3) vai em toda resposta, inclusive nas recusas. */
 export async function GET(req: NextRequest): Promise<Response> {
+  return comSinalDeCapacidade(await listar(req));
+}
+
+export async function POST(req: NextRequest): Promise<Response> {
+  return comSinalDeCapacidade(await criar(req));
+}
+
+/**
+ * Os parâmetros da lista. O `Object.fromEntries` de antes leva o ÚLTIMO valor de cada nome
+ * (comportamento da 1.101.0, mantido para os filtros antigos); `external_id` é o único que
+ * lê todos, e `external_id_prefix` repetido vira lista para o zod recusar em vez de escolher um.
+ */
+function parametrosDaLista(url: string): Record<string, unknown> {
+  const busca = new URL(url).searchParams;
+  const parametros: Record<string, unknown> = Object.fromEntries(busca);
+  if (busca.has("external_id")) parametros.external_id = busca.getAll("external_id");
+  if (busca.getAll("external_id_prefix").length > 1) {
+    parametros.external_id_prefix = busca.getAll("external_id_prefix");
+  }
+  return parametros;
+}
+
+async function listar(req: NextRequest): Promise<Response> {
   const requestId = randomUUID();
 
   const authz = await resolveAuthDual(req, {
@@ -109,7 +158,7 @@ export async function GET(req: NextRequest): Promise<Response> {
   const orgId = authz.organizationId;
   const usuario = usuarioDaSessao(authz);
 
-  const parsed = listaSchema.safeParse(Object.fromEntries(new URL(req.url).searchParams));
+  const parsed = listaSchema.safeParse(parametrosDaLista(req.url));
   if (!parsed.success) {
     return fail("validation_failed", t("Parâmetros inválidos."), 422, {
       requestId,
@@ -131,9 +180,11 @@ export async function GET(req: NextRequest): Promise<Response> {
   // sessão ele também é a regra do CLAUDE.md, não redundância. Consequência
   // aceita: o token enxerga todas as tarefas da org (é credencial de org); a
   // visibilidade por pessoa da RLS (`fn_can_view_task`) vale só para a sessão.
+  // `count: "exact"` conta as linhas que casam com os filtros ANTES do `limit(500)` e na mesma
+  // consulta (mesmo retrato do banco): `meta.total` é o que quem lê compara com o que recebeu.
   let query = supabase
     .from("crm_tasks")
-    .select(COLUNAS)
+    .select(COLUNAS, { count: "exact" })
     .eq("organization_id", orgId)
     .order("due_date", { ascending: true, nullsFirst: false })
     .order("created_at", { ascending: false })
@@ -150,13 +201,25 @@ export async function GET(req: NextRequest): Promise<Response> {
   if (filtros.assigned_to === "me") query = query.eq("assigned_to", usuario!);
   else if (filtros.assigned_to === "ninguem") query = query.is("assigned_to", null);
   else if (filtros.assigned_to) query = query.eq("assigned_to", filtros.assigned_to);
+  if (filtros.external_id) query = query.in("external_id", filtros.external_id);
+  if (filtros.external_id_prefix) {
+    query = query.like("external_id", `${escaparParaLike(filtros.external_id_prefix)}%`);
+  }
 
-  const { data, error } = await query;
+  const { data, error, count } = await query;
   if (error) {
+    return fail("internal_error", t("Erro ao listar as tarefas."), 500, { requestId });
+  }
+  // Sem o total exato a lista não diz se foi cortada: melhor recusar do que calar.
+  if (typeof count !== "number") {
     return fail("internal_error", t("Erro ao listar as tarefas."), 500, { requestId });
   }
 
   const encontradas = (data ?? []) as unknown as Tarefa[];
+  // Consulta por chave é consulta de ROBÔ: só as linhas que casaram, sem a família da tela.
+  if (filtros.external_id || filtros.external_id_prefix) {
+    return ok({ tasks: encontradas }, { requestId, meta: { total: count } });
+  }
   // Filtro é aplicado à DEMANDA de trabalho, não pode amputar a família. Se
   // uma filha casa com "Minhas" ou "Em aberto", trazemos a raiz e todas as
   // irmãs; sem isso uma filha aberta sob raiz concluída desapareceria da tela.
@@ -198,10 +261,10 @@ export async function GET(req: NextRequest): Promise<Response> {
       ...((filhas ?? []) as unknown as Tarefa[]),
     ].map((tarefa) => [tarefa.id, tarefa]),
   );
-  return ok({ tasks: [...porId.values()] }, { requestId });
+  return ok({ tasks: [...porId.values()] }, { requestId, meta: { total: count } });
 }
 
-export async function POST(req: NextRequest): Promise<Response> {
+async function criar(req: NextRequest): Promise<Response> {
   const supportDenied = await requireSupportWrite();
   if (supportDenied) return supportDenied;
 
@@ -344,6 +407,26 @@ export async function POST(req: NextRequest): Promise<Response> {
           requestId,
         },
       );
+    }
+    // D9: a unicidade é do ÍNDICE. Só o 23505 DESTE índice vira 409 — outro 23505 é erro nosso.
+    // Nada foi gravado, então não há auditoria nem atividade a desfazer: ambas só rodam
+    // depois do insert que deu certo, mais abaixo.
+    if (parsed.data.external_id !== undefined && ehConflitoDaChave(error)) {
+      const dona = await buscarDonaDaChave(supabase, orgId, parsed.data.external_id);
+      if (dona === "incerto") {
+        return fail(
+          "unavailable",
+          t(
+            "Não foi possível confirmar qual tarefa já tem esta chave. O resultado é incerto: consulte a lista pela chave antes de tentar de novo.",
+          ),
+          503,
+          { requestId, details: { external_id: parsed.data.external_id, outcome: "unknown" } },
+        );
+      }
+      return fail("state_conflict", t("Já existe uma tarefa com esta chave externa."), 409, {
+        requestId,
+        details: { external_id: parsed.data.external_id, task_id: dona },
+      });
     }
     return fail("internal_error", t("Erro ao salvar a tarefa."), 500, { requestId });
   }

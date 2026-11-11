@@ -70,6 +70,11 @@ export interface Tarefa {
   time_estimate_ms?: number | null;
   source_metadata?: Record<string, unknown>;
   /**
+   * Chave externa de idempotência (D9), única por organização. Nula = tarefa feita à mão.
+   * Quem grava por token a escolhe; o banco garante que não se repete.
+   */
+  external_id?: string | null;
+  /**
    * Derivado (não é coluna): o negócio de `lead_id`, embutido pela rota para a
    * lista de Tarefas dizer DE QUEM é a tarefa sem uma consulta por linha. Nulo
    * quando a tarefa é avulsa — ou quando o negócio não está mais visível.

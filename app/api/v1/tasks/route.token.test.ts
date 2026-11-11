@@ -54,7 +54,7 @@ const mockedAudit = vi.mocked(audit);
 const mockedAtividade = vi.mocked(registraAtividadeDaTarefa);
 
 /** Cliente Supabase mínimo: toda cadeia de query termina no `resultado`. */
-function clienteFalso(resultado: { data: unknown; error: unknown }) {
+function clienteFalso(resultado: { data: unknown; error: unknown; count?: number }) {
   const chamadas: Array<[string, unknown[]]> = [];
   const cadeia: Record<string, unknown> = {};
   for (const m of ["select", "eq", "in", "is", "gte", "lte", "order", "limit", "update"]) {
@@ -166,7 +166,8 @@ describe("POST /api/v1/tasks por token de servidor", () => {
 
 describe("GET /api/v1/tasks por token de servidor", () => {
   it("lista com escopo de leitura e filtra pela organização do token", async () => {
-    const { cliente, chamadas } = clienteFalso({ data: [], error: null });
+    // `count` é o que o PostgREST devolve com `count: "exact"` (D9: a rota agora pede o total).
+    const { cliente, chamadas } = clienteFalso({ data: [], error: null, count: 0 });
     mockedAuth.mockResolvedValue(autorizadoPorToken(cliente) as never);
 
     const res = await GET(pedido("https://crm.test/api/v1/tasks?aberto=true"));

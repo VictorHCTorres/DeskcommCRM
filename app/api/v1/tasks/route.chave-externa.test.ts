@@ -96,9 +96,7 @@ function banco(roteiro: Resultado[]) {
       obj.maybeSingle = async () => proximo();
       obj.single = async () => proximo();
       obj.then = (ok: (v: unknown) => unknown, ko: (e: unknown) => unknown) =>
-        Promise.resolve()
-          .then(proximo)
-          .then(ok, ko);
+        Promise.resolve().then(proximo).then(ok, ko);
       return obj;
     },
   };
@@ -132,10 +130,7 @@ const postar = (body: unknown) =>
   POST(pedido("https://crm.test/api/v1/tasks", { method: "POST", body }));
 const ctx = { params: Promise.resolve({ id: TAREFA_ID }) };
 const remendar = (body: unknown) =>
-  PATCH(
-    pedido(`https://crm.test/api/v1/tasks/${TAREFA_ID}`, { method: "PATCH", body }),
-    ctx,
-  );
+  PATCH(pedido(`https://crm.test/api/v1/tasks/${TAREFA_ID}`, { method: "PATCH", body }), ctx);
 
 const mockedAuth = vi.mocked(resolveAuthDual);
 const mockedGravar = vi.mocked(gravarTarefa);
@@ -290,7 +285,9 @@ describe("POST /api/v1/tasks — external_id", () => {
 
     expect((await postar({ title: "x", external_id: "x".repeat(200) })).status).toBe(201);
     expect((await postar({ title: "x", external_id: "a b" })).status).toBe(201);
-    const gravadas = mockedGravar.mock.calls.map((c) => (c[1] as Record<string, unknown>).external_id);
+    const gravadas = mockedGravar.mock.calls.map(
+      (c) => (c[1] as Record<string, unknown>).external_id,
+    );
     expect(gravadas).toEqual(["x".repeat(200), "a b"]);
   });
 
@@ -382,9 +379,9 @@ describe("GET /api/v1/tasks — filtros por chave e meta.total", () => {
     const { cliente } = banco([]);
     mockedAuth.mockResolvedValue(autorizado(cliente) as never);
 
-    expect(
-      (await GET(pedido("https://crm.test/api/v1/tasks?external_id_prefix="))).status,
-    ).toBe(422);
+    expect((await GET(pedido("https://crm.test/api/v1/tasks?external_id_prefix="))).status).toBe(
+      422,
+    );
     expect(
       (await GET(pedido("https://crm.test/api/v1/tasks?external_id_prefix=a&external_id_prefix=b")))
         .status,
@@ -532,11 +529,12 @@ describe("PATCH /api/v1/tasks/[id] — adoção da chave", () => {
     expect(res.status).toBe(404);
   });
 
-  it("repetir a MESMA chave que a tarefa já tem é idempotente: 200, sem regravar", async () => {
+  it("repetir a MESMA chave que a tarefa já tem é idempotente: 200, sem regravar a chave", async () => {
     const tarefa = { id: TAREFA_ID, status: "pending", external_id: CHAVE };
     const { cliente, cadeias } = banco([
       { data: { ...antes, external_id: CHAVE } },
-      { data: tarefa },
+      { data: null, error: { code: "PGRST116", message: "0 rows" } }, // a guarda não casou
+      { data: tarefa }, // a leitura que diz que a chave é a mesma
     ]);
     mockedAuth.mockResolvedValue(autorizado(cliente) as never);
 
@@ -544,7 +542,26 @@ describe("PATCH /api/v1/tasks/[id] — adoção da chave", () => {
 
     expect(res.status).toBe(200);
     expect((await res.json()).data.task.external_id).toBe(CHAVE);
-    // Nenhum `update` foi emitido: só as duas leituras.
-    expect(cadeias.some((c) => c.chamadas.some(([m]) => m === "update"))).toBe(false);
+    // Um único `update`, o guardado: a chave nunca é regravada.
+    const updates = cadeias.filter((c) => c.chamadas.some(([m]) => m === "update"));
+    expect(updates).toHaveLength(1);
+    expect(updates[0]!.chamadas).toContainEqual(["is", ["external_id", null]]);
+  });
+
+  it("a MESMA chave junto de outros campos: a chave é ignorada e o resto é gravado sem guarda", async () => {
+    const { cliente, cadeias } = banco([
+      { data: antes },
+      { data: null, error: { code: "PGRST116", message: "0 rows" } },
+      { data: { id: TAREFA_ID, status: "pending", external_id: CHAVE } },
+      { data: { id: TAREFA_ID, status: "pending", priority: "high", external_id: CHAVE } },
+    ]);
+    mockedAuth.mockResolvedValue(autorizado(cliente) as never);
+
+    const res = await remendar({ external_id: CHAVE, priority: "high" });
+
+    expect(res.status).toBe(200);
+    const updates = cadeias.filter((c) => c.chamadas.some(([m]) => m === "update"));
+    expect(updates[1]!.chamadas).toContainEqual(["update", [{ priority: "high" }]]);
+    expect(updates[1]!.chamadas.some(([m]) => m === "is")).toBe(false);
   });
 });
