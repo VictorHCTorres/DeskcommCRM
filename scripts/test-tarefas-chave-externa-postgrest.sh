@@ -13,6 +13,17 @@
 # Contêineres e rede têm nome único (PID + aleatório) e são removidos por trap, mesmo em erro.
 # Nenhum caminho fixo em /tmp. Requisito: Docker. Não toca em nenhum outro contêiner.
 #
+# DOIS veredictos, que nunca se confundem:
+#   · "GATE D9 DA API VERDE (volta NÃO provada)": os passos 1 e 2 (upgrade, catálogo, suíte real);
+#   · "GATE D9 COMPLETO VERDE": os passos 1, 2 e 3 (a volta: o app de D9_BASE_REF sobre o banco migrado).
+# Sem D9_PULAR_VOLTA=1 a volta roda; com ele o script diz que pulou e NUNCA imprime o veredicto completo.
+# A base é verificada (D9_BASE_REF tem de resolver para o commit 587fbbe81…) e NUNCA é escrita: a árvore
+# dela é extraída por `git archive` para um diretório temporário.
+#
+# Pré-requisitos: docker (daemon rodando), git, awk, curl, tar, python3 (só com D9_CHAVES_CANONICAS_JSONL),
+# node/npx e as dependências do repositório instaladas (node_modules). Nenhuma credencial, nenhuma rede além
+# do pull das imagens (se ainda não estiverem locais).
+#
 # Uso:  bash scripts/test-tarefas-chave-externa-postgrest.sh
 #       D9_BASE_REF=587fbbe81 TEST_DB_IMAGE=pgvector/pgvector:pg15 D9_POSTGREST_IMAGE=postgrest/postgrest:v13.0.7 \
 #       D9_CHAVES_CANONICAS_JSONL=<operacoes-F2.jsonl> bash scripts/test-tarefas-chave-externa-postgrest.sh
@@ -23,6 +34,7 @@ BASELINE="$ROOT/supabase/baseline.sql"
 IMAGE="${TEST_DB_IMAGE:-pgvector/pgvector:pg15}"
 PGRST_IMAGE="${D9_POSTGREST_IMAGE:-postgrest/postgrest:v13.0.7}"
 BASE_REF="${D9_BASE_REF:-587fbbe81}"
+BASE_ESPERADA="587fbbe81a3fdd1202cf9033cb4e0e7d94251450"   # a 1.101.0 DO FORK (a tag homônima do upstream é outro commit)
 SUF="$$-$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')"
 REDE="d9-rede-$SUF"
 PG_VELHO="d9-pg-upgrade-$SUF"
@@ -36,8 +48,21 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/d9-gate.XXXXXX")"
 cleanup() {
   docker rm -fv "$REST" "$PG_NOVO" "$PG_VELHO" >/dev/null 2>&1 || true
   docker network rm "$REDE" >/dev/null 2>&1 || true
+  # O diretório temporário é nosso (mktemp acima); só se apaga um caminho com o nome que ele gerou.
+  case "$TMP" in "${TMPDIR:-/tmp}"/d9-gate.*) find "$TMP" -depth -delete 2>/dev/null || true ;; esac
 }
 trap cleanup EXIT
+
+echo "==> pré-requisitos"
+faltam=""
+for c in docker git awk curl tar npx; do command -v "$c" >/dev/null 2>&1 || faltam="$faltam $c"; done
+[ -z "${D9_CHAVES_CANONICAS_JSONL:-}" ] || command -v python3 >/dev/null 2>&1 || faltam="$faltam python3"
+[ -d "$ROOT/node_modules" ] || faltam="$faltam node_modules(pnpm install)"
+docker info >/dev/null 2>&1 || faltam="$faltam docker(daemon parado)"
+[ -z "$faltam" ] || { echo "FATAL: faltam:$faltam" >&2; exit 1; }
+BASE_SHA=$(git -C "$ROOT" rev-parse --verify "$BASE_REF^{commit}")
+[ "$BASE_SHA" = "$BASE_ESPERADA" ] || { echo "FATAL: D9_BASE_REF=$BASE_REF resolve para $BASE_SHA, não para a 1.101.0 do fork ($BASE_ESPERADA)" >&2; exit 1; }
+echo "    ok; base $BASE_SHA; node $(node --version)"
 
 echo "==> versões"
 docker --version
@@ -155,16 +180,30 @@ cd "$ROOT"
 D9_PG_CONTAINER="$PG_NOVO" D9_POSTGREST_URL="$URL" D9_JWT_SECRET="$SEGREDO" D9_CHAVES_CANONICAS="$CANON" \
   npx vitest run --config vitest.d9-real.config.ts
 
-# ───────────────────────── 3. A VOLTA (1.101.0 sobre o banco migrado) ─────────────────────────
-# D9_BASE_WORKTREE: worktree (limpo) do commit da base, com node_modules. Sem ele o passo é pulado e dito.
-if [ -n "${D9_BASE_WORKTREE:-}" ] && [ -d "$D9_BASE_WORKTREE" ]; then
-  echo "==> [3] volta: o app da base ($(git -C "$D9_BASE_WORKTREE" rev-parse --short HEAD)) sobre o banco migrado"
-  mkdir -p "$D9_BASE_WORKTREE/tests/d9-volta"
-  cp "$ROOT/tests/d9-volta/volta-1101.real.ts" "$D9_BASE_WORKTREE/tests/d9-volta/"
-  cp "$ROOT/vitest.d9-volta.config.ts" "$D9_BASE_WORKTREE/"
-  (cd "$D9_BASE_WORKTREE" && D9_PG_CONTAINER="$PG_NOVO" D9_POSTGREST_URL="$URL" D9_JWT_SECRET="$SEGREDO" \
-    npx vitest run --config vitest.d9-volta.config.ts)
+# ───────────────────────── 3. A VOLTA (o app da base sobre o banco migrado) ─────────────────────────
+VOLTA="nao"
+if [ "${D9_PULAR_VOLTA:-0}" = 1 ]; then
+  echo "==> [3] volta: PULADA por D9_PULAR_VOLTA=1 — a volta NÃO foi provada"
 else
-  echo "==> [3] volta: PULADO (defina D9_BASE_WORKTREE com um worktree da base para provar o rollback)"
+  echo "==> [3] volta: o app de $BASE_SHA sobre o banco migrado"
+  # A base é extraída para um temporário (git archive): nunca se escreve numa árvore de verdade.
+  mkdir -p "$TMP/base"
+  git -C "$ROOT" archive "$BASE_SHA" | tar -x -C "$TMP/base"
+  ln -s "$ROOT/node_modules" "$TMP/base/node_modules"
+  mkdir -p "$TMP/base/tests/d9-volta"
+  cp "$ROOT/tests/d9-volta/volta-1101.real.ts" "$TMP/base/tests/d9-volta/"
+  cp "$ROOT/vitest.d9-volta.config.ts" "$TMP/base/"
+  # Prova de que o que roda é mesmo a base: o baseline extraído NÃO tem a chave e é idêntico ao do commit.
+  if grep -q crm_tasks_org_external_id_unique "$TMP/base/supabase/baseline.sql"; then
+    echo "FATAL: a árvore extraída da base já tem a chave" >&2; exit 1
+  fi
+  (cd "$TMP/base" && D9_PG_CONTAINER="$PG_NOVO" D9_POSTGREST_URL="$URL" D9_JWT_SECRET="$SEGREDO" \
+    npx vitest run --config vitest.d9-volta.config.ts)
+  VOLTA="sim"
 fi
-echo "==> GATE D9 VERDE"
+
+if [ "$VOLTA" = "sim" ]; then
+  echo "==> GATE D9 COMPLETO VERDE (API + volta)"
+else
+  echo "==> GATE D9 DA API VERDE (volta NÃO provada: não é o gate completo)"
+fi

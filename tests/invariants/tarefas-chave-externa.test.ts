@@ -398,6 +398,123 @@ describe("o limite de composição do gatilho (cxj §4), provado numa transaçã
   });
 });
 
+// D9v2-3 (cxj): o conferidor de catálogo aprovava função vazia, `WHEN (false)` e constraint permissiva.
+// Agora ele compara cada objeto POR EQUIVALÊNCIA EXATA. Cada sabotagem roda numa transação desfeita
+// (DDL é transacional no Postgres); o conferidor tem de FALHAR, e o banco volta intacto.
+describe("o conferidor de catálogo (scripts/d9-conferir-catalogo.sql): positivo e negativos exatos", () => {
+  const conferidor = readFileSync(join(__dirname, "../../scripts/d9-conferir-catalogo.sql"), "utf8");
+  const sabotado = (sabotagem: string) => erroDe(`begin;\n${sabotagem}\n${conferidor}\nrollback;`);
+  const GUARDA = "public.fn_crm_tasks_chave_externa_guarda";
+
+  it("positivo: no banco recém-instalado pelo baseline, o conferidor passa", () => {
+    expect(erroDe(conferidor)).toBeNull();
+  });
+
+  it("positivo: reaplicar a migration sobre o banco migrado e conferir de novo passa", () => {
+    const mig = readFileSync(
+      join(__dirname, "../../supabase/migrations/20261111132148_9252_tarefas_chave_externa_unica.sql"),
+      "utf8",
+    );
+    expect(erroDe(`${mig}\n${mig}\n${conferidor}`)).toBeNull();
+  });
+
+  const negativos: Array<[string, string, string]> = [
+    [
+      "função vazia (nome, tipo, INVOKER e ACL iguais; corpo trocado) — sabotagem 1 do cxj",
+      `create or replace function ${GUARDA}() returns trigger language plpgsql set search_path = public, pg_temp as $$ begin return new; end $$;`,
+      "corpo diferente do canônico",
+    ],
+    [
+      "gatilho com WHEN (false) (mesmo nome, função, eventos e estado) — sabotagem 2 do cxj",
+      `drop trigger zz_crm_tasks_chave_externa_ultimo on public.crm_tasks;
+       create trigger zz_crm_tasks_chave_externa_ultimo before insert or update on public.crm_tasks
+         for each row when (false) execute function ${GUARDA}();`,
+      "gatilho zz_crm_tasks_chave_externa_ultimo",
+    ],
+    [
+      "constraint permissiva (`or external_id is not null`) VALIDADA — sabotagem 3 do cxj",
+      `alter table public.crm_tasks drop constraint crm_tasks_external_id_formato;
+       alter table public.crm_tasks add constraint crm_tasks_external_id_formato
+         check (external_id is null or char_length(external_id) between 1 and 200 or external_id is not null);`,
+      "constraint: definição diferente da canônica",
+    ],
+    [
+      "um BEFORE ROW posterior (zzz_depois)",
+      `create function public.d9_depois() returns trigger language plpgsql as $$ begin return new; end $$;
+       create trigger zzz_depois before update on public.crm_tasks for each row execute function public.d9_depois();`,
+      "BEFORE ROW que ordena DEPOIS da guarda",
+    ],
+    [
+      "gatilho desligado",
+      `alter table public.crm_tasks disable trigger zz_crm_tasks_chave_externa_ultimo;`,
+      "gatilho zz_crm_tasks_chave_externa_ultimo",
+    ],
+    [
+      "gatilho só `update of title` (lista de colunas)",
+      `drop trigger zz_crm_tasks_chave_externa_ultimo on public.crm_tasks;
+       create trigger zz_crm_tasks_chave_externa_ultimo before insert or update of title on public.crm_tasks
+         for each row execute function ${GUARDA}();`,
+      "gatilho zz_crm_tasks_chave_externa_ultimo",
+    ],
+    [
+      "gatilho só INSERT",
+      `drop trigger zz_crm_tasks_chave_externa_ultimo on public.crm_tasks;
+       create trigger zz_crm_tasks_chave_externa_ultimo before insert on public.crm_tasks
+         for each row execute function ${GUARDA}();`,
+      "gatilho zz_crm_tasks_chave_externa_ultimo",
+    ],
+    [
+      "função SECURITY DEFINER",
+      `alter function ${GUARDA}() security definer;`,
+      "função (nargs",
+    ],
+    [
+      "função com search_path diferente",
+      `alter function ${GUARDA}() set search_path = public;`,
+      "função (nargs",
+    ],
+    [
+      "EXECUTE da função concedido ao authenticated",
+      `grant execute on function ${GUARDA}() to authenticated;`,
+      "EXECUTE concedido",
+    ],
+    [
+      "índice não único",
+      `drop index public.crm_tasks_org_external_id_unique;
+       create index crm_tasks_org_external_id_unique on public.crm_tasks (organization_id, external_id) where external_id is not null;`,
+      "índice",
+    ],
+    [
+      "índice sem o predicado parcial",
+      `drop index public.crm_tasks_org_external_id_unique;
+       create unique index crm_tasks_org_external_id_unique on public.crm_tasks (organization_id, external_id);`,
+      "índice: definição diferente da canônica",
+    ],
+    [
+      "constraint não validada",
+      `alter table public.crm_tasks drop constraint crm_tasks_external_id_formato;
+       alter table public.crm_tasks add constraint crm_tasks_external_id_formato
+         check (external_id is null or (char_length(external_id) between 1 and 200 and external_id ~ '^[A-Za-z0-9À-ÖØ-öø-ÿ|/.:-]+$')) not valid;`,
+      "validada",
+    ],
+    [
+      "coluna com default",
+      `alter table public.crm_tasks alter column external_id set default 'x';`,
+      "coluna external_id",
+    ],
+  ];
+  it.each(negativos)("negativo: %s", (_nome, sabotagem, trecho) => {
+    const erro = sabotado(sabotagem);
+    expect(erro, "o conferidor APROVOU uma trava sabotada").not.toBeNull();
+    expect(erro).toContain("conferir-catalogo D9");
+    expect(erro).toContain(trecho);
+  });
+
+  it("depois dos negativos o banco continua certo (as sabotagens foram desfeitas)", () => {
+    expect(erroDe(conferidor)).toBeNull();
+  });
+});
+
 describe("concorrência real: várias conexões, a mesma chave", () => {
   const psql = (script: string) =>
     execFileAsync(

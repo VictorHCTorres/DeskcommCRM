@@ -39,7 +39,7 @@ vi.mock("@/lib/tarefas/atividade", () => ({
 import { resolveAuthDual } from "@/lib/api/auth-dual";
 import { PATCH } from "@/app/api/v1/tasks/[id]/route";
 import { GET, POST } from "@/app/api/v1/tasks/route";
-import { chaveExternaSchema } from "@/lib/tarefas/chave-externa";
+import { chaveExternaSchema, valorDoFiltroIn } from "@/lib/tarefas/chave-externa";
 
 const URL_REST = process.env.D9_POSTGREST_URL ?? "";
 const SEGREDO = process.env.D9_JWT_SECRET ?? "";
@@ -330,8 +330,8 @@ describe("GET: count com embed, corte, cortada e RLS", () => {
   });
 });
 
-describe("caracteres especiais: Supabase JS + PostgREST + LIKE de verdade", () => {
-  const literais = ["pref:100%_a\\b:1", "pref:100xxa\\b:2", 'aspa"x', "barra\\x", "virgula,x", "paren(x)", "ponto.x", "dois:pontos"];
+describe("o domínio da chave pelo Supabase JS + PostgREST + LIKE de verdade (D9 v3)", () => {
+  const literais = ["pref.100:a-b|1", "pref.100:a-b|2", "ponto.x", "dois:pontos", "barra/x", "Pró-labore|ação"];
   beforeAll(async () => {
     for (const chave of literais) {
       const { error } = await servico.from("crm_tasks").insert({ organization_id: ORG_A, title: "lit", external_id: chave });
@@ -339,26 +339,22 @@ describe("caracteres especiais: Supabase JS + PostgREST + LIKE de verdade", () =
     }
   });
 
-  it("prefixo com %, _ e \\ casa só o literal (e não o `pref:100xxa\\b:2`)", async () => {
-    const { corpo } = await lista(`?external_id_prefix=${encodeURIComponent("pref:100%_a\\b")}`);
-    expect(corpo.data.tasks.map((t) => t.external_id)).toEqual(["pref:100%_a\\b:1"]);
-  });
-
-  it.each(literais)("o filtro exato acha %j (aspas, vírgula, barra, parênteses atravessam o `in`)", async (chave) => {
+  it.each(literais)("o filtro exato acha %j (e só ele)", async (chave) => {
     const { corpo } = await lista(`?external_id=${encodeURIComponent(chave)}`);
     expect(corpo.data.tasks.map((t) => t.external_id)).toEqual([chave]);
     expect(corpo.meta.total).toBe(1);
   });
 
-  it("vários exatos de uma vez e AND com o prefixo", async () => {
-    const { corpo } = await lista(`?external_id=${encodeURIComponent(literais[0]!)}&external_id=${encodeURIComponent('aspa"x')}`);
+  it("prefixo casa só o que começa com ele; vários exatos de uma vez; AND com o prefixo", async () => {
+    const { corpo: p } = await lista(`?external_id_prefix=${encodeURIComponent("pref.100:a-b|")}`);
+    expect(p.data.tasks.map((t) => t.external_id).sort()).toEqual(["pref.100:a-b|1", "pref.100:a-b|2"]);
+    const { corpo } = await lista(`?external_id=${encodeURIComponent(literais[0]!)}&external_id=${encodeURIComponent(literais[2]!)}`);
     expect(corpo.data.tasks).toHaveLength(2);
-    const e = await lista(`?external_id=${encodeURIComponent(literais[0]!)}&external_id_prefix=aspa`);
+    const e = await lista(`?external_id=${encodeURIComponent(literais[0]!)}&external_id_prefix=ponto`);
     expect(e.corpo.data.tasks).toHaveLength(0);
   });
 
   it("⭐ A PREMISSA DO ACHADO D9-2: o PostgREST traduz `*` em curinga do LIKE — por isso a chave não pode ter `*`", async () => {
-    // Com o escape de `%`, `_` e `\\` apenas, `*` passa cru ao PostgREST e vira `%` antes do LIKE.
     const { data } = await servico
       .from("crm_tasks")
       .select("external_id")
@@ -367,36 +363,58 @@ describe("caracteres especiais: Supabase JS + PostgREST + LIKE de verdade", () =
     expect((data ?? []).map((r) => r.external_id)).toEqual(["dois:pontos"]); // casou sem ter `*`: é curinga
   });
 
-  it("e por isso `*` é recusado em todas as camadas: rota (POST 422, GET 422) e constraint do banco", async () => {
-    expect((await postar({ title: "x", external_id: "star*literal:1" })).status).toBe(422);
-    expect((await GET(req("?external_id_prefix=star%2Aliteral"))).status).toBe(422);
-    expect((await GET(req("?external_id=star%2Aliteral"))).status).toBe(422);
-    const { error } = await servico.from("crm_tasks").insert({ organization_id: ORG_A, title: "x", external_id: "star*literal:1" });
+  // Tudo o que está FORA da lista: 422 na rota (POST, GET exato, GET por prefixo) E 23514 no banco.
+  const fora: Array<[string, string]> = [
+    ["asterisco", "star*literal:1"],
+    ["porcento", "a%b"],
+    ["sublinhado", "a_b"],
+    ["barra invertida", "a\\b"],
+    ["aspa dupla", 'a"b'],
+    ["vírgula", "a,b"],
+    ["parênteses", "a(b)"],
+    ["cerquilha", "a#b"],
+    ["espaço no meio", "a b"],
+    ["NBSP no meio", "a\u00a0b"],
+    ["NBSP no fim", "ab\u00a0"],
+    ["EM SPACE", "a\u2003b"],
+    ["LINE SEPARATOR", "a\u2028b"],
+    ["BOM", "a\ufeffb"],
+    ["controle C1", "a\u0085b"],
+    ["ZWJ", "a\u200db"],
+    ["NFD (ó decomposto)", "contab|rotina|6249|Pro\u0301-labore|09/2026"],
+    ["o caso do cxj, decomposto (U+105D2 + ponto)", "k:\u{105D2}\u0307"],
+    ["o caso do cxj, composto (U+105C9)", "k:\u{105C9}"],
+    ["emoji", "a\u{1F600}"],
+  ];
+  it.each(fora)("fora do domínio: %s é 422 na rota (POST, GET exato, GET prefixo) E 23514 no banco", async (_nome, chave) => {
+    expect((await postar({ title: "x", external_id: chave })).status).toBe(422);
+    expect((await GET(req(`?external_id=${encodeURIComponent(chave)}`))).status).toBe(422);
+    expect((await GET(req(`?external_id_prefix=${encodeURIComponent(chave)}`))).status).toBe(422);
+    const { error } = await servico.from("crm_tasks").insert({ organization_id: ORG_A, title: "x", external_id: chave });
     expect(error?.code).toBe("23514");
     expect(error?.message).toContain("crm_tasks_external_id_formato");
   });
 
-  it.each([
-    ["NBSP no meio", "a b"],
-    ["NBSP no fim", "ab "],
-    ["EM SPACE", "a b"],
-    ["LINE SEPARATOR", "a b"],
-    ["BOM", "a﻿b"],
-    ["controle C1", "a\u0085b"],
-    ["NFD", "contab|rotina|6249|Pró-labore|09/2026"],
-  ])("Unicode: %s é 422 na rota E 23514 no banco (as duas camadas concordam)", async (_nome, chave) => {
-    expect((await postar({ title: "x", external_id: chave })).status).toBe(422);
-    const { error } = await servico.from("crm_tasks").insert({ organization_id: ORG_A, title: "x", external_id: chave });
-    expect(error?.code).toBe("23514");
+  it("surrogate isolado: 422 (antes: o schema deixava passar e o POST dava 500 pelo PGRST102)", async () => {
+    expect((await postar({ title: "x", external_id: "k:\ud800" })).status).toBe(422);
   });
 
-  it("a chave canônica com acento (NFC) faz o caminho inteiro: POST, GET exato e GET por prefixo", async () => {
-    const chave = `contab|rotina|6249|Folha/Pró-labore|09/2026#${randomUUID().slice(0, 8)}`;
+  it("⭐ nenhum caminho cria duas linhas para o mesmo texto: o decomposto e o composto do cxj não gravam", async () => {
+    const antes = um(`select count(*) from public.crm_tasks where external_id like 'k:%' and organization_id='${ORG_A}'`);
+    for (const chave of ["k:\u{105D2}\u0307", "k:\u{105C9}"]) {
+      await servico.from("crm_tasks").insert({ organization_id: ORG_A, title: "x", external_id: chave });
+      await postar({ title: "x", external_id: chave });
+    }
+    expect(um(`select count(*) from public.crm_tasks where external_id like 'k:%' and organization_id='${ORG_A}'`)).toBe(antes);
+  });
+
+  it("a chave canônica com acento pré-composto faz o caminho inteiro: POST, GET exato e GET por prefixo", async () => {
+    const chave = `contab|rotina|6249|Folha/Pró-labore|09/2026.${randomUUID().slice(0, 8)}`;
     const res = await postar({ title: "acentuada", external_id: chave });
     expect(res.status).toBe(201);
     const exato = await lista(`?external_id=${encodeURIComponent(chave)}`);
     expect(exato.corpo.data.tasks).toHaveLength(1);
-    const prefixo = await lista(`?external_id_prefix=${encodeURIComponent("contab|rotina|6249|Folha/Pró-labore|09/2026#")}`);
+    const prefixo = await lista(`?external_id_prefix=${encodeURIComponent("contab|rotina|6249|Folha/Pró-labore|09/2026.")}`);
     expect(prefixo.corpo.data.tasks.map((t) => t.external_id)).toContain(chave);
   });
 
@@ -405,6 +423,86 @@ describe("caracteres especiais: Supabase JS + PostgREST + LIKE de verdade", () =
     expect((await postar({ title: "nfc", external_id: base.normalize("NFC") })).status).toBe(201);
     expect((await postar({ title: "nfd", external_id: base.normalize("NFD") })).status).toBe(422);
     expect((await postar({ title: "nfc de novo", external_id: base.normalize("NFC") })).status).toBe(409);
+  });
+});
+
+// D9v2-1 (cxj): o `.in()` do supabase-js põe aspas em valor com `,()` mas NÃO escapa `"` e `\`; o PostgREST lê
+// outra expressão. O domínio novo manda `"` e `\` para 422, mas a serialização correta fica como defesa e é
+// provada AQUI, contra uma tabela SEM a constraint (a única maneira de ter chaves assim no banco).
+describe("D9v2-1: o filtro `in` na gramática do PostgREST (tabela sem constraint, só para a prova)", () => {
+  const casos = [
+    'cxj:url:a",b',
+    'cxj:url:a\\",b',
+    'cxj:url:a"(b)',
+    "cxj:url:a\\(b)",
+    "cxj:url:a,b\\c",
+  ];
+  const semelhantes = ['cxj:url:a"', "cxj:url:a,b", "cxj:url:a\\", 'cxj:url:a"(b']; // contraprova: chaves parecidas
+  async function esperaTabela() {
+    for (let i = 0; i < 30; i++) {
+      const { error } = await servico.from("d9_filtro_in").select("external_id").limit(1);
+      if (!error) return;
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    throw new Error("o PostgREST não enxergou a tabela d9_filtro_in");
+  }
+  beforeAll(async () => {
+    psql(`
+      create table if not exists public.d9_filtro_in (external_id text);
+      grant all on public.d9_filtro_in to service_role;
+      truncate public.d9_filtro_in;
+      notify pgrst, 'reload schema';
+    `);
+    await esperaTabela();
+    const linhas = [...casos, ...semelhantes].map((external_id) => ({ external_id }));
+    const { error } = await servico.from("d9_filtro_in").insert(linhas);
+    expect(error).toBeNull();
+  });
+
+  it.each(casos)("serialização correta: o `in` acha EXATAMENTE a chave %j (e não as parecidas)", async (chave) => {
+    const { data, error } = await servico.from("d9_filtro_in").select("external_id").filter("external_id", "in", valorDoFiltroIn([chave]));
+    expect(error).toBeNull();
+    expect((data ?? []).map((r) => r.external_id)).toEqual([chave]);
+  });
+
+  it("serialização correta: as cinco chaves juntas voltam as cinco, e uma ausente não traz nenhuma", async () => {
+    const { data } = await servico.from("d9_filtro_in").select("external_id").filter("external_id", "in", valorDoFiltroIn(casos));
+    expect((data ?? []).map((r) => r.external_id).sort()).toEqual([...casos].sort());
+    const vazio = await servico.from("d9_filtro_in").select("external_id").filter("external_id", "in", valorDoFiltroIn(["cxj:nao-existe"]));
+    expect(vazio.data).toEqual([]);
+  });
+
+  it("⭐ a PREMISSA do achado: o `.in()` do supabase-js erra em ao menos uma dessas chaves (ausência falsa ou chave alheia)", async () => {
+    let erros = 0;
+    for (const chave of casos) {
+      const { data } = await servico.from("d9_filtro_in").select("external_id").in("external_id", [chave]);
+      const achou = (data ?? []).map((r) => r.external_id);
+      if (achou.length !== 1 || achou[0] !== chave) erros++;
+    }
+    expect(erros).toBeGreaterThan(0);
+  });
+});
+
+// Item 4 do v3: o 23505 que NÃO cita o índice da chave nunca vira 409.
+describe("23505 sem o nome do índice: nunca é 409", () => {
+  it("o PostgREST devolve o 23505 mas sem o nome do índice na mensagem: a rota responde 500, não 409", async () => {
+    const chave = `semnome:${randomUUID()}`;
+    expect((await postar({ title: "dona", external_id: chave })).status).toBe(201);
+    const semONome: Fetch = async (url, opts) => {
+      const res = await fetch(url, opts);
+      if ((opts?.method ?? "GET") !== "POST" || res.status !== 409) return res;
+      const corpo = (await res.json()) as { message?: string; details?: string };
+      const limpa = (t?: string) => (t ?? "").replaceAll("crm_tasks_org_external_id_unique", "um_indice_qualquer");
+      return new Response(JSON.stringify({ ...corpo, message: limpa(corpo.message), details: limpa(corpo.details) }), {
+        status: res.status,
+        headers: res.headers,
+      });
+    };
+    comoToken(cliente("service_role", USER_DUAS, semONome));
+    const res = await postar({ title: "dona de novo", external_id: chave });
+    expect(res.status).toBe(500);
+    comoToken(servico);
+    expect((await postar({ title: "dona de novo", external_id: chave })).status).toBe(409); // sem o filtro, o 409 volta
   });
 });
 
@@ -468,7 +566,7 @@ describe("as chaves canônicas da F5 e do C1 passam na regra (zod e banco) e faz
     const sufixo = randomUUID().slice(0, 6);
     for (const chave of todas) {
       expect(chaveExternaSchema.safeParse(chave).success, chave).toBe(true);
-      const res = await postar({ title: "canônica", external_id: `${chave}#${sufixo}` });
+      const res = await postar({ title: "canônica", external_id: `${chave}.${sufixo}` });
       expect(res.status, chave).toBe(201);
     }
     const { corpo } = await lista(`?external_id_prefix=${encodeURIComponent("contab|")}`);
