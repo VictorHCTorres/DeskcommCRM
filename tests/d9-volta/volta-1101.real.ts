@@ -94,14 +94,13 @@ describe("1.101.0 sobre o banco migrado (coluna + índice + gatilho presentes)",
     });
   }
 
-  it("a 1.101.0 não conhece `external_id`: o corpo com a chave NÃO grava chave (comportamento observado, registrado)", async () => {
+  it("a 1.101.0 NÃO conhece `external_id`: aceita o POST (201) e DESCARTA a chave em silêncio — por isso os escritores D9 ficam parados na volta", async () => {
     com(servico, "token");
-    const r = await POST(json("POST", "/api/v1/tasks", { title: "ignora chave", external_id: "volta:x" }));
+    const r = await POST(json("POST", "/api/v1/tasks", { title: "ignora chave", external_id: "volta.x" }));
     const corpo = await r.json();
-    // Observado: o que a 1.101.0 faz com um campo que ela não conhece. Se mudar, o rollback muda de natureza.
-    expect([201, 422]).toContain(r.status);
-    if (r.status === 201) {
-      expect(psql(`select coalesce(external_id,'(nulo)') from public.crm_tasks where id='${corpo.data.task.id}'`)).toBe("(nulo)");
-    }
+    expect(r.status).toBe(201);
+    // A linha existe SEM chave: o robô que repetir a chamada cria outra (duplicata). Não há cabeçalho de capacidade.
+    expect(r.headers.get("x-tasks-external-id")).toBeNull();
+    expect(psql(`select coalesce(external_id,'(nulo)') from public.crm_tasks where id='${corpo.data.task.id}'`)).toBe("(nulo)");
   });
 });
