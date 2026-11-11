@@ -25,6 +25,7 @@ import { createAdminClient } from "@/lib/supabase/admin";
 import { createClient } from "@/lib/supabase/server";
 import { registraAtividadeDaTarefa } from "@/lib/tarefas/atividade";
 import {
+  CHAVE_SO_POR_TOKEN,
   chaveExternaSchema,
   comSinalDeCapacidade,
   ehConflitoDaChave,
@@ -120,6 +121,14 @@ async function editar(req: NextRequest, ctx: Contexto): Promise<Response> {
     return fail("validation_failed", t("Dados inválidos."), 422, {
       requestId,
       details: parsed.error.flatten().fieldErrors as Record<string, unknown>,
+    });
+  }
+
+  // D9: adotar chave é coisa do robô (token). Na sessão é 422 explícito; o banco repete a regra.
+  if (parsed.data.external_id !== undefined && authz.via !== "token") {
+    return fail("validation_failed", t("Dados inválidos."), 422, {
+      requestId,
+      details: { external_id: [CHAVE_SO_POR_TOKEN] },
     });
   }
 

@@ -19,6 +19,10 @@ export const INDICE_DA_CHAVE_EXTERNA = "crm_tasks_org_external_id_unique";
 /** O cabeçalho que diz "esta versão do CRM entende `external_id`". Ver o contrato D9 §3. */
 export const CABECALHO_DA_CAPACIDADE = "x-tasks-external-id";
 
+/** A mensagem do 422 quando a sessão do navegador manda `external_id`. */
+export const CHAVE_SO_POR_TOKEN =
+  "A chave externa só pode ser gravada por token de servidor (dsk_…), não pela sessão do navegador.";
+
 export const TAMANHO_MAXIMO_DA_CHAVE = 200;
 export const MAXIMO_DE_CHAVES_NO_FILTRO = 100;
 

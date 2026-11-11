@@ -35,6 +35,7 @@ import { createAdminClient } from "@/lib/supabase/admin";
 import { createClient } from "@/lib/supabase/server";
 import { registraAtividadeDaTarefa } from "@/lib/tarefas/atividade";
 import {
+  CHAVE_SO_POR_TOKEN,
   chaveExternaSchema,
   comSinalDeCapacidade,
   ehConflitoDaChave,
@@ -82,7 +83,7 @@ const criacaoSchema = z.object({
   /**
    * A chave externa de idempotência (D9). Opcional; com espaço nas pontas, vazia, com
    * caractere de controle ou com mais de 200 caracteres é 422 — nunca aparada em silêncio.
-   * A unicidade é do ÍNDICE do banco, não desta validação.
+   * A unicidade é do ÍNDICE do banco, não desta validação. Só vale no ramo do token.
    */
   external_id: chaveExternaSchema.optional(),
 });
@@ -116,6 +117,7 @@ const listaSchema = z.object({
     .min(1)
     .max(MAXIMO_DE_CHAVES_NO_FILTRO)
     .optional(),
+  // Nos dois filtros a RLS segura o que a SESSÃO vê: `meta.total` na sessão conta só o visível.
   /** D9 — casamento por PREFIXO da chave (com `%`, `_` e `\` tratados como texto). */
   external_id_prefix: z.string().min(1).max(200).optional(),
 });
@@ -290,6 +292,17 @@ async function criar(req: NextRequest): Promise<Response> {
     return fail("validation_failed", t("Dados inválidos."), 422, {
       requestId,
       details: parsed.error.flatten().fieldErrors as Record<string, unknown>,
+    });
+  }
+
+  // D9: a chave é do robô. Pela sessão do navegador ela é recusada (nunca ignorada em silêncio):
+  // quem usa a tela poderia ocupar a chave que o robô vai precisar, e a leitura do dono da chave
+  // com o cliente da sessão viraria um oráculo sobre tarefas que a RLS esconde. O banco repete
+  // a regra (trigger da migration 9252) para quem fala com o PostgREST sem passar por aqui.
+  if (parsed.data.external_id !== undefined && authz.via !== "token") {
+    return fail("validation_failed", t("Dados inválidos."), 422, {
+      requestId,
+      details: { external_id: [CHAVE_SO_POR_TOKEN] },
     });
   }
 

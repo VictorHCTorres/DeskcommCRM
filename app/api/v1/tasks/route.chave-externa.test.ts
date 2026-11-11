@@ -207,14 +207,27 @@ describe("POST /api/v1/tasks — external_id", () => {
     expect(mockedAtividade).not.toHaveBeenCalled();
   });
 
-  it("a sessão do navegador recebe o mesmo 409", async () => {
-    const { cliente } = banco([{ data: { id: OUTRA_TAREFA_ID } }]);
+  it("na sessão do navegador, external_id é 422 explícito: nada é gravado nem consultado", async () => {
+    const { cliente, cadeias } = banco([]);
     mockedAuth.mockResolvedValue(autorizado(cliente, "session") as never);
-    mockedGravar.mockResolvedValue({ tarefa: null, erro: erroDoIndice });
 
     const res = await postar({ title: "x", external_id: CHAVE });
 
-    expect(res.status).toBe(409);
+    expect(res.status).toBe(422);
+    expect(res.headers.get("x-tasks-external-id")).toBe("1");
+    const corpo = await res.json();
+    expect(corpo.error.code).toBe("validation_failed");
+    expect(corpo.error.details.external_id).toBeDefined();
+    expect(mockedGravar).not.toHaveBeenCalled();
+    expect(cadeias).toHaveLength(0); // sem oráculo: nenhuma leitura da chave com o cliente da sessão
+  });
+
+  it("na sessão, sem external_id, o POST segue igual", async () => {
+    const { cliente } = banco([]);
+    mockedAuth.mockResolvedValue(autorizado(cliente, "session") as never);
+    mockedGravar.mockResolvedValue({ tarefa: { id: TAREFA_ID } as never, erro: null });
+
+    expect((await postar({ title: "x" })).status).toBe(201);
   });
 
   it("outro 23505 (de outra unicidade) NÃO vira 409 de chave: é 500", async () => {
@@ -434,6 +447,28 @@ describe("GET /api/v1/tasks — filtros por chave e meta.total", () => {
 
 describe("PATCH /api/v1/tasks/[id] — adoção da chave", () => {
   const antes = { status: "pending", recurrence_id: null, external_id: null };
+
+  it("na sessão do navegador, external_id é 422 explícito e nenhum update é emitido", async () => {
+    const { cliente, cadeias } = banco([]);
+    mockedAuth.mockResolvedValue(autorizado(cliente, "session") as never);
+
+    const res = await remendar({ external_id: CHAVE });
+
+    expect(res.status).toBe(422);
+    expect(res.headers.get("x-tasks-external-id")).toBe("1");
+    expect((await res.json()).error.details.external_id).toBeDefined();
+    expect(cadeias).toHaveLength(0);
+  });
+
+  it("na sessão, o PATCH sem external_id segue igual", async () => {
+    const { cliente } = banco([
+      { data: antes },
+      { data: { id: TAREFA_ID, status: "done", external_id: null } },
+    ]);
+    mockedAuth.mockResolvedValue(autorizado(cliente, "session") as never);
+
+    expect((await remendar({ status: "done" })).status).toBe(200);
+  });
 
   it("preenche a chave de tarefa que não tem, num update com `external_id is null`", async () => {
     const { cliente, cadeias } = banco([
