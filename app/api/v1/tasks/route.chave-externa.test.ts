@@ -43,6 +43,7 @@ vi.mock("@/lib/tarefas/gravar-tarefa", () => ({
 import { resolveAuthDual } from "@/lib/api/auth-dual";
 import { audit } from "@/lib/audit";
 import { registraAtividadeDaTarefa } from "@/lib/tarefas/atividade";
+import { LIMITE_DE_BYTES_DO_FILTRO, medidaDoFiltro } from "@/lib/tarefas/chave-externa";
 import { gravarTarefa } from "@/lib/tarefas/gravar-tarefa";
 
 import { PATCH } from "./[id]/route";
@@ -248,6 +249,24 @@ describe("POST /api/v1/tasks — external_id", () => {
     expect(cadeias).toHaveLength(0);
   });
 
+  it("⭐ 23505 de OUTRO índice cujo `details` traz o nome do nosso (dado da linha) é 500, não 503/409 (cxj D9v3-5)", async () => {
+    const { cliente, cadeias } = banco([]);
+    mockedAuth.mockResolvedValue(autorizado(cliente) as never);
+    mockedGravar.mockResolvedValue({
+      tarefa: null,
+      erro: {
+        code: "23505",
+        message: 'duplicate key value violates unique constraint "cxj_outro_titulo"',
+        details: `Key (title)=(${INDICE}) already exists.`,
+      },
+    });
+
+    const res = await postar({ title: INDICE, external_id: CHAVE });
+
+    expect(res.status).toBe(500);
+    expect(cadeias).toHaveLength(0); // não foi procurar a "dona" de uma chave que nunca colidiu
+  });
+
   it("23505 da chave mas a tarefa dona não é encontrada: resultado incerto (503), nem 201 nem 409", async () => {
     const { cliente } = banco([{ data: null }]);
     mockedAuth.mockResolvedValue(autorizado(cliente) as never);
@@ -385,6 +404,80 @@ describe("GET /api/v1/tasks — filtros por chave e meta.total", () => {
 
     expect((await GET(pedido(consulta(100)))).status).toBe(200);
     expect((await GET(pedido(consulta(101)))).status).toBe(422);
+  });
+
+  describe("orçamento em BYTES do filtro (D9v3-2: o transporte, não a contagem, é o limite)", () => {
+    const consultaDe = (chaves: string[], prefixo?: string) =>
+      "https://crm.test/api/v1/tasks?" +
+      [
+        ...chaves.map((c) => `external_id=${encodeURIComponent(c)}`),
+        ...(prefixo ? [`external_id_prefix=${encodeURIComponent(prefixo)}`] : []),
+      ].join("&");
+    /** `n` chaves ASCII distintas cuja soma codificada é exatamente `total`. */
+    const chavesComSoma = (n: number, total: number) => {
+      const base = Math.floor(total / n);
+      let resto = total - base * n;
+      return Array.from({ length: n }, (_, i) => {
+        const extra = resto > 0 ? 1 : 0;
+        resto -= extra;
+        return `${String(i).padStart(3, "0")}`.padEnd(base + extra, "x");
+      });
+    };
+
+    it("⭐ o lote do cxj (10 x 193 letras acentuadas, todas válidas) é 422 CLARO, não 500", async () => {
+      const { cliente, cadeias } = banco([]);
+      mockedAuth.mockResolvedValue(autorizado(cliente) as never);
+      const lote = Array.from({ length: 10 }, (_, i) => `cxj:limite:${i}:` + "á".repeat(180));
+
+      const res = await GET(pedido(consultaDe(lote)));
+
+      expect(res.status).toBe(422);
+      expect(res.headers.get("x-tasks-external-id")).toBe("1");
+      const corpo = await res.json();
+      expect(corpo.error.code).toBe("validation_failed");
+      expect(corpo.error.details.limite_get.bytes_lista).toBe(LIMITE_DE_BYTES_DO_FILTRO);
+      expect(corpo.error.details.limite_get.medido).toBe(medidaDoFiltro(lote, undefined));
+      expect(JSON.stringify(corpo)).toMatch(/subdivid/i);
+      expect(cadeias).toHaveLength(0); // nem chegou ao banco
+    });
+
+    it("exatamente no orçamento passa (200); um byte acima é 422", async () => {
+      const { cliente } = banco([{ data: [], count: 0 }]);
+      mockedAuth.mockResolvedValue(autorizado(cliente) as never);
+      const noLimite = chavesComSoma(40, LIMITE_DE_BYTES_DO_FILTRO);
+      expect(medidaDoFiltro(noLimite, undefined)).toBe(LIMITE_DE_BYTES_DO_FILTRO);
+      expect((await GET(pedido(consultaDe(noLimite)))).status).toBe(200);
+
+      const acima = chavesComSoma(40, LIMITE_DE_BYTES_DO_FILTRO + 1);
+      expect((await GET(pedido(consultaDe(acima)))).status).toBe(422);
+    });
+
+    it("o prefixo conta na mesma soma que as chaves", async () => {
+      const { cliente } = banco([{ data: [], count: 0 }]);
+      mockedAuth.mockResolvedValue(autorizado(cliente) as never);
+      const prefixo = "p".repeat(100);
+      const chaves = chavesComSoma(30, LIMITE_DE_BYTES_DO_FILTRO - 100);
+      expect((await GET(pedido(consultaDe(chaves, prefixo)))).status).toBe(200);
+      const res = await GET(pedido(consultaDe(chavesComSoma(30, LIMITE_DE_BYTES_DO_FILTRO - 99), prefixo)));
+      expect(res.status).toBe(422);
+    });
+
+    it("a medida é do valor CODIFICADO: 100 chaves de 30 letras acentuadas estouram, as mesmas em ASCII passam", async () => {
+      const { cliente } = banco([{ data: [], count: 0 }]);
+      mockedAuth.mockResolvedValue(autorizado(cliente) as never);
+      const acentuadas = Array.from({ length: 100 }, (_, i) => `k${i}`.padEnd(4, "x") + "á".repeat(26));
+      const ascii = Array.from({ length: 100 }, (_, i) => `k${i}`.padEnd(30, "x"));
+      expect((await GET(pedido(consultaDe(acentuadas)))).status).toBe(422);
+      expect((await GET(pedido(consultaDe(ascii)))).status).toBe(200);
+    });
+
+    it("recusa a lista toda, nunca devolve lista vazia nem parcial no lugar do erro", async () => {
+      const { cliente } = banco([{ data: [], count: 0 }]);
+      mockedAuth.mockResolvedValue(autorizado(cliente) as never);
+      const res = await GET(pedido(consultaDe(chavesComSoma(100, LIMITE_DE_BYTES_DO_FILTRO + 500))));
+      expect(res.status).toBe(422);
+      expect((await res.json()).data).toBeUndefined();
+    });
   });
 
   it("external_id vazio é 422 (não vira 'a lista inteira')", async () => {

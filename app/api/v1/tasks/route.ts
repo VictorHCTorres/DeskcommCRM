@@ -40,7 +40,10 @@ import {
   comSinalDeCapacidade,
   ehConflitoDaChave,
   escaparParaLike,
+  LIMITE_DE_BYTES_DO_FILTRO,
   MAXIMO_DE_CHAVES_NO_FILTRO,
+  MEDIDA_DO_FILTRO,
+  medidaDoFiltro,
   prefixoDeChaveSchema,
   valorDoFiltroIn,
 } from "@/lib/tarefas/chave-externa";
@@ -171,6 +174,25 @@ async function listar(req: NextRequest): Promise<Response> {
     });
   }
   const filtros = parsed.data;
+  // O orçamento em bytes do filtro por chave (D9v3-2): acima dele o transporte quebra (500 genérico
+  // e tentativas repetidas do SDK); aqui é recusa clara, antes de tocar o banco, nunca lista vazia
+  // nem parcial no lugar do erro.
+  const medido = medidaDoFiltro(filtros.external_id, filtros.external_id_prefix);
+  if (medido > LIMITE_DE_BYTES_DO_FILTRO) {
+    return fail(
+      "validation_failed",
+      t(
+        "O filtro por chave é grande demais para uma consulta só. Subdivida: faça várias consultas com menos chaves, de modo que a soma de len(encodeURIComponent(valor)) fique dentro de limite_get.bytes_lista.",
+      ),
+      422,
+      {
+        requestId,
+        details: {
+          limite_get: { bytes_lista: LIMITE_DE_BYTES_DO_FILTRO, medido, medida: MEDIDA_DO_FILTRO },
+        },
+      },
+    );
+  }
   if (filtros.assigned_to === "me" && !usuario) {
     return fail("validation_failed", t("Parâmetros inválidos."), 422, {
       requestId,
@@ -310,7 +332,7 @@ async function criar(req: NextRequest): Promise<Response> {
   // D9: a chave é do robô. Pela sessão do navegador ela é recusada (nunca ignorada em silêncio):
   // quem usa a tela poderia ocupar a chave que o robô vai precisar, e a leitura do dono da chave
   // com o cliente da sessão viraria um oráculo sobre tarefas que a RLS esconde. O banco repete
-  // a regra (trigger da migration 9337) para quem fala com o PostgREST sem passar por aqui.
+  // a regra (trigger da migration 9338) para quem fala com o PostgREST sem passar por aqui.
   if (parsed.data.external_id !== undefined && authz.via !== "token") {
     return fail("validation_failed", t("Dados inválidos."), 422, {
       requestId,

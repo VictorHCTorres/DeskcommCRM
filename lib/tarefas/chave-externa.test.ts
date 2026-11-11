@@ -6,6 +6,8 @@ import {
   ehConflitoDaChave,
   escaparParaLike,
   INDICE_DA_CHAVE_EXTERNA,
+  LIMITE_DE_BYTES_DO_FILTRO,
+  medidaDoFiltro,
   prefixoDeChaveSchema,
   valorDoFiltroIn,
 } from "@/lib/tarefas/chave-externa";
@@ -143,14 +145,58 @@ describe("escaparParaLike", () => {
   });
 });
 
-describe("ehConflitoDaChave", () => {
-  it("só reconhece o 23505 que cita o índice da chave", () => {
-    const msg = `duplicate key value violates unique constraint "${INDICE_DA_CHAVE_EXTERNA}"`;
-    expect(ehConflitoDaChave({ code: "23505", message: msg })).toBe(true);
-    expect(ehConflitoDaChave({ code: "23505", message: "x", details: msg })).toBe(true);
-    expect(ehConflitoDaChave({ code: "23505", message: 'unique constraint "outro"' })).toBe(false);
-    expect(ehConflitoDaChave({ code: "23503", message: msg })).toBe(false);
+describe("ehConflitoDaChave (pelo NOME EXATO da restrição na mensagem do PostgreSQL)", () => {
+  const msg = (nome: string) => `duplicate key value violates unique constraint "${nome}"`;
+  it("reconhece o 23505 cuja mensagem nomeia exatamente o índice da chave", () => {
+    expect(ehConflitoDaChave({ code: "23505", message: msg(INDICE_DA_CHAVE_EXTERNA) })).toBe(true);
+    expect(
+      ehConflitoDaChave({
+        code: "23505",
+        message: msg(INDICE_DA_CHAVE_EXTERNA),
+        details: "Key (organization_id, external_id)=(x, y) already exists.",
+      }),
+    ).toBe(true);
+  });
+  it("não reconhece outro nome, outro código nem ausência", () => {
+    expect(ehConflitoDaChave({ code: "23505", message: msg("outro") })).toBe(false);
+    expect(ehConflitoDaChave({ code: "23503", message: msg(INDICE_DA_CHAVE_EXTERNA) })).toBe(false);
     expect(ehConflitoDaChave(null)).toBe(false);
+    expect(ehConflitoDaChave({ code: "23505" })).toBe(false);
+  });
+  it("⭐ o nome só no `details` (dado da linha) NÃO é o nome da restrição (contraprova do cxj, D9v3-5)", () => {
+    // Um índice único de título + um título literalmente igual ao nome do nosso índice: o PostgreSQL
+    // põe o título no `details`, e a mensagem nomeia o índice DO TÍTULO.
+    expect(
+      ehConflitoDaChave({
+        code: "23505",
+        message: msg("cxj_outro_titulo"),
+        details: `Key (title)=(${INDICE_DA_CHAVE_EXTERNA}) already exists.`,
+      }),
+    ).toBe(false);
+    expect(ehConflitoDaChave({ code: "23505", message: "x", details: msg(INDICE_DA_CHAVE_EXTERNA) })).toBe(false);
+  });
+  it("⭐ nome que apenas CONTÉM o do nosso índice (prefixo/sufixo/aspas internas) não é o nosso", () => {
+    expect(ehConflitoDaChave({ code: "23505", message: msg(`${INDICE_DA_CHAVE_EXTERNA}_v2`) })).toBe(false);
+    expect(ehConflitoDaChave({ code: "23505", message: msg(`x_${INDICE_DA_CHAVE_EXTERNA}`) })).toBe(false);
+    expect(
+      ehConflitoDaChave({ code: "23505", message: `${msg("outro")} e ${msg(INDICE_DA_CHAVE_EXTERNA)}` }),
+    ).toBe(false);
+  });
+});
+
+describe("medidaDoFiltro: a soma de len(encodeURIComponent(valor)), que o consumidor calcula sozinho", () => {
+  it("é a soma dos comprimentos codificados, valores e prefixo contando igual", () => {
+    expect(medidaDoFiltro(["a", "b"], undefined)).toBe(2);
+    expect(medidaDoFiltro(["á"], undefined)).toBe(6); // %C3%A1
+    expect(medidaDoFiltro(["a|b/c:d"], undefined)).toBe(1 + 3 + 1 + 3 + 1 + 3 + 1); // | / : viram %XX
+    expect(medidaDoFiltro(undefined, "contab|")).toBe(encodeURIComponent("contab|").length);
+    expect(medidaDoFiltro(["ab"], "cd")).toBe(4);
+    expect(medidaDoFiltro(undefined, undefined)).toBe(0);
+  });
+  it("o orçamento é um inteiro positivo e dez chaves de 193 letras acentuadas o estouram (o lote do cxj)", () => {
+    expect(Number.isInteger(LIMITE_DE_BYTES_DO_FILTRO)).toBe(true);
+    const lote = Array.from({ length: 10 }, (_, i) => `cxj:limite:${i}:` + "á".repeat(180));
+    expect(medidaDoFiltro(lote, undefined)).toBeGreaterThan(LIMITE_DE_BYTES_DO_FILTRO);
   });
 });
 
