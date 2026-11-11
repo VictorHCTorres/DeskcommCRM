@@ -10,7 +10,7 @@ import { REGEX_DA_CHAVE } from "../../lib/tarefas/chave-externa";
 import { GOV_ORG, seedGov, sql } from "./gov-helpers";
 
 /**
- * A CHAVE EXTERNA DA TAREFA (D9, migration 9252) — NO BANCO DE VERDADE, COM O BASELINE INTEIRO.
+ * A CHAVE EXTERNA DA TAREFA (D9, migration 9337) — NO BANCO DE VERDADE, COM O BASELINE INTEIRO.
  *
  * O que as provas de unidade das rotas (`app/api/v1/tasks/route.chave-externa.test.ts`) NÃO
  * medem, porque lá o banco é falso: o índice único, a constraint de forma (a mesma regra do zod,
@@ -74,7 +74,7 @@ function um(query: string): string {
   return out.split("\n").pop() ?? "";
 }
 
-describe("catálogo: o que a migração 9252 tem de ter deixado", () => {
+describe("catálogo: o que a migração 9337 tem de ter deixado", () => {
   it("coluna, constraint validada, índice único parcial válido e o gatilho", () => {
     expect(
       um(`select data_type from information_schema.columns
@@ -412,7 +412,7 @@ describe("o conferidor de catálogo (scripts/d9-conferir-catalogo.sql): positivo
 
   it("positivo: reaplicar a migration sobre o banco migrado e conferir de novo passa", () => {
     const mig = readFileSync(
-      join(__dirname, "../../supabase/migrations/20261111132148_9252_tarefas_chave_externa_unica.sql"),
+      join(__dirname, "../../supabase/migrations/20261111132148_9337_tarefas_chave_externa_unica.sql"),
       "utf8",
     );
     expect(erroDe(`${mig}\n${mig}\n${conferidor}`)).toBeNull();
@@ -564,11 +564,11 @@ describe("concorrência real: várias conexões, a mesma chave", () => {
 });
 
 describe("tabela com dados e reaplicação (a migração é re-aplicável e não mexe nas linhas)", () => {
-  it("reaplicar 9252 com tarefas (com e sem chave) não muda uma linha nem o catálogo", () => {
+  it("reaplicar 9337 com tarefas (com e sem chave) não muda uma linha nem o catálogo", () => {
     const migracao = readFileSync(
       join(
         __dirname,
-        "../../supabase/migrations/20261111132148_9252_tarefas_chave_externa_unica.sql",
+        "../../supabase/migrations/20261111132148_9337_tarefas_chave_externa_unica.sql",
       ),
       "utf8",
     );

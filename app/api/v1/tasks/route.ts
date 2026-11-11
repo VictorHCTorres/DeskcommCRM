@@ -310,7 +310,7 @@ async function criar(req: NextRequest): Promise<Response> {
   // D9: a chave é do robô. Pela sessão do navegador ela é recusada (nunca ignorada em silêncio):
   // quem usa a tela poderia ocupar a chave que o robô vai precisar, e a leitura do dono da chave
   // com o cliente da sessão viraria um oráculo sobre tarefas que a RLS esconde. O banco repete
-  // a regra (trigger da migration 9252) para quem fala com o PostgREST sem passar por aqui.
+  // a regra (trigger da migration 9337) para quem fala com o PostgREST sem passar por aqui.
   if (parsed.data.external_id !== undefined && authz.via !== "token") {
     return fail("validation_failed", t("Dados inválidos."), 422, {
       requestId,

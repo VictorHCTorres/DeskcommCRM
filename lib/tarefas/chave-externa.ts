@@ -7,7 +7,7 @@
  *
  * A regra de forma mora em DOIS lugares que precisam concordar: aqui (para
  * recusar com 422 antes de gravar) e na constraint `crm_tasks_external_id_formato`
- * da migration 9252. Aqui nada é aparado em silêncio: valor com espaço nas
+ * da migration 9337. Aqui nada é aparado em silêncio: valor com espaço nas
  * pontas é recusado, porque aparar faria "a " e "a" virarem a mesma chave sem
  * que o robô soubesse.
  */
@@ -28,7 +28,7 @@ export const MAXIMO_DE_CHAVES_NO_FILTRO = 100;
 
 /**
  * O DOMÍNIO da chave: uma LISTA DE CARACTERES PERMITIDOS, idêntica à da constraint
- * `crm_tasks_external_id_formato` (migration 9252) — se mudar aqui, mude lá (o invariante
+ * `crm_tasks_external_id_formato` (migration 9337) — se mudar aqui, mude lá (o invariante
  * `tests/invariants/tarefas-chave-externa.test.ts` compara, ponto de código a ponto de código,
  * o que o Postgres aceita com o que esta regra aceita, de U+0001 a U+10FFFF):
  *  · ASCII: letras A–Z e a–z, dígitos 0–9 (a classe explícita, nunca `\d`, que no Unicode casa

@@ -1,4 +1,4 @@
--- conferir-catalogo D9 (v3) — SOMENTE LEITURA. Prova, depois da migration 9252, que o catálogo tem a D9 EXATA.
+-- conferir-catalogo D9 (v3) — SOMENTE LEITURA. Prova, depois da migration 9337, que o catálogo tem a D9 EXATA.
 --
 -- Uso:  psql -v ON_ERROR_STOP=1 -f conferir-catalogo.sql    (sai com erro e lista as FALHAS se algo divergir)
 --
