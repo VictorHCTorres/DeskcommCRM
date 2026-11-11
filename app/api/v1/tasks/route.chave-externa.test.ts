@@ -291,6 +291,22 @@ describe("POST /api/v1/tasks — external_id", () => {
     expect(mockedGravar).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["asterisco", "a*b"],
+    ["NBSP no meio", "a\u00a0b"],
+    ["NBSP no fim", "ab\u00a0"],
+    ["NFD (ó decomposto)", "contab|rotina|6249|Pro\u0301-labore"],
+    ["controle C1", "a\u0085b"],
+  ])("D9 v2: POST recusa com 422: %s", async (_nome, valor) => {
+    const { cliente } = banco([]);
+    mockedAuth.mockResolvedValue(autorizado(cliente) as never);
+
+    const res = await postar({ title: "x", external_id: valor });
+
+    expect(res.status).toBe(422);
+    expect(mockedGravar).not.toHaveBeenCalled();
+  });
+
   it("aceita 200 caracteres e chave com espaço no MEIO", async () => {
     const { cliente } = banco([]);
     mockedAuth.mockResolvedValue(autorizado(cliente) as never);
@@ -401,6 +417,80 @@ describe("GET /api/v1/tasks — filtros por chave e meta.total", () => {
     ).toBe(422);
   });
 
+  it.each([
+    ["external_id exato com asterisco", "external_id=" + encodeURIComponent("a*b")],
+    ["external_id exato com NBSP", "external_id=" + encodeURIComponent("a\u00a0b")],
+    ["external_id exato em NFD", "external_id=" + encodeURIComponent("Pro\u0301")],
+    ["prefixo com asterisco", "external_id_prefix=" + encodeURIComponent("star*literal")],
+    ["prefixo com NBSP", "external_id_prefix=" + encodeURIComponent("a\u00a0b")],
+    ["prefixo em NFD", "external_id_prefix=" + encodeURIComponent("Pro\u0301")],
+  ])("422 explícito, sem consultar o banco: %s", async (_nome, consulta) => {
+    const { cliente, cadeias } = banco([]);
+    mockedAuth.mockResolvedValue(autorizado(cliente) as never);
+
+    const res = await GET(pedido(`https://crm.test/api/v1/tasks?${consulta}`));
+
+    expect(res.status).toBe(422);
+    expect(cadeias).toHaveLength(0);
+  });
+
+  it("prefixo com acento em NFC passa e chega ao banco, com a barra escapada", async () => {
+    const { cliente, cadeias } = banco([{ data: [], count: 0 }]);
+    mockedAuth.mockResolvedValue(autorizado(cliente) as never);
+
+    const res = await GET(
+      pedido(
+        "https://crm.test/api/v1/tasks?external_id_prefix=" +
+          encodeURIComponent("contab|rotina|6249|Folha/Pró-labore|"),
+      ),
+    );
+
+    expect(res.status).toBe(200);
+    expect(cadeias[0]!.chamadas).toContainEqual([
+      "like",
+      ["external_id", "contab|rotina|6249|Folha/Pró-labore|%"],
+    ]);
+  });
+
+  // D9 v2 (cxj D9-3): `meta.total` é a contagem da consulta BASE, antes da expansão de família, e
+  // `meta.cortada` diz se essa consulta passou do limite. Receber == total só certifica
+  // completude nas consultas por chave; na lista expandida, olhe `cortada`.
+  it.each([
+    [0, false],
+    [500, false],
+    [501, true],
+    [731, true],
+  ])("meta.cortada com count=%i é %s (consulta por chave)", async (count, cortada) => {
+    const { cliente } = banco([{ data: [], count }]);
+    mockedAuth.mockResolvedValue(autorizado(cliente) as never);
+
+    const res = await GET(pedido("https://crm.test/api/v1/tasks?external_id_prefix=bulk:"));
+
+    const corpo = await res.json();
+    expect(corpo.meta).toEqual({ total: count, cortada });
+  });
+
+  it("⭐ contraprova da família (cxj): 500 filhas + count 501, a lista expandida recebe 501 == total, mas `cortada` é true", async () => {
+    const filhas = Array.from({ length: 500 }, (_, i) =>
+      linha(`f${i}`, { parent_task_id: OUTRA_TAREFA_ID }),
+    );
+    const { cliente } = banco([
+      { data: filhas, count: 501 },
+      { data: [linha(OUTRA_TAREFA_ID)] }, // o pai que não casa com o filtro, trazido pela expansão
+      { data: filhas },
+    ]);
+    mockedAuth.mockResolvedValue(autorizado(cliente) as never);
+
+    const res = await GET(
+      pedido("https://crm.test/api/v1/tasks?status=pending&due_from=2050-01-01T00:00:00Z"),
+    );
+
+    const corpo = await res.json();
+    expect(corpo.data.tasks).toHaveLength(501);
+    expect(corpo.meta.total).toBe(501); // a igualdade enganosa que o cxj mediu...
+    expect(corpo.meta.cortada).toBe(true); // ...e o sinal que a desfaz
+  });
+
   it("meta.total é o count do banco, não o tamanho do corte de 500", async () => {
     const corte = Array.from({ length: 500 }, (_, i) => linha(`t${i}`));
     const { cliente, cadeias } = banco([{ data: corte, count: 731 }, { data: [] }, { data: [] }]);
@@ -411,6 +501,7 @@ describe("GET /api/v1/tasks — filtros por chave e meta.total", () => {
     const corpo = await res.json();
     expect(corpo.data.tasks).toHaveLength(500);
     expect(corpo.meta.total).toBe(731);
+    expect(corpo.meta.cortada).toBe(true);
     expect(cadeias[0]!.chamadas).toContainEqual([
       "select",
       [expect.any(String), { count: "exact" }],
