@@ -5,6 +5,8 @@ import { promisify } from "node:util";
 
 import { beforeAll, describe, expect, it } from "vitest";
 
+import { REGEX_DA_CHAVE } from "../../lib/tarefas/chave-externa";
+
 import { GOV_ORG, seedGov, sql } from "./gov-helpers";
 
 /**
@@ -12,7 +14,7 @@ import { GOV_ORG, seedGov, sql } from "./gov-helpers";
  *
  * O que as provas de unidade das rotas (`app/api/v1/tasks/route.chave-externa.test.ts`) NÃO
  * medem, porque lá o banco é falso: o índice único, a constraint de forma (a mesma regra do zod,
- * inclusive Unicode e NFC), a trava de quem escreve a chave e, desde a revisão do cxj, a
+ * o domínio por lista de caracteres, sem normalize), a trava de quem escreve a chave e, desde a revisão do cxj, a
  * IDENTIDADE `(organization_id, external_id)` — mover a tarefa com chave para outra organização
  * pela sessão (JWT de quem está nas duas) não pode ser um jeito de ocupar/liberar a chave.
  *
@@ -114,25 +116,20 @@ describe("catálogo: o que a migração 9252 tem de ter deixado", () => {
   });
 });
 
-describe("a regra da forma da chave: idêntica à do zod", () => {
+describe("o domínio da chave: lista de caracteres, idêntica à do zod (D9 v3)", () => {
   const ok = (expr: string, n: number) =>
     erroDe(`insert into public.crm_tasks (id, organization_id, title, external_id)
             values ('${T(100 + n)}', '${ORG_A}', 'forma', ${expr});`);
 
   const aceitas: Array<[string, string]> = [
-    ["canônica com acento NFC", `'contab|rotina|6249|Folha/Pró-labore|09/2026'`],
+    ["canônica com acento pré-composto", `'contab|rotina|6249|Folha/Pró-labore|09/2026'`],
+    ["canônica com Carnê-leão", `'contab|rotina|6249|Carnê-leão|11/2026'`],
     ["200 caracteres", `repeat('x', 200)`],
-    ["espaço no meio", `'a b'`],
-    ["% _ e barra invertida", `'pref:100%_a\\b'`],
-    ["ZWJ (emoji composto)", `'a' || chr(8205) || 'b'`],
+    ["pontuação . : - | /", `'a.b:c-d|e/f'`],
+    ["as pontas do Latin-1 (À Ö Ø ö ø ÿ)", `chr(192) || chr(214) || chr(216) || chr(246) || chr(248) || chr(255)`],
   ];
   it.each(aceitas)("aceita: %s", (_nome, expr) => {
-    expect(
-      ok(
-        expr,
-        aceitas.findIndex((a) => a[0] === _nome),
-      ),
-    ).toBeNull();
+    expect(ok(expr, aceitas.findIndex((a) => a[0] === _nome))).toBeNull();
   });
 
   const recusadas: Array<[string, string]> = [
@@ -140,23 +137,57 @@ describe("a regra da forma da chave: idêntica à do zod", () => {
     ["201 caracteres", `repeat('x', 201)`],
     ["espaço ASCII no início", `' a'`],
     ["espaço ASCII no fim", `'a '`],
+    ["espaço ASCII no meio (sem espaço nenhum)", `'a b'`],
     ["tabulação", `'a' || chr(9) || 'b'`],
     ["DEL", `'a' || chr(127) || 'b'`],
     ["controle C1 (NEL)", `'a' || chr(133) || 'b'`],
     ["NBSP no meio", `'a' || chr(160) || 'b'`],
-    ["NBSP no fim", `'a' || chr(160)`],
     ["EM SPACE", `'a' || chr(8195) || 'b'`],
-    ["IDEOGRAPHIC SPACE", `'a' || chr(12288) || 'b'`],
-    ["NARROW NBSP", `'a' || chr(8239) || 'b'`],
     ["LINE SEPARATOR", `'a' || chr(8232) || 'b'`],
-    ["PARAGRAPH SEPARATOR", `'a' || chr(8233) || 'b'`],
     ["BOM", `'a' || chr(65279) || 'b'`],
+    ["ZWJ", `'a' || chr(8205) || 'b'`],
     ["asterisco", `'a*b'`],
+    ["aspa dupla", `'a"b'`],
+    ["barra invertida", `'a\\b'`],
+    ["vírgula", `'a,b'`],
+    ["parênteses", `'a(b)'`],
+    ["porcento, sublinhado, mais, cerquilha", `'a%b_c+d#e'`],
+    ["× (U+00D7)", `'a' || chr(215) || 'b'`],
+    ["÷ (U+00F7)", `'a' || chr(247) || 'b'`],
     ["NFD (ó decomposto)", `'Pro' || chr(769) || '-labore'`],
+    ["dígito arábico-índico", `'a' || chr(1634) || 'b'`],
+    ["dígito de largura total", `'a' || chr(65302) || 'b'`],
+    ["emoji", `'a' || chr(128512)`],
+    ["U+105D2 com ponto (o par do cxj)", `'k:' || chr(66002) || chr(775)`],
   ];
   it.each(recusadas)("recusa (23514): %s", (nome, expr) => {
     const erro = ok(expr, 50 + recusadas.findIndex((r) => r[0] === nome));
     expect(erro).toContain("crm_tasks_external_id_formato");
+  });
+
+  it("⭐ VARREDURA: de U+0001 a U+10FFFF, o Postgres e o zod aceitam EXATAMENTE os mesmos caracteres", () => {
+    // O defeito D9v2-2 era uma regra por `normalize()`/`is nfc normalized` que divergia entre o
+    // PostgreSQL 15 e o Node (20 caracteres). Agora a regra é uma lista; aqui ela é comparada
+    // ponto de código a ponto de código, usando a expressão regular QUE ESTÁ NA CONSTRAINT do
+    // catálogo (não a do arquivo). Surrogates (U+D800–U+DFFF) o Postgres nem representa em UTF-8:
+    // a recusa do surrogate isolado é do zod e está nos testes de unidade.
+    const doBanco = um(`
+      with re as (
+        select substring(pg_get_constraintdef(oid) from $q$~ '([^']*)'$q$) as r
+          from pg_constraint
+         where conname = 'crm_tasks_external_id_formato' and conrelid = 'public.crm_tasks'::regclass)
+      select string_agg(n::text, ',' order by n)
+        from re, generate_series(1, 1114111) n
+       where (n < 55296 or n > 57343) and chr(n) ~ re.r`);
+    const doZod: number[] = [];
+    for (let n = 1; n <= 0x10ffff; n++) {
+      if (n >= 0xd800 && n <= 0xdfff) continue;
+      if (REGEX_DA_CHAVE.test(String.fromCodePoint(n))) doZod.push(n);
+    }
+    expect(doBanco).not.toBe("");
+    expect(doBanco.split(",").map(Number)).toEqual(doZod);
+    // E o tamanho do domínio é o esperado: 52 letras + 10 dígitos + 5 sinais + 62 letras Latin-1.
+    expect(doZod).toHaveLength(52 + 10 + 5 + (0xff - 0xc0 + 1 - 2));
   });
 });
 

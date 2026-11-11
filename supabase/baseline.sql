@@ -75199,6 +75199,24 @@ create trigger trg_clickup_knowledge_attachment_revive
 --   drop function if exists public.fn_crm_tasks_chave_externa_guarda();
 --   drop index if exists public.crm_tasks_org_external_id_unique;
 --   alter table public.crm_tasks drop constraint if exists crm_tasks_external_id_formato;
+--   alter table public.crm_tasks drop column if exists external_id;
+--
+-- Com chaves já gravadas, o DROP COLUMN apaga o mapa de idempotência: exporte antes
+-- `organization_id, id, external_id` (ver docs/D9-tarefas-chave-unica/VOLTA-D9.md). A volta de
+-- software NÃO exige desfazer o schema: ele é aditivo.
+--
+-- Aditiva: nenhuma linha existente muda (a coluna nasce nula).
+
+alter table public.crm_tasks
+  add column if not exists external_id text;
+
+-- Reaplicação auto-curativa: a constraint é derrubada e recriada, para que um banco que recebeu
+-- uma versão anterior da regra (sem Unicode, ou a de NFC) fique com a regra desta. `not valid` +
+-- `validate`: a coluna nasce toda nula, então validar é imediato, mas o par evita segurar o
+-- bloqueio mais forte sobre uma tabela já em uso se um dia houver dado (o `validate` ainda toma
+-- `share update exclusive`; o `add column` e o `create index` tomam bloqueios próprios: a migração
+-- não é "sem bloqueio", só curta).
+alter table public.crm_tasks drop constraint if exists crm_tasks_external_id_formato;
 alter table public.crm_tasks
   add constraint crm_tasks_external_id_formato
   check (
