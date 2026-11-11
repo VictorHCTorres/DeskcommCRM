@@ -90,13 +90,12 @@ interface Contexto {
 
 /** O sinal de capacidade (contrato D9 §3) vai em toda resposta do PATCH, inclusive nas recusas. */
 export async function PATCH(req: NextRequest, ctx: Contexto): Promise<Response> {
+  const supportDenied = await requireSupportWrite();
+  if (supportDenied) return comSinalDeCapacidade(supportDenied);
   return comSinalDeCapacidade(await editar(req, ctx));
 }
 
 async function editar(req: NextRequest, ctx: Contexto): Promise<Response> {
-  const supportDenied = await requireSupportWrite();
-  if (supportDenied) return supportDenied;
-
   const requestId = randomUUID();
   const { id } = await ctx.params;
 

@@ -52,7 +52,8 @@ function fazerSupabase() {
   for (const metodo of ["select", "order", "limit", "in", "gte", "lte"]) elo[metodo] = () => elo;
   elo.eq = (coluna: string, valor: unknown) => (filtros.push(["eq", coluna, valor]), elo);
   elo.is = (coluna: string, valor: unknown) => (filtros.push(["is", coluna, valor]), elo);
-  elo.then = (res: (v: unknown) => unknown) => Promise.resolve({ data: [], error: null }).then(res);
+  elo.then = (res: (v: unknown) => unknown) =>
+    Promise.resolve({ data: [], error: null, count: 0 }).then(res);
   vi.mocked(createClient).mockResolvedValue({ from: () => elo } as never);
   return filtros;
 }

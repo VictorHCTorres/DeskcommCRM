@@ -86,7 +86,12 @@ function fazerSupabase(respostas: Resposta[]) {
     const elo: Record<string, unknown> = {};
     const devolve = () => {
       const r = proxima();
-      return Promise.resolve({ data: r.data ?? null, error: r.error ?? null });
+      // `count` é o total exato que o PostgREST devolve com `count: "exact"` (o GET da D9 o exige).
+      return Promise.resolve({
+        data: r.data ?? null,
+        error: r.error ?? null,
+        count: Array.isArray(r.data) ? r.data.length : null,
+      });
     };
     for (const metodo of [
       "select",
