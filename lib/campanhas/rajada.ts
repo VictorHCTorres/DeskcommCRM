@@ -90,6 +90,32 @@ export function desfechoParaARajada(detalhe: string): boolean {
   return PARA_A_RAJADA.test(detalhe);
 }
 
+/**
+ * A rajada parou por erro: a fila não foi lida, a contagem não veio, ou um envio
+ * lançou. O erro sobe com o que ela já tinha feito (F4k, K08 do cxj). Sem o
+ * parcial, a rodada perdia os envios e os números por onde a rajada falou, e
+ * outra campanha que divide o vinculado mandava por ele no mesmo tique.
+ */
+export class RajadaInterrompida extends Error {
+  constructor(
+    /** Todos os erros da rajada, na ordem: o primeiro foi o que a parou. */
+    readonly causas: readonly unknown[],
+    readonly parcial: DesfechoDaRajada,
+  ) {
+    super(mensagemDosErros(causas));
+    this.name = "RajadaInterrompida";
+  }
+}
+
+/**
+ * A mensagem do primeiro erro, e depois a dos outros (de envios que estavam em
+ * voo): o aviso da rodada mostra só esta mensagem, e nenhum erro some dele.
+ */
+function mensagemDosErros(causas: readonly unknown[]): string {
+  const [primeira = "", ...outras] = causas.map((e) => (e instanceof Error ? e.message : String(e)));
+  return outras.length > 0 ? `${primeira} (e mais ${outras.length} na mesma rajada: ${outras.join("; ")})` : primeira;
+}
+
 export async function rodarEmRajada<T>(
   dep: DependenciasDaRajada<T>,
   config: {
@@ -131,36 +157,56 @@ export async function rodarEmRajada<T>(
     return vez;
   };
 
-  while (parada === null && noPrazo()) {
-    if (!(await dep.aindaEmAndamento())) {
-      parada = "fora_de_andamento";
-      break;
-    }
-    const lote = await dep.buscarLote(config.tamanhoDoLote);
-    if (lote.length === 0) {
-      somar(await dep.concluirSeAcabou());
-      parada = "sem_pendentes";
-      break;
-    }
+  // Os erros que pararam a rajada (F4k, K08). Uma lista, e não um `let`: atribuído
+  // só dentro das faixas, o compilador o daria como sempre nulo aqui fora.
+  const erros: unknown[] = [];
+  const pararPorErro = (e: unknown) => {
+    erros.push(e);
+    parada ??= "erro";
+  };
 
-    let proximo = 0;
-    const faixa = async () => {
-      while (parada === null && proximo < lote.length) {
-        // O destinatário é tomado ANTES da espera: esperar a vez para depois
-        // achar o lote vazio desperdiçava um início por faixa a cada lote. Se
-        // a rajada parar durante a espera, ele segue `pending` e o próximo lote
-        // (ou a próxima rodada) o busca de novo.
-        const alvo = lote[proximo++]!;
-        await vagaDeInicio();
-        // Rechecado DEPOIS da espera: outra faixa pode ter parado a rajada, e
-        // o prazo pode ter vencido enquanto esta esperava a vez.
-        if (parada !== null || !noPrazo()) return;
-        const r = await dep.enviarUm(alvo);
-        somar(r);
-        if (desfechoParaARajada(r.detalhe)) parada = r.detalhe;
+  try {
+    while (parada === null && noPrazo()) {
+      if (!(await dep.aindaEmAndamento())) {
+        parada = "fora_de_andamento";
+        break;
       }
-    };
-    await Promise.all(Array.from({ length: Math.min(config.concorrencia, lote.length) }, faixa));
+      const lote = await dep.buscarLote(config.tamanhoDoLote);
+      if (lote.length === 0) {
+        somar(await dep.concluirSeAcabou());
+        parada = "sem_pendentes";
+        break;
+      }
+
+      let proximo = 0;
+      const faixa = async () => {
+        // Cada faixa pega o próprio erro: o `Promise.all` só termina quando todas
+        // terminam, e o envio em voo nas outras entra na conta antes de o erro subir.
+        try {
+          while (parada === null && proximo < lote.length) {
+            // O destinatário é tomado ANTES da espera: esperar a vez para depois
+            // achar o lote vazio desperdiçava um início por faixa a cada lote. Se
+            // a rajada parar durante a espera, ele segue `pending` e o próximo lote
+            // (ou a próxima rodada) o busca de novo.
+            const alvo = lote[proximo++]!;
+            await vagaDeInicio();
+            // Rechecado DEPOIS da espera: outra faixa pode ter parado a rajada, e
+            // o prazo pode ter vencido enquanto esta esperava a vez.
+            if (parada !== null || !noPrazo()) return;
+            const r = await dep.enviarUm(alvo);
+            somar(r);
+            if (desfechoParaARajada(r.detalhe)) parada = r.detalhe;
+          }
+        } catch (e) {
+          pararPorErro(e);
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(config.concorrencia, lote.length) }, faixa));
+    }
+  } catch (e) {
+    // A leitura do lote, a da conclusão ou a do andamento (J11: a fila que não se
+    // lê lança, para a campanha não ser dada como concluída).
+    pararPorErro(e);
   }
 
   // Nada saiu e ninguém foi pulado: a rajada não usou o número. O desfecho volta
@@ -171,10 +217,10 @@ export async function rodarEmRajada<T>(
   total.numeros = [...numeros];
   if (total.enviadas === 0 && total.pulados === 0 && ultimoDetalhe !== null) {
     total.detalhe = ultimoDetalhe;
-    return total;
+  } else {
+    const resumo = [...motivos].map(([k, n]) => `${k}×${n}`).join(",");
+    total.detalhe = `rajada:${total.enviadas}${resumo ? `(${resumo})` : ""}${parada ? `:${parada}` : ":prazo"}`;
   }
-
-  const resumo = [...motivos].map(([k, n]) => `${k}×${n}`).join(",");
-  total.detalhe = `rajada:${total.enviadas}${resumo ? `(${resumo})` : ""}${parada ? `:${parada}` : ":prazo"}`;
+  if (erros.length > 0) throw new RajadaInterrompida(erros, total);
   return total;
 }

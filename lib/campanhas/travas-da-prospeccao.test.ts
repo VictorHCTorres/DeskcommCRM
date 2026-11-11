@@ -38,10 +38,16 @@ const mundo = vi.hoisted(() => ({
   ctxs: [] as Array<Record<string, unknown>>,
   /** O que foi para `logger.error`: o veto que não se grava tem de deixar rastro (F4i, H08). */
   erros: [] as unknown[][],
+  /** O que foi para `logger.warn`: a rodada que falhou diz o que a rajada já tinha feito (F4k, K08). */
+  avisos: [] as unknown[][],
 }));
 
 vi.mock("@/lib/logger", () => ({
-  logger: { info: () => undefined, warn: () => undefined, error: (...args: unknown[]) => void mundo.erros.push(args) },
+  logger: {
+    info: () => undefined,
+    warn: (...args: unknown[]) => void mundo.avisos.push(args),
+    error: (...args: unknown[]) => void mundo.erros.push(args),
+  },
 }));
 vi.mock("@/lib/agent-engine/db/request-pool", () => ({ getRequestPool: () => ({}) }));
 vi.mock("@/lib/agent-engine/pacing/store", () => ({
@@ -73,7 +79,7 @@ vi.mock("@/app/api/v1/messages/_handler", () => ({
 }));
 
 import { cancelarAcao } from "@/lib/campanhas/acoes";
-import { ESTADOS_DE_QUEM_RECEBEU, aplicarVeto } from "@/lib/campanhas/conferencia";
+import { COLUNAS_DO_DESTINATARIO, ESTADOS_DE_QUEM_RECEBEU, aplicarVeto } from "@/lib/campanhas/conferencia";
 import { VetoDaCampanhaError, assertCampaignDelivery, entregaPeloAtor } from "@/lib/campanhas/entrega";
 import { hashDoEndereco } from "@/lib/campanhas/exclusoes";
 import { desfechoParaARajada } from "@/lib/campanhas/rajada";
@@ -289,6 +295,7 @@ beforeEach(() => {
   mundo.aoAbrir = null;
   mundo.ctxs.length = 0;
   mundo.erros.length = 0;
+  mundo.avisos.length = 0;
   vi.useRealTimers();
 });
 
@@ -1828,5 +1835,80 @@ describe("7. os contratos da revisão F4j do cxj (11/11/2026): a fila que não s
       message_id: "m-1",
     });
     expect(mensagemDe(tabelas, "m-2")).toMatchObject({ status: "failed", error_code: "campanha_sem_reenvio" });
+  });
+});
+
+describe("8. o contrato da revisão F4k do cxj (11/11/2026): a rajada que para por erro leva o que fez", () => {
+  /** A campanha A em rajada (rápida, com modelo) e a B gradual; as duas só falam pelo vinculado comum. */
+  const rajadaEGradualNoVinculado = (): Tabelas => {
+    const tabelas = duasCampanhasNoVinculado();
+    Object.assign(tabelas.campaigns!.find((c) => c.id === "camp-a")!, { velocidade: "rapida", message_mode: "template" });
+    Object.assign(tabelas.campaign_recipients!.find((d) => d.id === "r-ana")!, { variables: { modelo: {} } });
+    return tabelas;
+  };
+  /** O banco que recusa a N-ª leitura dos pendentes (a busca do lote), e só ela. */
+  const recusaALeituraDosPendentes = (tabelas: Tabelas, qual: number) => {
+    const inteiro = fakeAdmin(tabelas) as unknown as { from: (t: string) => Record<string, unknown> };
+    let leituras = 0;
+    return {
+      from: (tabela: string) => {
+        const consulta = inteiro.from(tabela);
+        if (tabela !== "campaign_recipients") return consulta;
+        return new Proxy(consulta, {
+          get: (alvo, metodo) =>
+            metodo === "select"
+              ? (colunas: string, opcoes?: unknown) =>
+                  colunas === COLUNAS_DO_DESTINATARIO && ++leituras === qual
+                    ? cadeiaComErro("a leitura da fila falhou")
+                    : (alvo.select as (c: string, o?: unknown) => unknown)(colunas, opcoes)
+              : alvo[metodo as string],
+        });
+      },
+    };
+  };
+
+  it("K08 ⭐ a rajada falou pelo vinculado e a leitura do 2º lote falhou: a rodada conta o envio, e a outra campanha não fala pelo vinculado", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(QUARTA);
+    try {
+      const tabelas = rajadaEGradualNoVinculado();
+      const rodada = rodarUmaRodadaDeCampanha(recusaALeituraDosPendentes(tabelas, 2) as never, QUARTA);
+      await vi.runAllTimersAsync();
+      const r = await rodada;
+      expect(mundo.envios).toEqual(["conv:ana:vinculado"]);
+      expect(r.detalhe).toContain("camp-a:erro");
+      expect(r.enviadas).toBe(1);
+      expect(tabelas.campaign_recipients!.find((d) => d.id === "r-bia")).toMatchObject({ status: "pending" });
+      expect(tabelas.campaigns!.find((c) => c.id === "camp-a")).toMatchObject({ status: "running" });
+      // O log diz o erro e o que a rajada já tinha feito.
+      expect(mundo.avisos).toEqual([
+        [
+          "[campanha] rodada falhou",
+          {
+            campanha: "camp-a",
+            motivo: "a fila da campanha não foi lida: a leitura da fila falhou",
+            parcial: "rajada:1(enviado×1):erro",
+          },
+        ],
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("K08 controle: sem a falha, a rajada conclui, e a outra campanha também não fala pelo vinculado", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(QUARTA);
+    try {
+      const tabelas = rajadaEGradualNoVinculado();
+      const rodada = rodarUmaRodadaDeCampanha(fakeAdmin(tabelas), QUARTA);
+      await vi.runAllTimersAsync();
+      const r = await rodada;
+      expect(mundo.envios).toEqual(["conv:ana:vinculado"]);
+      expect(r.enviadas).toBe(1);
+      expect(tabelas.campaign_recipients!.find((d) => d.id === "r-bia")).toMatchObject({ status: "pending" });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

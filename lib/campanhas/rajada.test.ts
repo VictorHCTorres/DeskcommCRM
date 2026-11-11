@@ -7,7 +7,7 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { desfechoParaARajada, rodarEmRajada, type DesfechoDeUm } from "./rajada";
+import { RajadaInterrompida, desfechoParaARajada, rodarEmRajada, type DesfechoDeUm } from "./rajada";
 
 const CONFIG = { concorrencia: 4, intervaloEntreIniciosMs: 167, tamanhoDoLote: 24, prazoMs: 38_000 };
 
@@ -141,6 +141,105 @@ describe("rodarEmRajada", () => {
     const r = await rodarEmRajada(c.dep, CONFIG);
     expect(r.enviadas + r.pulados).toBe(30);
     expect(r.pulados).toBe(10);
+  });
+});
+
+describe("a rajada que para por erro leva o que já fez (F4k, K08 do cxj)", () => {
+  const pelo = (numero: string) => (): DesfechoDeUm => ({
+    enviadas: 1,
+    pulados: 0,
+    concluidas: 0,
+    detalhe: "enviado:sent:rodizio",
+    numero,
+  });
+
+  it("a leitura do lote seguinte falha: o erro sobe com os envios e os números do lote que já saiu", async () => {
+    const c = cenario({ pendentes: 30, desfecho: pelo("vinculado") });
+    let leituras = 0;
+    const erro = await rodarEmRajada(
+      {
+        ...c.dep,
+        buscarLote: async (n: number) => {
+          if (++leituras === 2) throw new Error("a fila da campanha não foi lida: banco fora");
+          return c.dep.buscarLote(n);
+        },
+      },
+      CONFIG,
+    ).catch((e: unknown) => e);
+    expect(erro).toBeInstanceOf(RajadaInterrompida);
+    expect((erro as RajadaInterrompida).message).toBe("a fila da campanha não foi lida: banco fora");
+    expect((erro as RajadaInterrompida).parcial).toEqual({
+      enviadas: 24,
+      pulados: 0,
+      concluidas: 0,
+      detalhe: "rajada:24(enviado×24):erro",
+      numeros: ["vinculado"],
+    });
+  });
+
+  it("a conclusão no fim da fila falha (a contagem não veio): o erro sobe com o que saiu", async () => {
+    const c = cenario({ pendentes: 5, desfecho: pelo("vinculado") });
+    const erro = await rodarEmRajada(
+      {
+        ...c.dep,
+        concluirSeAcabou: async () => {
+          throw new Error("a contagem da fila da campanha não foi lida: sem contagem");
+        },
+      },
+      CONFIG,
+    ).catch((e: unknown) => e);
+    expect(erro).toBeInstanceOf(RajadaInterrompida);
+    expect((erro as RajadaInterrompida).parcial).toMatchObject({ enviadas: 5, numeros: ["vinculado"] });
+  });
+
+  /** O envio do 4 demora (uma volta do relógio de verdade): ainda está em voo quando o 5 quebra. */
+  const comO4EmVoo = (c: ReturnType<typeof cenario>, depoisDoVoo?: () => never) => async (id: number) => {
+    const r = await c.dep.enviarUm(id);
+    if (id === 4) {
+      await new Promise((ok) => setTimeout(ok, 0));
+      depoisDoVoo?.();
+    }
+    return r;
+  };
+
+  it("um envio lança: nenhum envio novo começa, e o que estava em voo termina e entra no parcial", async () => {
+    const c = cenario({
+      pendentes: 24,
+      desfecho: (id) => {
+        if (id === 5) throw new Error("o envio quebrou");
+        return pelo(id === 4 ? "terceiro" : "principal")();
+      },
+    });
+    const erro = await rodarEmRajada({ ...c.dep, enviarUm: comO4EmVoo(c) }, CONFIG).catch((e: unknown) => e);
+    expect(erro).toBeInstanceOf(RajadaInterrompida);
+    expect((erro as RajadaInterrompida).message).toBe("o envio quebrou");
+    // Os que já estavam em voo terminam (até 3 além do 5); nenhum começa depois.
+    expect(c.enviados.length).toBeLessThanOrEqual(9);
+    // Todo envio que começou, menos o que quebrou, terminou e entrou na conta, inclusive o 4.
+    expect((erro as RajadaInterrompida).parcial.enviadas).toBe(c.enviados.length - 1);
+    expect([...(erro as RajadaInterrompida).parcial.numeros].sort()).toEqual(["principal", "terceiro"]);
+  });
+
+  it("dois envios lançam: o erro sobe com o primeiro, leva os dois, e a mensagem diz os dois", async () => {
+    const c = cenario({
+      pendentes: 24,
+      desfecho: (id) => {
+        if (id === 5) throw new Error("o envio quebrou");
+        return pelo("principal")();
+      },
+    });
+    const emVoo = comO4EmVoo(c, () => {
+      throw new Error("o envio em voo também quebrou");
+    });
+    const erro = await rodarEmRajada({ ...c.dep, enviarUm: emVoo }, CONFIG).catch((e: unknown) => e);
+    expect(erro).toBeInstanceOf(RajadaInterrompida);
+    expect((erro as RajadaInterrompida).message).toBe(
+      "o envio quebrou (e mais 1 na mesma rajada: o envio em voo também quebrou)",
+    );
+    expect((erro as RajadaInterrompida).causas.map((e) => (e as Error).message)).toEqual([
+      "o envio quebrou",
+      "o envio em voo também quebrou",
+    ]);
   });
 });
 

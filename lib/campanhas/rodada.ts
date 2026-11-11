@@ -68,7 +68,7 @@ import { statusDaSaida } from "./elegibilidade";
 import { VetoDaCampanhaError, type VetoDaCampanha } from "./entrega";
 import type { ConteudoDoEnvio } from "./modelo";
 import { renderizar } from "./renderizador";
-import { RAJADA, rodarEmRajada } from "./rajada";
+import { RAJADA, RajadaInterrompida, rodarEmRajada } from "./rajada";
 import { escolherNumero, poolDaCampanha, type NumeroDisponivel } from "./rodizio";
 import { podeMandarAgora, proximaTentativa, type RitmoDaCampanha } from "./ritmo";
 import { nomeDoContato } from "@/lib/contacts/rotulo-do-contato";
@@ -193,6 +193,11 @@ export async function rodarUmaRodadaDeCampanha(
   const numerosQueFalaram = new Set<string>();
   const total: ResultadoDaRodada = { ...VAZIA, promovidas, detalhe: "" };
   const detalhes: string[] = [];
+  const somarAoTotal = (r: { enviadas: number; pulados: number; concluidas: number }) => {
+    total.enviadas += r.enviadas;
+    total.pulados += r.pulados;
+    total.concluidas += r.concluidas;
+  };
 
   for (const campanha of emExecucao) {
     // Um número, uma mensagem por rodada. A campanha mais antiga do número ganha
@@ -208,9 +213,7 @@ export async function rodarUmaRodadaDeCampanha(
       const r = emRajada(campanha)
         ? await rodarCampanhaEmRajada(admin, campanha, numerosQueFalaram)
         : await rodarUmaCampanha(admin, campanha, agora, numerosQueFalaram);
-      total.enviadas += r.enviadas;
-      total.pulados += r.pulados;
-      total.concluidas += r.concluidas;
+      somarAoTotal(r);
       detalhes.push(`${campanha.id.slice(0, 8)}:${r.detalhe}`);
       if (ocupaONumero(r)) principaisOcupados.add(campanha.channel_session_id);
       // O número que FALOU nesta rodada, que no rodízio pode não ser o principal
@@ -220,9 +223,21 @@ export async function rodarUmaRodadaDeCampanha(
       for (const numero of numerosQueAFalaUsou(r)) numerosQueFalaram.add(numero);
     } catch (err) {
       const motivo = err instanceof Error ? err.message : String(err);
-      logger.warn("[campanha] rodada falhou", { campanha: campanha.id, motivo });
+      // A rajada que parou por erro traz o que já tinha feito (F4k, K08 do cxj):
+      // os envios entram na conta, e os números por onde ela falou ficam fora do
+      // rodízio das campanhas seguintes desta rodada, como no desfecho normal.
+      const parcial = err instanceof RajadaInterrompida ? err.parcial : null;
+      logger.warn("[campanha] rodada falhou", {
+        campanha: campanha.id,
+        motivo,
+        ...(parcial ? { parcial: parcial.detalhe } : {}),
+      });
       detalhes.push(`${campanha.id.slice(0, 8)}:erro`);
       principaisOcupados.add(campanha.channel_session_id);
+      if (parcial) {
+        somarAoTotal(parcial);
+        for (const numero of numerosQueAFalaUsou(parcial)) numerosQueFalaram.add(numero);
+      }
     }
   }
 
