@@ -10,7 +10,7 @@ import { REGEX_DA_CHAVE } from "../../lib/tarefas/chave-externa";
 import { GOV_ORG, seedGov, sql } from "./gov-helpers";
 
 /**
- * A CHAVE EXTERNA DA TAREFA (D9, migration 9337) — NO BANCO DE VERDADE, COM O BASELINE INTEIRO.
+ * A CHAVE EXTERNA DA TAREFA (D9, migration 9338) — NO BANCO DE VERDADE, COM O BASELINE INTEIRO.
  *
  * O que as provas de unidade das rotas (`app/api/v1/tasks/route.chave-externa.test.ts`) NÃO
  * medem, porque lá o banco é falso: o índice único, a constraint de forma (a mesma regra do zod,
@@ -74,7 +74,7 @@ function um(query: string): string {
   return out.split("\n").pop() ?? "";
 }
 
-describe("catálogo: o que a migração 9337 tem de ter deixado", () => {
+describe("catálogo: o que a migração 9338 tem de ter deixado", () => {
   it("coluna, constraint validada, índice único parcial válido e o gatilho", () => {
     expect(
       um(`select data_type from information_schema.columns
@@ -412,7 +412,7 @@ describe("o conferidor de catálogo (scripts/d9-conferir-catalogo.sql): positivo
 
   it("positivo: reaplicar a migration sobre o banco migrado e conferir de novo passa", () => {
     const mig = readFileSync(
-      join(__dirname, "../../supabase/migrations/20261111132148_9337_tarefas_chave_externa_unica.sql"),
+      join(__dirname, "../../supabase/migrations/20261111175431_9338_tarefas_chave_externa_unica.sql"),
       "utf8",
     );
     expect(erroDe(`${mig}\n${mig}\n${conferidor}`)).toBeNull();
@@ -515,6 +515,164 @@ describe("o conferidor de catálogo (scripts/d9-conferir-catalogo.sql): positivo
   });
 });
 
+describe("D9v3-1: a coluna é `text COLLATE \"C\"` e o conferidor exige isso (collation efetiva da coluna E do índice)", () => {
+  const conferidor = readFileSync(join(__dirname, "../../scripts/d9-conferir-catalogo.sql"), "utf8");
+  const migracao = readFileSync(
+    join(__dirname, "../../supabase/migrations/20261111175431_9338_tarefas_chave_externa_unica.sql"),
+    "utf8",
+  );
+  const ESPERADA = `check (external_id is null or (char_length(external_id) between 1 and 200
+      and external_id ~ '^[A-Za-z0-9\\u00c0-\\u00d6\\u00d8-\\u00f6\\u00f8-\\u00ff|/.:-]+$'))`;
+  /** Estado de um banco que recebeu a v3: coluna sem o "C", constraint e índice ainda canônicos. */
+  const coluna = (collation: string) => `
+    truncate public.crm_tasks cascade;
+    alter table public.crm_tasks drop constraint crm_tasks_external_id_formato;
+    alter table public.crm_tasks alter column external_id type text collate ${collation};
+    alter table public.crm_tasks add constraint crm_tasks_external_id_formato ${ESPERADA};`;
+  const ICU_NAO_DETERMINISTICA = `create collation public.d9_nd (provider = icu, locale = 'und-u-ks-level2', deterministic = false);`;
+  const dentro = (script: string) => erroDe(`begin;\n${script}\nrollback;`);
+  /** Depois da migration a coluna TEM de ser "C" (sem isto a cura passaria vazia). */
+  const EXIGE_C = `do $$ begin
+    if (select a.attcollation from pg_attribute a
+         where a.attrelid = 'public.crm_tasks'::regclass and a.attname = 'external_id') <> 'pg_catalog."C"'::regcollation::oid
+    then raise exception 'D9-V4: a coluna não ficou COLLATE C'; end if;
+  end $$;`;
+
+  it("catálogo: a coluna é pg_catalog.\"C\" e o índice tem a MESMA collation (indcollation)", () => {
+    expect(
+      um(`select n.nspname || '.' || c.collname from pg_attribute a
+            join pg_collation c on c.oid = a.attcollation join pg_namespace n on n.oid = c.collnamespace
+           where a.attrelid = 'public.crm_tasks'::regclass and a.attname = 'external_id'`),
+    ).toBe("pg_catalog.C");
+    expect(
+      um(`select (select n.nspname || '.' || co.collname from pg_collation co
+                         join pg_namespace n on n.oid = co.collnamespace
+                        where co.oid = i.indcollation[1]) from pg_index i
+            join pg_class c on c.oid = i.indexrelid where c.relname = 'crm_tasks_org_external_id_unique'`),
+    ).toBe("pg_catalog.C");
+  });
+
+  it("⭐ NEGATIVO (o do cxj): coluna com collation ICU NÃO determinística, constraint canônica: o conferidor FALHA por collation", () => {
+    const erro = dentro(`${ICU_NAO_DETERMINISTICA}\n${coluna("public.d9_nd")}\n${conferidor}`);
+    expect(erro, "o conferidor imprimiu TUDO ok sobre uma coluna que recusa INSERT válido (0A000)").not.toBeNull();
+    expect(erro).toContain("conferir-catalogo D9");
+    expect(erro).toContain("collation");
+  });
+
+  it("⭐ NEGATIVO: coluna com a collation padrão do banco (a que o conferidor da v3 aprovava) também FALHA", () => {
+    const erro = dentro(`${coluna('"default"')}\n${conferidor}`);
+    expect(erro).not.toBeNull();
+    expect(erro).toContain("collation");
+  });
+
+  it("NEGATIVO: coluna ICU determinística (und-x-icu) FALHA", () => {
+    const erro = dentro(`${coluna('"und-x-icu"')}\n${conferidor}`);
+    expect(erro).not.toBeNull();
+    expect(erro).toContain("collation");
+  });
+
+  it("NEGATIVO: índice com collation própria diferente da da coluna FALHA", () => {
+    const erro = dentro(`
+      drop index public.crm_tasks_org_external_id_unique;
+      create unique index crm_tasks_org_external_id_unique on public.crm_tasks
+        (organization_id, (external_id collate "und-x-icu")) where external_id is not null;
+      ${conferidor}`);
+    expect(erro).not.toBeNull();
+    expect(erro).toContain("índice");
+  });
+
+  it("⭐ POSITIVO (cura): índice com collation própria (und-x-icu) sobre coluna \"C\" é recriado pela migration", () => {
+    expect(
+      dentro(`
+        drop index public.crm_tasks_org_external_id_unique;
+        create unique index crm_tasks_org_external_id_unique on public.crm_tasks
+          (organization_id, (external_id collate "und-x-icu")) where external_id is not null;
+        ${migracao}
+        ${EXIGE_C}
+        ${conferidor}`),
+    ).toBeNull();
+  });
+
+  it("⭐ POSITIVO (instalação): num banco instalado do zero a coluna é \"C\" e o conferidor passa", () => {
+    expect(erroDe(conferidor)).toBeNull();
+  });
+
+  it("⭐ POSITIVO (reaplicação): a migration sobre o banco já migrado não muda a collation nem o catálogo", () => {
+    expect(erroDe(`${migracao}\n${migracao}\n${conferidor}`)).toBeNull();
+  });
+
+  it("⭐ POSITIVO (cura): banco que recebeu a v3 (collation padrão) vira \"C\" ao aplicar a migration e passa no conferidor", () => {
+    expect(dentro(`${coluna('"default"')}\n${migracao}\n${EXIGE_C}\n${conferidor}`)).toBeNull();
+  });
+
+  it("⭐ POSITIVO (cura): a collation ICU NÃO determinística do cxj é curada pela migration (era o 0A000 do cxj)", () => {
+    expect(
+      dentro(`${ICU_NAO_DETERMINISTICA}\n${coluna("public.d9_nd")}\n${migracao}\n${EXIGE_C}\n${conferidor}\n
+        insert into public.crm_tasks (organization_id, title, external_id) values ('${GOV_ORG}', 'cxj: formato permitido', 'cxj:ok');`),
+    ).toBeNull();
+  });
+
+  it("a cura preserva as linhas e as chaves já gravadas (a mudança de collation reescreve a tabela, não os dados)", () => {
+    const erro = dentro(`
+      ${coluna('"default"')}
+      insert into public.crm_tasks (id, organization_id, title, external_id)
+        values ('${T(900)}', '${GOV_ORG}', 'ficou', 'contab|rotina|6249|Folha/Pró-labore|09/2026'),
+               ('${T(901)}', '${GOV_ORG}', 'ficou2', 'A'), ('${T(902)}', '${GOV_ORG}', 'ficou3', 'a');
+      ${migracao}
+      ${EXIGE_C}
+      do $$ begin
+        if (select count(*) from public.crm_tasks where id in ('${T(900)}','${T(901)}','${T(902)}')) <> 3
+           or (select external_id from public.crm_tasks where id = '${T(900)}') <> 'contab|rotina|6249|Folha/Pró-labore|09/2026'
+        then raise exception 'D9-V4: a cura mudou dados'; end if;
+      end $$;
+      ${conferidor}`);
+    expect(erro).toBeNull();
+  });
+
+  it("sob \"C\" a ordem e a igualdade são por byte: A e a, e as acentuadas, são chaves DISTINTAS e o índice as separa", () => {
+    expect(
+      erroDe(`begin;
+        insert into public.crm_tasks (organization_id, title, external_id) values
+          ('${GOV_ORG}', 'c1', 'Chave:A'), ('${GOV_ORG}', 'c2', 'Chave:a'), ('${GOV_ORG}', 'c3', 'Chave:Á'),
+          ('${GOV_ORG}', 'c4', 'Chave:á');
+        rollback;`),
+    ).toBeNull();
+    const dup = erroDe(`begin;
+        insert into public.crm_tasks (organization_id, title, external_id) values
+          ('${GOV_ORG}', 'c5', 'Chave:z'), ('${GOV_ORG}', 'c6', 'Chave:z');
+        rollback;`);
+    expect(dup).toContain("crm_tasks_org_external_id_unique");
+  });
+
+  it("⭐ VARREDURA SOB \"C\": de U+0001 a U+10FFFF, a coluna aceita (constraint real) EXATAMENTE os 129 caracteres do zod", () => {
+    // O mesmo critério da varredura do domínio, agora com o valor tipado `text COLLATE "C"` (a
+    // collation efetiva da coluna): o gate do cxj mediu em en_US.utf8; aqui a regra é medida na
+    // collation que a migration FIXA. Cada caractere é avaliado com a expressão da constraint.
+    const doBanco = um(`
+      with re as (
+        select substring(pg_get_constraintdef(oid) from $q$~ '([^']*)'$q$) as r
+          from pg_constraint
+         where conname = 'crm_tasks_external_id_formato' and conrelid = 'public.crm_tasks'::regclass)
+      select string_agg(n::text, ',' order by n)
+        from re, generate_series(1, 1114111) n
+       where (n < 55296 or n > 57343) and (chr(n) collate "C") ~ re.r`);
+    const doZod: number[] = [];
+    for (let n = 1; n <= 0x10ffff; n++) {
+      if (n >= 0xd800 && n <= 0xdfff) continue;
+      if (REGEX_DA_CHAVE.test(String.fromCodePoint(n))) doZod.push(n);
+    }
+    expect(doBanco.split(",").map(Number)).toEqual(doZod);
+    expect(doZod).toHaveLength(129);
+    // e a inserção REAL na coluna dos 129 (um por linha, numa transação desfeita) passa inteira
+    const insere = erroDe(`begin;
+      insert into public.crm_tasks (organization_id, title, external_id)
+        select '${GOV_ORG}', 'v' || n, 'v4:' || chr(n) || ':' || n from generate_series(1, 255) n
+         where chr(n) ~ '^[A-Za-z0-9À-ÖØ-öø-ÿ|/.:-]$';
+      rollback;`);
+    expect(insere).toBeNull();
+  });
+});
+
 describe("concorrência real: várias conexões, a mesma chave", () => {
   const psql = (script: string) =>
     execFileAsync(
@@ -564,11 +722,11 @@ describe("concorrência real: várias conexões, a mesma chave", () => {
 });
 
 describe("tabela com dados e reaplicação (a migração é re-aplicável e não mexe nas linhas)", () => {
-  it("reaplicar 9337 com tarefas (com e sem chave) não muda uma linha nem o catálogo", () => {
+  it("reaplicar 9338 com tarefas (com e sem chave) não muda uma linha nem o catálogo", () => {
     const migracao = readFileSync(
       join(
         __dirname,
-        "../../supabase/migrations/20261111132148_9337_tarefas_chave_externa_unica.sql",
+        "../../supabase/migrations/20261111175431_9338_tarefas_chave_externa_unica.sql",
       ),
       "utf8",
     );

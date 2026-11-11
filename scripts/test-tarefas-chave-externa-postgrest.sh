@@ -3,9 +3,12 @@
 #
 # Prova, contra Postgres + PostgREST de verdade (nada de dublê de banco):
 #   1. UPGRADE COM DADOS: um banco instalado pelo baseline da base (1.101.0, D9_BASE_REF) com
-#      centenas de tarefas é atualizado pelo baseline da branch (que carrega a 9337) DUAS vezes,
+#      centenas de tarefas é atualizado pelo baseline da branch (que carrega a 9338) DUAS vezes,
 #      com ON_ERROR_STOP=1; o hash das linhas antigas não muda, a coluna nasce nula.
 #   2. CATÁLOGO: scripts/d9-conferir-catalogo.sql (somente leitura) passa nesse banco e no instalado do zero.
+#   2b. CURA DA v3 (v4, D9v3-1): um banco que recebeu a D9 v3 (coluna `external_id` SEM a collation "C") com
+#      chaves gravadas é atualizado pelo baseline da branch (x2): a coluna vira `COLLATE "C"`, as linhas e
+#      as chaves não mudam, o catálogo confere.
 #   3. A SUÍTE REAL (tests/d9-real): handlers de produção + supabase-js + PostgREST v13 sobre o baseline
 #      inteiro (RLS, trigger, índice): POST 201/409, outro 23505, dona ausente, PATCH concorrente,
 #      count/embed/RLS/cortada, caracteres especiais, Unicode, D9-1 com JWT de duas organizações.
@@ -26,7 +29,7 @@
 #
 # Uso:  bash scripts/test-tarefas-chave-externa-postgrest.sh
 #       D9_BASE_REF=587fbbe81 TEST_DB_IMAGE=pgvector/pgvector:pg15 D9_POSTGREST_IMAGE=postgrest/postgrest:v13.0.7 \
-#       D9_CHAVES_CANONICAS_JSONL=<operacoes-F2.jsonl> bash scripts/test-tarefas-chave-externa-postgrest.sh
+#       D9_CHAVES_CANONICAS_JSONL=<operacoes-F2.jsonl> D9_AMOSTRAS_JSON=<chaves-amostras.json> bash scripts/test-tarefas-chave-externa-postgrest.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -34,10 +37,12 @@ BASELINE="$ROOT/supabase/baseline.sql"
 IMAGE="${TEST_DB_IMAGE:-pgvector/pgvector:pg15}"
 PGRST_IMAGE="${D9_POSTGREST_IMAGE:-postgrest/postgrest:v13.0.7}"
 BASE_REF="${D9_BASE_REF:-587fbbe81}"
+V3_REF="${D9_V3_REF:-4c9e44efb1025577f40d298af78ed3fe23cd1596}"   # a D9 v3 (a que o cxj reprovou): coluna sem COLLATE "C"
 BASE_ESPERADA="587fbbe81a3fdd1202cf9033cb4e0e7d94251450"   # a 1.101.0 DO FORK (a tag homônima do upstream é outro commit)
 SUF="$$-$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')"
 REDE="d9-rede-$SUF"
 PG_VELHO="d9-pg-upgrade-$SUF"
+PG_V3="d9-pg-v3-$SUF"
 PG_NOVO="d9-pg-real-$SUF"
 REST="d9-postgrest-$SUF"
 SEGREDO="d9-segredo-de-teste-com-mais-de-32-caracteres-$SUF"
@@ -46,7 +51,7 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/d9-gate.XXXXXX")"
 [ -f "$BASELINE" ] || { echo "FATAL: $BASELINE não encontrado" >&2; exit 1; }
 
 cleanup() {
-  docker rm -fv "$REST" "$PG_NOVO" "$PG_VELHO" >/dev/null 2>&1 || true
+  docker rm -fv "$REST" "$PG_NOVO" "$PG_VELHO" "$PG_V3" >/dev/null 2>&1 || true
   docker network rm "$REDE" >/dev/null 2>&1 || true
   # O diretório temporário é nosso (mktemp acima); só se apaga um caminho com o nome que ele gerou.
   case "$TMP" in "${TMPDIR:-/tmp}"/d9-gate.*) find "$TMP" -depth -delete 2>/dev/null || true ;; esac
@@ -128,12 +133,51 @@ nulas=$(psql_t "$PG_VELHO" <<<'select count(*) from public.crm_tasks where exter
 psql_de "$PG_VELHO" < "$ROOT/scripts/d9-conferir-catalogo.sql" >/dev/null
 echo "    ✓ hash das linhas antigas idêntico; external_id nulo em todas; catálogo confere"
 # A migration sozinha, de novo, sobre o banco já migrado e com dados (é o que o `supabase db push` faria).
-mig=$(ls "$ROOT"/supabase/migrations/*_9337_tarefas_chave_externa_unica.sql)
+mig=$(ls "$ROOT"/supabase/migrations/*_9338_tarefas_chave_externa_unica.sql)
 psql_de "$PG_VELHO" < "$mig" >/dev/null
 psql_de "$PG_VELHO" < "$mig" >/dev/null
 psql_de "$PG_VELHO" < "$ROOT/scripts/d9-conferir-catalogo.sql" >/dev/null
 echo "    ✓ a migration aplicada sozinha, 2x, sobre dados: sem erro, catálogo confere"
 docker rm -fv "$PG_VELHO" >/dev/null
+
+# ───────────────────────── 1b. CURA DA v3 ─────────────────────────
+echo "==> [1b] cura da v3: baseline de ${V3_REF:0:9} (coluna sem COLLATE \"C\")  ->  baseline da branch (x2)"
+if git -C "$ROOT" cat-file -e "$V3_REF^{commit}" 2>/dev/null; then
+  git -C "$ROOT" show "$V3_REF:supabase/baseline.sql" > "$TMP/baseline-v3.sql"
+  grep -q 'crm_tasks_org_external_id_unique' "$TMP/baseline-v3.sql" || { echo "FATAL: o baseline de $V3_REF não tem a D9" >&2; exit 1; }
+  grep -q 'external_id text collate "C"' "$TMP/baseline-v3.sql" && { echo "FATAL: o baseline de $V3_REF já tem COLLATE C; D9_V3_REF errado" >&2; exit 1; }
+  sobe_pg "$PG_V3"
+  psql_de "$PG_V3" <<<"$prelude"
+  psql_de "$PG_V3" < "$TMP/baseline-v3.sql" >/dev/null
+  col_antes=$(psql_t "$PG_V3" <<<"select n.nspname || '.' || c.collname from pg_attribute a join pg_collation c on c.oid = a.attcollation join pg_namespace n on n.oid = c.collnamespace where a.attrelid = 'public.crm_tasks'::regclass and a.attname = 'external_id';")
+  [ "$col_antes" != "pg_catalog.C" ] || { echo "FATAL: a v3 já está em C; a cura não seria provada" >&2; exit 1; }
+  psql_de "$PG_V3" <<'SQL' >/dev/null
+insert into auth.users (id, email) values ('d9c00000-0000-4000-8000-000000000001', 'u@v3.test') on conflict do nothing;
+insert into public.organizations (id, slug, legal_name, display_name) values
+  ('d9c00000-0000-4000-8000-00000000000a', 'v3-a', 'V3 A', 'A') on conflict do nothing;
+insert into public.crm_tasks (organization_id, title, status, external_id)
+  select 'd9c00000-0000-4000-8000-00000000000a', 'v3 ' || g, 'pending', 'contab|rotina|6249|Folha/Pró-labore|' || g from generate_series(1, 300) g;
+insert into public.crm_tasks (organization_id, title, status, external_id) values
+  ('d9c00000-0000-4000-8000-00000000000a', 'v3 maiúscula', 'pending', 'Chave:A'),
+  ('d9c00000-0000-4000-8000-00000000000a', 'v3 minúscula', 'pending', 'Chave:a'),
+  ('d9c00000-0000-4000-8000-00000000000a', 'v3 sem chave', 'pending', null);
+SQL
+  hv3_antes=$(psql_t "$PG_V3" <<<"select md5(string_agg(t::text, '|' order by id)) from (select id, organization_id, title, status, external_id from public.crm_tasks) t;")
+  for passada in 1 2; do
+    psql_de "$PG_V3" < "$BASELINE" >/dev/null
+    echo "    ✓ update $passada/2 sobre a v3 com ON_ERROR_STOP=1"
+  done
+  hv3_depois=$(psql_t "$PG_V3" <<<"select md5(string_agg(t::text, '|' order by id)) from (select id, organization_id, title, status, external_id from public.crm_tasks) t;")
+  [ "$hv3_antes" = "$hv3_depois" ] || { echo "FATAL: a cura da v3 mudou linhas ou chaves" >&2; exit 1; }
+  col_depois=$(psql_t "$PG_V3" <<<"select n.nspname || '.' || c.collname from pg_attribute a join pg_collation c on c.oid = a.attcollation join pg_namespace n on n.oid = c.collnamespace where a.attrelid = 'public.crm_tasks'::regclass and a.attname = 'external_id';")
+  [ "$col_depois" = "pg_catalog.C" ] || { echo "FATAL: depois da cura a collation é $col_depois, não pg_catalog.C" >&2; exit 1; }
+  psql_de "$PG_V3" < "$ROOT/scripts/d9-conferir-catalogo.sql" >/dev/null
+  echo "    ✓ collation $col_antes -> $col_depois; linhas e chaves idênticas (hash $hv3_depois); catálogo confere"
+  docker rm -fv "$PG_V3" >/dev/null
+else
+  echo "FATAL: o commit da v3 ($V3_REF) não existe neste clone; a cura da v3 NÃO foi provada (D9_V3_REF=<commit> ou D9_PULAR_CURA_V3=1)" >&2
+  [ "${D9_PULAR_CURA_V3:-0}" = 1 ] || exit 1
+fi
 
 # ───────────────────────── 2. SUÍTE REAL ─────────────────────────
 echo "==> [2] banco novo (baseline da branch) + PostgREST + suíte real"
@@ -176,9 +220,12 @@ PY
   CANON="$TMP/chaves.json"
 fi
 
+if [ -z "${D9_AMOSTRAS_JSON:-}" ]; then
+  echo "    AVISO: D9_AMOSTRAS_JSON não informado: os exemplos de limite_get de chaves-amostras.json NÃO foram conferidos contra a rota"
+fi
 cd "$ROOT"
 D9_PG_CONTAINER="$PG_NOVO" D9_POSTGREST_URL="$URL" D9_JWT_SECRET="$SEGREDO" D9_CHAVES_CANONICAS="$CANON" \
-  npx vitest run --config vitest.d9-real.config.ts
+  D9_AMOSTRAS_JSON="${D9_AMOSTRAS_JSON:-}" npx vitest run --config vitest.d9-real.config.ts
 
 # ───────────────────────── 3. A VOLTA (o app da base sobre o banco migrado) ─────────────────────────
 VOLTA="nao"

@@ -1,5 +1,5 @@
 -- manifest: `crm_tasks.external_id` — chave externa única por organização, para que quem grava tarefa por token (robôs do n8n, importador) não crie a mesma tarefa em dobro (D9).
--- 9337: coluna nula + constraint de forma + índice único parcial `crm_tasks_org_external_id_unique` + trava de quem escreve a chave.
+-- 9338: coluna nula (text COLLATE "C") + constraint de forma + índice único parcial `crm_tasks_org_external_id_unique` + trava de quem escreve a chave.
 --
 -- ─── Por que o banco, e não a rota
 --
@@ -93,15 +93,69 @@
 --
 -- Aditiva: nenhuma linha existente muda (a coluna nasce nula).
 
+-- ─── A collation da coluna (D9 v4, cxj D9v3-1): `text COLLATE "C"`, FIXADA aqui
+--
+-- Por que fixar. A coluna sem collation própria herda a do BANCO, e a regra de forma (a constraint
+-- por expressão regular) e a igualdade da chave passam a depender de configuração que esta migration
+-- não controla: com uma collation ICU NÃO determinística, a constraint recusa até INSERT válido
+-- (`0A000: nondeterministic collations are not supported for regular expressions`), e com uma
+-- collation que trate `A`/`a` ou letra acentuada/sem acento como iguais, duas chaves diferentes para
+-- o robô seriam UMA para o índice. A chave de idempotência é identidade técnica: igualdade por BYTE.
+-- `"C"` é a collation embutida (`pg_catalog."C"`), determinística, existe em todo PostgreSQL e em
+-- todo Supabase, e é a que o `tgname collate "C"` do conferidor já usa para a ordem dos gatilhos.
+-- O domínio (129 caracteres) foi varrido de U+0001 a U+10FFFF sob "C" (invariante do banco).
+--
+-- Se a coluna JÁ EXISTE com outra collation (uma instalação da v3, ou alguém que a mudou à mão), esta
+-- migration a CURA: derruba o índice (se for preciso), converte a coluna para `COLLATE "C"` (o
+-- PostgreSQL reescreve a tabela e preserva os valores; as linhas e as chaves não mudam) e recria
+-- tudo abaixo. Chaves que só se distinguiam por collation (`A` e `a` sob uma collation que as igualasse)
+-- não existem: o índice não as aceitaria. Converter de uma collation que igualava para "C" nunca cria
+-- colisão (a igualdade por byte é a mais fina), então o `create unique index` abaixo não falha por isso.
+-- O conferidor (`scripts/d9-conferir-catalogo.sql`) FALHA, e nunca imprime "TUDO ok", se a collation
+-- efetiva da coluna ou a do índice não for "C".
 alter table public.crm_tasks
-  add column if not exists external_id text;
+  add column if not exists external_id text collate "C";
 
--- Reaplicação auto-curativa: a constraint é derrubada e recriada, para que um banco que recebeu
--- uma versão anterior da regra (sem Unicode, ou a de NFC) fique com a regra desta. `not valid` +
--- `validate`: a coluna nasce toda nula, então validar é imediato, mas o par evita segurar o
--- bloqueio mais forte sobre uma tabela já em uso se um dia houver dado (o `validate` ainda toma
--- `share update exclusive`; o `add column` e o `create index` tomam bloqueios próprios: a migração
--- não é "sem bloqueio", só curta).
+-- Reaplicação auto-curativa: a constraint é derrubada ANTES de mexer na coluna (converter com a
+-- constraint presente a reavaliaria sob a collation antiga, e sob uma não determinística isso falha) e
+-- recriada depois, para que um banco que recebeu uma versão anterior da regra (sem Unicode, ou a de
+-- NFC) fique com a regra desta. `not valid` + `validate`: a coluna nasce toda nula, então validar é
+-- imediato, mas o par evita segurar o bloqueio mais forte sobre uma tabela já em uso se um dia houver
+-- dado (o `validate` ainda toma `share update exclusive`; o `add column` e o `create index` tomam
+-- bloqueios próprios: a migração não é "sem bloqueio", só curta).
+alter table public.crm_tasks drop constraint if exists crm_tasks_external_id_formato;
+
+do $d9_collation$
+begin
+  -- O índice com collation própria diferente da "C" (ou herdada de uma coluna que não é "C") sai: é
+  -- recriado logo abaixo. `create ... if not exists` sozinho deixaria o índice errado onde estava.
+  if exists (
+    select 1
+      from pg_index i
+      join pg_class c on c.oid = i.indexrelid
+     where c.relname = 'crm_tasks_org_external_id_unique'
+       and c.relnamespace = 'public'::regnamespace
+       and i.indrelid = 'public.crm_tasks'::regclass
+       and i.indcollation[1] <> 'pg_catalog."C"'::regcollation::oid  -- oidvector: base 0, [1] = external_id
+  ) then
+    drop index public.crm_tasks_org_external_id_unique;
+  end if;
+  if exists (
+    select 1
+      from pg_attribute a
+     where a.attrelid = 'public.crm_tasks'::regclass
+       and a.attname = 'external_id'
+       and not a.attisdropped
+       and a.attcollation <> 'pg_catalog."C"'::regcollation::oid
+  ) then
+    drop index if exists public.crm_tasks_org_external_id_unique;
+    alter table public.crm_tasks alter column external_id type text collate "C";
+  end if;
+end
+$d9_collation$;
+
+-- (de novo, de propósito: a conversão acima pode ter sido pulada, e o `add constraint` abaixo só é
+-- reaplicável com o `drop ... if exists` colado nele; o baseline é lido por uma régua que exige isso)
 alter table public.crm_tasks drop constraint if exists crm_tasks_external_id_formato;
 alter table public.crm_tasks
   add constraint crm_tasks_external_id_formato

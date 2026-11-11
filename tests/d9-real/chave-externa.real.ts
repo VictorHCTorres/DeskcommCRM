@@ -39,7 +39,9 @@ vi.mock("@/lib/tarefas/atividade", () => ({
 import { resolveAuthDual } from "@/lib/api/auth-dual";
 import { PATCH } from "@/app/api/v1/tasks/[id]/route";
 import { GET, POST } from "@/app/api/v1/tasks/route";
-import { chaveExternaSchema, valorDoFiltroIn } from "@/lib/tarefas/chave-externa";
+import { chaveExternaSchema, LIMITE_DE_BYTES_DO_FILTRO, valorDoFiltroIn } from "@/lib/tarefas/chave-externa";
+
+const LIMITE = LIMITE_DE_BYTES_DO_FILTRO;
 
 const URL_REST = process.env.D9_POSTGREST_URL ?? "";
 const SEGREDO = process.env.D9_JWT_SECRET ?? "";
@@ -571,5 +573,118 @@ describe("as chaves canônicas da F5 e do C1 passam na regra (zod e banco) e faz
     }
     const { corpo } = await lista(`?external_id_prefix=${encodeURIComponent("contab|")}`);
     expect(corpo.meta.total).toBeGreaterThanOrEqual(todas.length);
+  });
+});
+
+describe("D9v3-5: o 23505 de outro índice, com o NOME DO NOSSO no dado da linha, não é conflito da chave (PostgREST real)", () => {
+  it("⭐ índice único de título + título igual ao nome do nosso índice: 500, não 503 (contraprova do cxj)", async () => {
+    psql(`create unique index if not exists d9_real_titulo_nome_indice on public.crm_tasks (organization_id, title) where title = 'crm_tasks_org_external_id_unique'`);
+    try {
+      expect((await postar({ title: "crm_tasks_org_external_id_unique" })).status).toBe(201);
+      const livre = `titulo-igual-ao-indice:${randomUUID()}`;
+      // O erro bruto: a message nomeia o índice do TÍTULO; o details traz o título (= o nome do nosso índice).
+      const { error } = await servico
+        .from("crm_tasks")
+        .insert({ organization_id: ORG_A, title: "crm_tasks_org_external_id_unique", external_id: livre });
+      expect(error?.code).toBe("23505");
+      expect(error?.message).toContain("d9_real_titulo_nome_indice");
+      expect(String(error?.details)).toContain("crm_tasks_org_external_id_unique");
+      const res = await postar({ title: "crm_tasks_org_external_id_unique", external_id: livre });
+      expect(res.status).toBe(500);
+      expect(um(`select count(*) from public.crm_tasks where organization_id='${ORG_A}' and external_id='${livre}'`)).toBe("0");
+    } finally {
+      psql(`drop index if exists public.d9_real_titulo_nome_indice`);
+    }
+  });
+});
+
+describe("D9v3-2: o ORÇAMENTO em bytes do GET por chave, contra PostgREST e `fetch` reais (limite padrão de cabeçalhos)", () => {
+  const medida = (v: string[]) => v.reduce((soma, x) => soma + encodeURIComponent(x).length, 0);
+  const consultaDe = (chaves: string[], prefixo?: string) =>
+    "?" +
+    [
+      ...chaves.map((c) => `external_id=${encodeURIComponent(c)}`),
+      ...(prefixo ? [`external_id_prefix=${encodeURIComponent(prefixo)}`] : []),
+    ].join("&");
+  /** `n` chaves com a mesma "pior forma" (acentuadas: 6 bytes por letra) cuja soma é EXATAMENTE `total`. */
+  function pior(n: number, total: number, tag: string): string[] {
+    const e = Math.floor(total / n);
+    let resto = total - e * n;
+    return Array.from({ length: n }, (_, i) => {
+      const alvo = e + (resto-- > 0 ? 1 : 0);
+      const base = `${tag}:${i}:`; // ASCII, sem caractere de escape: 1 por caractere? não — `:` vira %3A
+      const falta = alvo - encodeURIComponent(base).length;
+      return base + "á".repeat(Math.floor(falta / 6)) + "a".repeat(falta % 6);
+    });
+  }
+
+  it("⭐ os lotes máximos do cxj, todos válidos pelo domínio: nenhum é 500 — ou cabem e dão 200 correto, ou são 422 claro", async () => {
+    const lotes: Array<[string, string[]]> = [
+      ["10 x 193 acentuadas", Array.from({ length: 10 }, (_, i) => `cxj:limite:${i}:` + "á".repeat(180))],
+      ["100 x 30 acentuadas", Array.from({ length: 100 }, (_, i) => `k${String(i).padStart(3, "0")}` + "á".repeat(26))],
+      ["100 x 200 ASCII", Array.from({ length: 100 }, (_, i) => `k${String(i).padStart(3, "0")}`.padEnd(200, "x"))],
+      ["100 x 200 acentuadas", Array.from({ length: 100 }, (_, i) => `k${String(i).padStart(3, "0")}`.padEnd(5, "x") + "á".repeat(195))],
+      ["100 x 30 ASCII", Array.from({ length: 100 }, (_, i) => `k${String(i).padStart(3, "0")}`.padEnd(30, "x"))],
+    ];
+    for (const [nome, chaves] of lotes) {
+      for (const c of chaves) expect(chaveExternaSchema.safeParse(c).success, `${nome}: ${c.slice(0, 20)}`).toBe(true);
+      const { res } = await lista(consultaDe(chaves));
+      const cabe = medida(chaves) <= LIMITE;
+      expect(res.status, `${nome} (medida ${medida(chaves)} / orçamento ${LIMITE})`).toBe(cabe ? 200 : 422);
+    }
+  });
+
+  it("⭐ NO orçamento, na pior forma (100 chaves acentuadas, soma = orçamento): 200 com o conjunto e o total CERTOS", async () => {
+    const chaves = pior(100, LIMITE, "bud");
+    expect(medida(chaves)).toBe(LIMITE);
+    const gravadas = [chaves[0]!, chaves[57]!, chaves[99]!];
+    for (const c of gravadas) {
+      const { error } = await servico.from("crm_tasks").insert({ organization_id: ORG_A, title: "orçamento", external_id: c });
+      expect(error).toBeNull();
+    }
+    const { res, corpo } = await lista(consultaDe(chaves));
+    expect(res.status).toBe(200);
+    expect(corpo.meta.total).toBe(3);
+    expect(corpo.data.tasks.map((t) => t.external_id).sort()).toEqual([...gravadas].sort());
+  });
+
+  it("NO orçamento com prefixo junto (a soma inclui o prefixo): 200", async () => {
+    const prefixo = "bud:5";
+    const chaves = pior(50, LIMITE - medida([prefixo]), "bp");
+    expect(medida(chaves) + medida([prefixo])).toBe(LIMITE);
+    expect((await lista(consultaDe(chaves, prefixo))).res.status).toBe(200);
+  });
+
+  it("um byte acima do orçamento: 422 com o orçamento e a orientação, e o corpo não traz lista", async () => {
+    const chaves = pior(100, LIMITE + 1, "acima");
+    const { res, corpo } = await lista(consultaDe(chaves));
+    expect(res.status).toBe(422);
+    const bruto = corpo as unknown as { error: { details: { limite_get: { bytes_lista: number; medido: number } } } };
+    expect(bruto.error.details.limite_get).toMatchObject({ bytes_lista: LIMITE, medido: LIMITE + 1 });
+    expect(JSON.stringify(bruto)).toMatch(/subdivid/i);
+  });
+
+  it("o orçamento tem MARGEM sobre o ponto em que o transporte quebra (medido: ~7,9 mil bytes na pior forma)", async () => {
+    // A pior forma do cxj no triplo do orçamento já quebra o `fetch` (era o 500); a rota recusa antes.
+    // Aqui se prova o lado de cá: o orçamento + 1 NÃO chega ao PostgREST (é 422), e o orçamento chega e passa.
+    const noLimite = pior(10, LIMITE, "marg");
+    expect((await lista(consultaDe(noLimite))).res.status).toBe(200);
+  });
+
+  it("os exemplos publicados em `limite_get.exemplos` (chaves-amostras.json) batem com a rota, se o arquivo foi informado", async () => {
+    const caminho = process.env.D9_AMOSTRAS_JSON;
+    if (!caminho) return; // o gate informa; sem o arquivo, não há o que conferir
+    const doc = JSON.parse(readFileSync(caminho, "utf8")) as {
+      limite_get: { bytes_lista: number; medida: string; exemplos: Array<{ descricao: string; lote: string[]; medido: number; passa: boolean }> };
+    };
+    expect(doc.limite_get.bytes_lista).toBe(LIMITE);
+    expect(doc.limite_get.medida).toBeTruthy();
+    expect(doc.limite_get.exemplos.length).toBeGreaterThanOrEqual(2);
+    for (const ex of doc.limite_get.exemplos) {
+      expect(medida(ex.lote), ex.descricao).toBe(ex.medido);
+      expect(ex.medido <= LIMITE, ex.descricao).toBe(ex.passa);
+      const { res } = await lista(consultaDe(ex.lote));
+      expect(res.status, ex.descricao).toBe(ex.passa ? 200 : 422);
+    }
   });
 });

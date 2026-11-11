@@ -1,4 +1,4 @@
--- conferir-catalogo D9 (v3) — SOMENTE LEITURA. Prova, depois da migration 9337, que o catálogo tem a D9 EXATA.
+-- conferir-catalogo D9 (v4) — SOMENTE LEITURA. Prova, depois da migration 9338, que o catálogo tem a D9 EXATA.
 --
 -- Uso:  psql -v ON_ERROR_STOP=1 -f conferir-catalogo.sql    (sai com erro e lista as FALHAS se algo divergir)
 --
@@ -9,6 +9,10 @@
 --     CORPO (`prosrc`) IDÊNTICO ao da migration, byte a byte;
 --   · gatilho: `tgtype`, `tgenabled`, `tgqual` NULO (sem WHEN), sem lista de colunas, sem argumentos, não
 --     diferível, `tgfoid` = a função acima, e o ÚLTIMO entre os BEFORE ROW;
+--   · collation (v4, cxj D9v3-1): a coluna `external_id` TEM de ser `text COLLATE "C"` (`attcollation`) e o
+--     índice TEM de usar a mesma (`indcollation`); `pg_get_indexdef` omite a collation herdada da coluna,
+--     então comparar só o texto deixava passar uma coluna com collation ICU não determinística (a
+--     constraint recusa INSERT válido com 0A000) e este instrumento imprimia "TUDO ok";
 --   · constraint: tipo, validada e `pg_get_constraintdef` IGUAL ao texto canônico (a regra inteira);
 --   · índice: `pg_get_indexdef` IGUAL ao texto canônico, único, válido, pronto, vivo, predicado.
 -- O texto canônico de `pg_get_constraintdef`/`pg_get_indexdef` foi medido no PostgreSQL 15.19 (o baseline
@@ -49,6 +53,15 @@ begin
   if v = 'text|f|f||' then raise notice 'ok: coluna crm_tasks.external_id text, anulável, sem default';
   else falhas := falhas || format('coluna external_id: %s', coalesce(v, '(ausente)')); end if;
 
+  -- 1b. a COLLATION efetiva da coluna: "C" (pg_catalog), a única que dá igualdade por byte e aceita regex
+  select n.nspname || '.' || c.collname into v
+    from pg_attribute a
+    join pg_collation c on c.oid = a.attcollation
+    join pg_namespace n on n.oid = c.collnamespace
+   where a.attrelid = 'public.crm_tasks'::regclass and a.attname = 'external_id' and not a.attisdropped;
+  if v = 'pg_catalog.C' then raise notice 'ok: a collation da coluna external_id é pg_catalog."C"';
+  else falhas := falhas || format('collation da coluna external_id: %s (esperado pg_catalog.C)', coalesce(v, '(ausente)')); end if;
+
   -- 2. a constraint: tipo check, validada, e a definição IGUAL à canônica (a regra inteira)
   select format('%s|%s', c.contype, c.convalidated) into v
     from pg_constraint c
@@ -67,6 +80,13 @@ begin
    where c.relname = 'crm_tasks_org_external_id_unique' and i.indrelid = 'public.crm_tasks'::regclass;
   if v = 't|t|t|t' then raise notice 'ok: índice único, válido, pronto e vivo';
   else falhas := falhas || format('índice crm_tasks_org_external_id_unique (único|válido|pronto|vivo): %s', coalesce(v, '(ausente)')); end if;
+  -- 3b. a collation do ÍNDICE por coluna (organization_id uuid = 0; external_id = "C"): o texto do
+  -- `pg_get_indexdef` não mostra a herdada da coluna, então a prova é o `indcollation`.
+  select i.indcollation::text into v
+    from pg_index i join pg_class c on c.oid = i.indexrelid
+   where c.relname = 'crm_tasks_org_external_id_unique' and i.indrelid = 'public.crm_tasks'::regclass;
+  if v = '0 ' || 'pg_catalog."C"'::regcollation::oid::text then raise notice 'ok: o índice usa a collation "C" em external_id';
+  else falhas := falhas || format('collation do índice crm_tasks_org_external_id_unique (indcollation): %s (esperado 0 %s = "C")', coalesce(v, '(ausente)'), 'pg_catalog."C"'::regcollation::oid::text); end if;
   select pg_get_indexdef(c.oid) into v from pg_class c
    where c.relname = 'crm_tasks_org_external_id_unique' and c.relnamespace = 'public'::regnamespace;
   if v is not distinct from esp_indice then raise notice 'ok: a definição do índice é a canônica';
