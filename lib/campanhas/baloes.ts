@@ -49,14 +49,24 @@ export function pausaEntreBaloes(
  * `continuar` (opcional) é perguntado antes de cada balão seguinte, depois da
  * pausa: `false` para ali, e o desfecho é o do último balão que saiu. A
  * prospecção o usa para não mandar o resto a quem respondeu ao começo.
+ *
+ * `enviar` devolver `null` num balão SEGUINTE é o mesmo `false` do `continuar`,
+ * dito de dentro do envio: a conferência final do handler vetou aquele balão
+ * (F4i). Ele não saiu, não é registrado, e o desfecho é o do último que saiu. No
+ * 1º balão não há "último que saiu", e o laço recusa.
+ *
+ * `parar` (opcional) é perguntado depois de cada balão: `true` para ali, como a
+ * falha. A prospecção o usa para o balão que o canal segurou na fila física
+ * (F4i, A1): se o canal voltasse na pausa, o seguinte sairia sem ele.
  */
 export async function enviarEmBaloes<T extends { status?: string }>(
   baloes: readonly string[],
   passos: {
-    enviar: (corpo: string, indice: number) => Promise<T>;
+    enviar: (corpo: string, indice: number) => Promise<T | null>;
     registrar?: (indice: number) => Promise<void>;
     esperar: () => Promise<void>;
     continuar?: (indice: number) => Promise<boolean>;
+    parar?: (desfecho: T) => boolean;
   },
 ): Promise<{ primeira: T; desfecho: T; indiceDoDesfecho: number }> {
   let primeira: T | undefined;
@@ -67,11 +77,16 @@ export async function enviarEmBaloes<T extends { status?: string }>(
       await passos.esperar();
       if (passos.continuar && !(await passos.continuar(indice))) break;
     }
-    desfecho = await passos.enviar(baloes[indice]!, indice);
+    const resultado = await passos.enviar(baloes[indice]!, indice);
+    if (resultado === null) {
+      if (indice === 0) throw new Error("enviarEmBaloes: o 1º balão não pode parar sem desfecho");
+      break;
+    }
+    desfecho = resultado;
     indiceDoDesfecho = indice;
     primeira ??= desfecho;
     await passos.registrar?.(indice);
-    if (desfecho.status === "failed") break;
+    if (desfecho.status === "failed" || passos.parar?.(desfecho)) break;
   }
   return { primeira: primeira!, desfecho: desfecho!, indiceDoDesfecho };
 }

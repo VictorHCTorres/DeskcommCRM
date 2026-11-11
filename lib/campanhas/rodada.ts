@@ -682,36 +682,53 @@ async function rodarUmaCampanha(
     const baloes = comModelo ? [corpo] : baloesDaCampanha(corpo, dividir, baloesPrevistos);
     const relogioDosBaloes = Date.now();
     const { primeira, desfecho: mensagem, indiceDoDesfecho } = await enviarEmBaloes(baloes, {
-      enviar: (texto, i) =>
-        sendMessageHandler(
-          admin,
-          {
-            organization_id: campanha.organization_id,
-            serviceBoundary: boundary,
-            proactiveContext: { organizationId: campanha.organization_id, contactId: alvo.contact_id },
-            actor: { type: "webhook_source", id: `campaign:${campanha.id}` },
-            requestId: i === 0 ? `campaign:${campanha.id}:${alvo.id}` : `campaign:${campanha.id}:${alvo.id}:${i}`,
-            internalMessageId: i === 0 ? messageId : randomUUID(),
-            // Só no 1º balão: os seguintes passam pelo `continuar`, que aceita
-            // o destinatário já `sent`/`delivered` (o ack do 1º pode ter chegado).
-            // O destino aprovado é o congelado na preparação (F4g, A5).
-            ...(i === 0 && ehProspeccao(campanha)
-              ? { campaignDelivery: { ...entrega, destinoAprovado: (alvo.recipient_address ?? "").trim() } }
-              : {}),
-          } as Parameters<typeof sendMessageHandler>[1],
-          {
-            conversation_id: boundary.conversation_id,
-            ...conteudo,
-            ...(conteudo.type === "text" ? { body: texto } : {}),
-            metadata: {
-              source: "campaign",
-              campaign_id: campanha.id,
-              campaign_recipient_id: alvo.id,
-              campaign_content_version: campanha.content_version,
-              idempotency_key: i === 0 ? `campaign:${alvo.id}` : `campaign:${alvo.id}:${i}`,
-            },
-          } as Parameters<typeof sendMessageHandler>[2],
-        ),
+      enviar: async (texto, i) => {
+        try {
+          return await sendMessageHandler(
+            admin,
+            {
+              organization_id: campanha.organization_id,
+              serviceBoundary: boundary,
+              proactiveContext: { organizationId: campanha.organization_id, contactId: alvo.contact_id },
+              actor: { type: "webhook_source", id: `campaign:${campanha.id}` },
+              requestId: i === 0 ? `campaign:${campanha.id}:${alvo.id}` : `campaign:${campanha.id}:${alvo.id}:${i}`,
+              internalMessageId: i === 0 ? messageId : randomUUID(),
+              // Na prospecção, TODO balão leva a entrega (F4i, I01): a conferência
+              // final dentro do handler e o destino congelado na preparação (F4g,
+              // A5). O 1º segue byte a byte o de antes (só o destinatário
+              // reservado); os seguintes aceitam o que o ack do 1º já avançou.
+              ...(ehProspeccao(campanha)
+                ? {
+                    campaignDelivery: {
+                      ...entrega,
+                      destinoAprovado: (alvo.recipient_address ?? "").trim(),
+                      ...(i > 0 ? { estadosAceitos: ESTADOS_DE_QUEM_RECEBEU } : {}),
+                    },
+                  }
+                : {}),
+            } as Parameters<typeof sendMessageHandler>[1],
+            {
+              conversation_id: boundary.conversation_id,
+              ...conteudo,
+              ...(conteudo.type === "text" ? { body: texto } : {}),
+              metadata: {
+                source: "campaign",
+                campaign_id: campanha.id,
+                campaign_recipient_id: alvo.id,
+                campaign_content_version: campanha.content_version,
+                idempotency_key: i === 0 ? `campaign:${alvo.id}` : `campaign:${alvo.id}:${i}`,
+              },
+            } as Parameters<typeof sendMessageHandler>[2],
+          );
+        } catch (err) {
+          // O handler vetou um balão SEGUINTE: o começo já saiu e não volta, e o
+          // resto não vai — o mesmo desfecho do `continuar` falso. Aplicar o
+          // veto aqui devolveria a pessoa à fila, e a rodada seguinte repetiria
+          // o começo. O veto do 1º balão segue para o `catch` de fora.
+          if (i > 0 && err instanceof VetoDaCampanhaError) return null;
+          throw err;
+        }
+      },
       // Cada balão entra no ledger no instante em que SAIU: o throttle do próximo
       // envio do número conta a partir do último registro, e gravar todos com o
       // `agora` da rodada deixava o destinatário seguinte sair a menos de
@@ -733,7 +750,12 @@ async function rodarUmaCampanha(
       // depois do 1º balão não recebe o resto; sem conseguir ler, também não
       // (o começo já saiu, e o resto espera a pessoa).
       ...(ehProspeccao(campanha)
-        ? { continuar: async () => (await conferenciaFinal(admin, entrega, agora, ESTADOS_DE_QUEM_RECEBEU)) === null }
+        ? {
+            continuar: async () => (await conferenciaFinal(admin, entrega, agora, ESTADOS_DE_QUEM_RECEBEU)) === null,
+            // O balão que o canal segurou na fila física (F4i, A1) para os
+            // seguintes: se o canal voltasse na pausa, o próximo sairia sem ele.
+            parar: retidaPeloCanal,
+          }
         : {}),
     });
 
@@ -744,6 +766,22 @@ async function rodarUmaCampanha(
     const falhou = status === "failed";
     const erro = mensagem;
     const codigoDaFalha = falhou ? codigoDaPlataforma(erro.error_code, erro.error_message) : null;
+
+    // A mensagem de PROSPECÇÃO que não saiu (a fila física do canal) nunca conta
+    // como enviada, nem fica na fila física (F4i, A1): o resgate do watchdog a
+    // mandaria depois sem conferir a pessoa, e a vigia deixaria de acompanhar
+    // quem já constasse como enviado.
+    if (ehProspeccao(campanha) && !falhou && !SAIU.has(status ?? "")) {
+      return desfechoDaFilaDoCanal(admin, {
+        organizationId: campanha.organization_id,
+        destinatarioId: alvo.id,
+        retida: mensagem,
+        primeiraId: primeira.id ?? messageId,
+        indiceDoDesfecho,
+        agora,
+        numero: sessionEscolhida,
+      });
+    }
 
     // O provedor ou a plataforma pediram para DESACELERAR (429 do parceiro,
     // 130429 da plataforma). A mensagem não saiu e não tem nada de errado: o
@@ -816,6 +854,85 @@ async function rodarUmaCampanha(
       numero: sessionEscolhida,
     };
   }
+}
+
+/** O que já saiu para o cliente: o canal aceitou (`sent`) ou confirmou (`delivered`/`read`). */
+const SAIU = new Set(["sent", "delivered", "read"]);
+
+/**
+ * O canal segurou a mensagem na fila física, e o handler disse por quê
+ * (`metadata.queued_reason`): o canal fora do ar ou ainda sem credencial. Nos
+ * dois ramos o handler não chega a falar com o provedor — nada saiu.
+ */
+export function retidaPeloCanal(m: { status?: string | null; metadata?: unknown }): boolean {
+  const motivo = (m.metadata as { queued_reason?: unknown } | null | undefined)?.queued_reason;
+  return m.status === "queued" && typeof motivo === "string" && motivo !== "";
+}
+
+/**
+ * A mensagem de prospecção que voltou do handler sem ter saído (F4i, A1).
+ *
+ * 1. Sai da fila física (`failed/campanha_sem_reenvio`), só se ainda estiver
+ *    lá: quem manda a prospecção é a rodada, que confere a pessoa de novo; o
+ *    resgate do watchdog não confere (e também a recusa, em
+ *    `session-reconciler.ts`).
+ * 2. O destinatário volta à fila da campanha SÓ quando nada saiu com certeza: o
+ *    1º balão, retido com o motivo gravado pelo handler. Sem o motivo, o handler
+ *    pode ter mandado e só não ter conseguido marcar `sent` — voltar à fila
+ *    repetiria a mensagem; num balão seguinte, o começo já saiu. Nos dois casos
+ *    o destinatário fica `failed`, e ninguém recebe de novo.
+ */
+async function desfechoDaFilaDoCanal(
+  admin: SupabaseClient,
+  d: {
+    organizationId: string;
+    destinatarioId: string;
+    retida: { id?: string | null; status?: string | null; metadata?: unknown };
+    primeiraId: string;
+    indiceDoDesfecho: number;
+    agora: Date;
+    numero: string;
+  },
+): Promise<{ enviadas: number; pulados: number; concluidas: number; detalhe: string; numero?: string }> {
+  if (d.retida.id) {
+    await admin
+      .from("messages")
+      .update({
+        status: "failed",
+        error_code: "campanha_sem_reenvio",
+        error_message: "Não saiu: a campanha de prospecção só manda pela rodada, que confere a pessoa de novo.",
+      })
+      .eq("id", d.retida.id)
+      .eq("organization_id", d.organizationId)
+      .eq("status", "queued");
+  }
+  const motivo = (d.retida.metadata as { queued_reason?: string } | null | undefined)?.queued_reason ?? null;
+  if (d.indiceDoDesfecho === 0 && retidaPeloCanal(d.retida)) {
+    await admin
+      .from("campaign_recipients")
+      .update({
+        status: "pending",
+        sending_at: null,
+        next_attempt_at: new Date(d.agora.getTime() + 60_000).toISOString(),
+        last_error_code: "canal_indisponivel",
+        last_error_detail: motivo,
+      })
+      .eq("id", d.destinatarioId)
+      .eq("status", "sending");
+    return { enviadas: 0, pulados: 0, concluidas: 0, detalhe: "fila:canal_indisponivel" };
+  }
+  const codigo = d.indiceDoDesfecho === 0 ? "envio_incerto" : "canal_indisponivel";
+  await admin
+    .from("campaign_recipients")
+    .update({
+      status: "failed",
+      last_error_code: codigo,
+      last_error_detail: motivo,
+      message_id: d.primeiraId,
+    })
+    .eq("id", d.destinatarioId)
+    .eq("status", "sending");
+  return { enviadas: 0, pulados: 0, concluidas: 0, detalhe: `fila:${codigo}`, numero: d.numero };
 }
 
 /**

@@ -19,6 +19,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 
 import { samePhone } from "@/lib/channels/phone-variants";
+import { logger } from "@/lib/logger";
 import { STATUS_ENCERRADOS, silencioVigente } from "@/lib/inbox/comando-da-conversa";
 
 import { motivoParaExcluir, recusouMarketing, statusDaSaida } from "./elegibilidade";
@@ -229,6 +230,23 @@ export async function travaDaProspeccao(
   );
   if (comUmaPessoa) return { pular: "atendimento_humano" };
 
+  // A passagem a uma pessoa DEPOIS da preparação, em qualquer conversa, mesmo já
+  // encerrada (F4i, I03 do cxj): alguém da equipe atendeu a pessoa depois que a
+  // campanha a escolheu, e o toque frio chegaria por cima desse atendimento. A
+  // conversa encerrada não manda em quem atende agora (o bloco de cima), mas a
+  // passagem recente é fato novo. Consulta própria, separada da de cima.
+  const { data: passagens, error: erroDasPassagens } = await admin
+    .from("conversations")
+    .select("last_handoff_at")
+    .eq("organization_id", campanha.organization_id)
+    .eq("contact_id", alvo.contact_id);
+  if (erroDasPassagens) return { esperar: "sem_leitura" };
+  const corte = Date.parse(campanha.prepared_at);
+  const passouDepois = ((passagens ?? []) as Array<{ last_handoff_at: string | null }>).some(
+    (c) => !!c.last_handoff_at && Date.parse(c.last_handoff_at) > corte,
+  );
+  if (passouDepois) return { pular: "atendimento_humano" };
+
   if (paradas.length > 0) {
     // A operação marca a parada também no NEGÓCIO; a audiência só olhou o
     // contato. Com funis no público, vale o negócio desses funis: a etiqueta de
@@ -323,7 +341,21 @@ export async function aplicarVeto(
             opted_out_at: veto.pular === "opt_out" ? agora.toISOString() : null,
             sending_at: null,
           };
-  await admin.from("campaign_recipients").update(patch).eq("id", destinatarioId).eq("status", "sending");
+  const { error } = await admin
+    .from("campaign_recipients")
+    .update(patch)
+    .eq("id", destinatarioId)
+    .eq("status", "sending");
+  if (error) {
+    // O destinatário segue reservado (`sending`), e nenhuma rodada o pega de
+    // novo: nada sai. O que não pode é a rodada dizer que pulou (F4i).
+    logger.error("[campanha] o veto da conferência final não foi gravado", {
+      destinatario: destinatarioId,
+      veto,
+      erro: error.message,
+    });
+    return "veto_sem_registro";
+  }
   if ("esperar" in veto) return `trava:${veto.esperar}`;
   if ("parou" in veto) return "campanha_parou";
   return `pulado:${veto.pular}`;

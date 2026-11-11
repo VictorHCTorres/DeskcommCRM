@@ -1,5 +1,5 @@
 import { assertProspectingDelivery } from "@/lib/prospecting/guard";
-import { assertCampaignDelivery, VetoDaCampanhaError } from "@/lib/campanhas/entrega";
+import { assertCampaignDelivery, entregaPeloAtor, VetoDaCampanhaError } from "@/lib/campanhas/entrega";
 import { assertAgentOperationSupabase, mesmaOperacao } from "@/lib/ai/agents/operation";
 import {
   assertApprovedReplySupabase,
@@ -448,6 +448,12 @@ export async function sendMessageHandler(
   // gate antes da suspensão. O erro é terminal (`terminal: true`).
   await assertOrgOperante(supabase, ctx.organization_id);
   if (ctx.prospectingDelivery) await assertProspectingDelivery(supabase, ctx.prospectingDelivery);
+  // O envio de campanha que chegar sem a entrega (um chamador que a esquecesse)
+  // a ganha aqui, pelo ator que só a rodada cria (F4i, H06/H07 do cxj).
+  if (!ctx.campaignDelivery) {
+    const montada = await entregaPeloAtor(supabase, ctx, input.metadata);
+    if (montada) ctx = { ...ctx, campaignDelivery: montada };
+  }
   // A campanha de prospecção confere a pessoa de novo aqui e no `checkBoundary`
   // (F4g, A3): o veto sobe como `VetoDaCampanhaError`, e a rodada o aplica.
   if (ctx.campaignDelivery) await assertCampaignDelivery(supabase, ctx.campaignDelivery);
@@ -1429,22 +1435,36 @@ export async function sendMessageHandler(
     } catch (err) {
       if (err instanceof VetoDaCampanhaError) {
         // O veto da conferência final da campanha no instante do efeito (F4g,
-        // A3), DEPOIS do INSERT: a linha sai de `queued` (senão o redrive do
-        // watchdog a mandaria), só se ainda estiver lá, e o erro sobe para a
-        // rodada aplicar o veto ao destinatário. Não é falha de entrega: nada
-        // de `emitirFalhaDeEntrega`.
-        await supabase
-          .from("messages")
-          .update({
-            status: "failed",
-            error_code: "campanha_vetada",
-            error_message: "Não enviada: a conferência final da campanha vetou o envio.",
-          })
-          .eq("id", message.id)
-          .eq("organization_id", ctx.organization_id)
-          .eq("status", "queued")
-          .select("id")
-          .maybeSingle();
+        // A3), DEPOIS do INSERT: a linha sai de `queued`, só se ainda estiver
+        // lá, e o erro sobe para a rodada aplicar o veto ao destinatário. Não é
+        // falha de entrega: nada de `emitirFalhaDeEntrega`.
+        //
+        // F4i (H08 do cxj): o erro deste UPDATE era descartado, e a linha ficava
+        // na fila física. Uma 2ª tentativa cobre a queda passageira; sem ela, o
+        // log diz qual mensagem ficou, e o resgate do watchdog não manda
+        // mensagem de campanha de prospecção (`session-reconciler.ts`).
+        const tirarDaFila = () =>
+          supabase
+            .from("messages")
+            .update({
+              status: "failed",
+              error_code: "campanha_vetada",
+              error_message: "Não enviada: a conferência final da campanha vetou o envio.",
+            })
+            .eq("id", message.id)
+            .eq("organization_id", ctx.organization_id)
+            .eq("status", "queued")
+            .select("id")
+            .maybeSingle();
+        let { error: erroAoTirar } = await tirarDaFila();
+        if (erroAoTirar) ({ error: erroAoTirar } = await tirarDaFila());
+        if (erroAoTirar) {
+          logger.error("messages.send.campanha_vetada_sem_registro", {
+            message_id: message.id,
+            organization_id: ctx.organization_id,
+            erro: erroAoTirar.message,
+          });
+        }
         throw err;
       }
       if (err instanceof AgendaPuladoError) {

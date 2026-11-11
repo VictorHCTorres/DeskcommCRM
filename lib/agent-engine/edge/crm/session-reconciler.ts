@@ -181,6 +181,19 @@ interface QueuedRow {
   phone_number: string | null;
   is_group: boolean;
   group_chat_id: string | null;
+  /** De onde veio a mensagem: a de campanha leva `source` e `campaign_id` (F4i). */
+  metadata: unknown;
+}
+
+/**
+ * A campanha da mensagem presa, pelo `metadata` que a rodada grava. `null`
+ * quando não é de campanha; `''` quando é de campanha sem o id (a busca não
+ * acha nada, e a falta conta como prospecção: falha fechada).
+ */
+export function campanhaDaMensagem(metadata: unknown): string | null {
+  const meta = metadata as { source?: unknown; campaign_id?: unknown } | null | undefined;
+  if (meta?.source !== 'campaign') return null;
+  return typeof meta.campaign_id === 'string' ? meta.campaign_id : '';
 }
 
 /**
@@ -390,7 +403,7 @@ export async function redriveQueued(
 ): Promise<number> {
   const { rows } = await pool.query<QueuedRow>(
     `select m.id, m.organization_id, m.conversation_id, m.contact_id, m.body, s.waha_session_name,
-            c.wa_identity, c.wa_lid, c.phone_number, v.is_group, v.group_chat_id
+            c.wa_identity, c.wa_lid, c.phone_number, v.is_group, v.group_chat_id, m.metadata
      from messages m
      join channel_sessions s on s.id = m.channel_session_id and s.organization_id = m.organization_id
      join conversations v on v.id = m.conversation_id and v.organization_id = m.organization_id
@@ -511,6 +524,31 @@ export async function redriveQueued(
         );
         log.info('watchdog: reenvio bloqueado pelo modo de teste', { message_id: m.id });
         continue;
+      }
+      // A campanha de PROSPECÇÃO só sai pela rodada (F4i, A1 do cxj). Este
+      // resgate manda direto ao WAHA sem conferir a pessoa — se respondeu, foi
+      // para atendimento humano, recusou, entrou na lista de exclusão — nem a
+      // campanha, que pode ter sido cancelada enquanto o canal estava fora. A
+      // rodada tira a sua mensagem da fila física e devolve a pessoa à fila da
+      // campanha; o que sobrar aqui (o veto que não gravou, a linha de antes
+      // desta versão) vira `failed`. Só a campanha de consentimento segue como
+      // antes; campanha que não se acha conta como prospecção.
+      const campanhaId = campanhaDaMensagem(m.metadata);
+      if (campanhaId !== null) {
+        const { rows: campanha } = await pool.query<{ base_legal: string | null }>(
+          `select k.base_legal from campaigns k where k.organization_id = $1 and k.id::text = $2`,
+          [m.organization_id, campanhaId],
+        );
+        if (campanha[0]?.base_legal !== 'consent') {
+          await pool.query(
+            `update messages set status = 'failed', error_code = 'campanha_sem_reenvio',
+               error_message = 'Não reenviada: a campanha de prospecção só manda pela rodada, que confere a pessoa de novo.'
+             where id = $1 and organization_id = $2 and status = 'queued'`,
+            [m.id, m.organization_id],
+          );
+          log.info('watchdog: reenvio bloqueado — mensagem de campanha de prospecção', { message_id: m.id });
+          continue;
+        }
       }
       const res = await fetch(`${cfg.wahaBaseUrl}/api/sendText`, {
         method: 'POST',

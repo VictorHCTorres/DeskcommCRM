@@ -81,7 +81,9 @@ export interface DependenciasDaRajada<T> {
 // da prospecção que não conseguiu ler (`trava:sem_leitura`) ou não tem o corte
 // (`trava:sem_preparacao`): o veto é de todos os envios seguintes. E a campanha
 // que parou no meio (`campanha_parou`, visto na reserva) não manda mais nada.
-const PARA_A_RAJADA = /^(pausada:|ritmo:|canal:|limite:|erro_na_reserva|org_nao_operante|trava:|campanha_parou)/;
+// E a mensagem da prospecção que o canal segurou (`fila:`, F4i A1): o próximo
+// envio cairia no mesmo canal fora do ar, e a pessoa só voltaria à fila.
+const PARA_A_RAJADA = /^(pausada:|ritmo:|canal:|fila:|limite:|erro_na_reserva|org_nao_operante|trava:|campanha_parou)/;
 
 /** O desfecho vale para os envios seguintes também — a rajada não insiste. */
 export function desfechoParaARajada(detalhe: string): boolean {

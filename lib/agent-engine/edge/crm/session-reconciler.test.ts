@@ -260,3 +260,93 @@ describe("redrive × ficha com telefone extra (Spec 31 B1)", () => {
     // principal (5527999998888@c.us) e deixa este teste vermelho.
   });
 });
+
+/**
+ * F4i do cxj (11/11/2026), A1: a mensagem de campanha de PROSPECÇÃO que ficou na fila física (o canal caiu, ou o veto
+ * não conseguiu ser gravado) não sai pelo resgate. O resgate manda direto ao WAHA, sem conferir a pessoa (resposta,
+ * atendimento humano, recusa, lista de exclusão, campanha cancelada); quem manda a prospecção é a rodada, que confere
+ * tudo de novo. A linha vira `failed/campanha_sem_reenvio`, e a campanha de consentimento segue como antes.
+ */
+describe("redrive × campanha de prospecção (F4i)", () => {
+  const CFG = {
+    wahaBaseUrl: "http://127.0.0.1:9999", wahaApiKey: "test-key",
+    intervalMs: 1, redriveMinAgeMs: 0, redriveBatchSize: 10, redriveSpacingMs: 0,
+  };
+  function cenario(metadata: unknown, campanha: () => Promise<{ rows: unknown[] }>) {
+    const send = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(JSON.stringify({ id: { id: "3EB0NEW" } }), { status: 200 }));
+    const consultas: Array<{ sql: string; params: unknown[] }> = [];
+    const query = vi.fn(async (sql: string, params: unknown[] = []) => {
+      consultas.push({ sql, params });
+      if (/select\s+m\.id/i.test(sql)) {
+        return { rows: [{
+          id: "m-1", organization_id: "org-1", conversation_id: "conv-1", contact_id: "ficha-1", body: "Olá",
+          waha_session_name: "default", wa_identity: null, wa_lid: null, phone_number: "+5588999990000",
+          is_group: false, group_chat_id: null, metadata,
+        }] };
+      }
+      if (/count\(\*\)/i.test(sql)) return { rows: [{ n: "0" }] };
+      if (/select\s+s\.metadata/i.test(sql)) return { rows: [{ metadata: {}, phone_number: "+5588999990000", operante: true }] };
+      if (/from campaigns/i.test(sql)) return campanha();
+      return { rows: [] };
+    });
+    const rodar = () => redriveQueued({ query } as unknown as pg.Pool, CFG, createLogger());
+    const bloqueio = () => consultas.find((c) => c.sql.includes("error_code = 'campanha_sem_reenvio'"));
+    const leuCampanha = () => consultas.filter((c) => /from campaigns/i.test(c.sql));
+    return { send, rodar, bloqueio, leuCampanha };
+  }
+  const daCampanha = { source: "campaign", campaign_id: "camp-1", campaign_recipient_id: "r-1" };
+
+  it("⭐ mensagem presa de campanha de prospecção: não sai pelo resgate, e vira failed/campanha_sem_reenvio", async () => {
+    const c = cenario(daCampanha, async () => ({ rows: [{ base_legal: "legitimate_interest" }] }));
+    expect(await c.rodar()).toBe(0);
+    expect(c.send).not.toHaveBeenCalled();
+    expect(c.bloqueio()?.params).toEqual(["m-1", "org-1"]);
+    expect(c.leuCampanha()[0]?.params).toEqual(["org-1", "camp-1"]);
+  });
+
+  it("⭐ a campanha não se acha (apagada, ou o id não casa): também não sai (falha fechada)", async () => {
+    const c = cenario(daCampanha, async () => ({ rows: [] }));
+    expect(await c.rodar()).toBe(0);
+    expect(c.send).not.toHaveBeenCalled();
+    expect(c.bloqueio()).toBeDefined();
+  });
+
+  it("⭐ a campanha voltou sem a base legal (só o status, como no dublê do cxj): não sai", async () => {
+    const c = cenario(daCampanha, async () => ({ rows: [{ status: "cancelled" }] }));
+    expect(await c.rodar()).toBe(0);
+    expect(c.send).not.toHaveBeenCalled();
+    expect(c.bloqueio()).toBeDefined();
+  });
+
+  it("⭐ de campanha, mas sem o id da campanha: não sai", async () => {
+    const c = cenario({ source: "campaign" }, async () => ({ rows: [] }));
+    expect(await c.rodar()).toBe(0);
+    expect(c.send).not.toHaveBeenCalled();
+    expect(c.bloqueio()).toBeDefined();
+  });
+
+  it("⭐ sem conseguir ler a campanha: não sai, e a linha fica na fila para o próximo tique", async () => {
+    const c = cenario(daCampanha, async () => {
+      throw new Error("leitura de campaigns falhou");
+    });
+    expect(await c.rodar()).toBe(0);
+    expect(c.send).not.toHaveBeenCalled();
+    expect(c.bloqueio()).toBeUndefined();
+  });
+
+  it("controle: campanha de consentimento segue como antes, e sai pelo resgate", async () => {
+    const c = cenario(daCampanha, async () => ({ rows: [{ base_legal: "consent" }] }));
+    expect(await c.rodar()).toBe(1);
+    expect(c.send).toHaveBeenCalledTimes(1);
+    expect(c.bloqueio()).toBeUndefined();
+  });
+
+  it("controle: a mensagem que não é de campanha não lê campanha nenhuma, e sai como antes", async () => {
+    const c = cenario({ source: "agent" }, async () => ({ rows: [{ base_legal: "legitimate_interest" }] }));
+    expect(await c.rodar()).toBe(1);
+    expect(c.send).toHaveBeenCalledTimes(1);
+    expect(c.leuCampanha()).toEqual([]);
+  });
+});
