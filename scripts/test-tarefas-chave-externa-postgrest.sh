@@ -154,4 +154,17 @@ fi
 cd "$ROOT"
 D9_PG_CONTAINER="$PG_NOVO" D9_POSTGREST_URL="$URL" D9_JWT_SECRET="$SEGREDO" D9_CHAVES_CANONICAS="$CANON" \
   npx vitest run --config vitest.d9-real.config.ts
+
+# ───────────────────────── 3. A VOLTA (1.101.0 sobre o banco migrado) ─────────────────────────
+# D9_BASE_WORKTREE: worktree (limpo) do commit da base, com node_modules. Sem ele o passo é pulado e dito.
+if [ -n "${D9_BASE_WORKTREE:-}" ] && [ -d "$D9_BASE_WORKTREE" ]; then
+  echo "==> [3] volta: o app da base ($(git -C "$D9_BASE_WORKTREE" rev-parse --short HEAD)) sobre o banco migrado"
+  mkdir -p "$D9_BASE_WORKTREE/tests/d9-volta"
+  cp "$ROOT/tests/d9-volta/volta-1101.real.ts" "$D9_BASE_WORKTREE/tests/d9-volta/"
+  cp "$ROOT/vitest.d9-volta.config.ts" "$D9_BASE_WORKTREE/"
+  (cd "$D9_BASE_WORKTREE" && D9_PG_CONTAINER="$PG_NOVO" D9_POSTGREST_URL="$URL" D9_JWT_SECRET="$SEGREDO" \
+    npx vitest run --config vitest.d9-volta.config.ts)
+else
+  echo "==> [3] volta: PULADO (defina D9_BASE_WORKTREE com um worktree da base para provar o rollback)"
+fi
 echo "==> GATE D9 VERDE"
