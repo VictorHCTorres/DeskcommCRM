@@ -1,0 +1,441 @@
+import { execFile } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { promisify } from "node:util";
+
+import { beforeAll, describe, expect, it } from "vitest";
+
+import { GOV_ORG, seedGov, sql } from "./gov-helpers";
+
+/**
+ * A CHAVE EXTERNA DA TAREFA (D9, migration 9252) — NO BANCO DE VERDADE, COM O BASELINE INTEIRO.
+ *
+ * O que as provas de unidade das rotas (`app/api/v1/tasks/route.chave-externa.test.ts`) NÃO
+ * medem, porque lá o banco é falso: o índice único, a constraint de forma (a mesma regra do zod,
+ * inclusive Unicode e NFC), a trava de quem escreve a chave e, desde a revisão do cxj, a
+ * IDENTIDADE `(organization_id, external_id)` — mover a tarefa com chave para outra organização
+ * pela sessão (JWT de quem está nas duas) não pode ser um jeito de ocupar/liberar a chave.
+ *
+ * Quem responde aqui é o Postgres: `set role authenticated|service_role` + `request.jwt.claims`,
+ * o mesmo que o PostgREST faz. A RLS é a REAL (baseline). O PostgREST em si (count, embed, LIKE,
+ * `*`) é provado por `scripts/test-tarefas-chave-externa-postgrest.sh`.
+ *
+ * Fixtures locais por id (namespace `d9`), porque o molde do banco é um por arquivo.
+ */
+
+const execFileAsync = promisify(execFile);
+const container = process.env.TEST_DB_CONTAINER ?? "";
+
+const ORG_A = GOV_ORG;
+const ORG_B = "d9d9d9d9-0000-4000-8000-00000000000b";
+/** Manager NAS DUAS organizações: a pré-condição que o cxj usou para mover a tarefa. */
+const USER_DUAS = "d9d9d9d9-1111-4000-8000-000000000001";
+/** Manager só da A: não passa na RLS da B. */
+const USER_SO_A = "d9d9d9d9-1111-4000-8000-000000000002";
+
+const T = (n: number) => `d9d9d9d9-2222-4000-8000-${String(n).padStart(12, "0")}`;
+
+beforeAll(() => {
+  seedGov();
+  sql(`
+    insert into auth.users (id, email) values
+      ('${USER_DUAS}', 'd9-duas@invariant.test'), ('${USER_SO_A}', 'd9-so-a@invariant.test')
+      on conflict do nothing;
+    insert into public.organizations (id, slug, legal_name, display_name)
+      values ('${ORG_B}', 'd9-org-b', 'D9 Org B', 'D9 B') on conflict do nothing;
+    insert into public.user_organizations (user_id, organization_id, role, accepted_at) values
+      ('${USER_DUAS}', '${ORG_A}', 'manager', now()),
+      ('${USER_DUAS}', '${ORG_B}', 'manager', now()),
+      ('${USER_SO_A}', '${ORG_A}', 'manager', now())
+      on conflict do nothing;
+  `);
+});
+
+/** Roda o SQL e devolve o texto do erro (stderr), ou null se passou. */
+function erroDe(script: string): string | null {
+  try {
+    sql(script);
+    return null;
+  } catch (err) {
+    return String((err as { stderr?: string }).stderr ?? err);
+  }
+}
+
+const comoSessao = (user: string, dml: string) => `
+  set role authenticated;
+  select set_config('request.jwt.claims', '{"sub":"${user}","role":"authenticated"}', false);
+  ${dml}`;
+const comoServico = (dml: string) => `set role service_role; ${dml}`;
+
+function um(query: string): string {
+  const out = sql(query);
+  return out.split("\n").pop() ?? "";
+}
+
+describe("catálogo: o que a migração 9252 tem de ter deixado", () => {
+  it("coluna, constraint validada, índice único parcial válido e o gatilho", () => {
+    expect(
+      um(`select data_type from information_schema.columns
+           where table_name='crm_tasks' and column_name='external_id'`),
+    ).toBe("text");
+    expect(
+      um(`select convalidated::text from pg_constraint
+           where conname='crm_tasks_external_id_formato' and conrelid='public.crm_tasks'::regclass`),
+    ).toBe("true");
+    const indice = um(`select i.indisunique::text || ',' || i.indisvalid::text || ',' ||
+        pg_get_expr(i.indpred, i.indrelid) || ',' ||
+        (select string_agg(a.attname, ',' order by k.ord)
+           from unnest(i.indkey) with ordinality k(attnum, ord)
+           join pg_attribute a on a.attrelid = i.indrelid and a.attnum = k.attnum)
+      from pg_index i join pg_class c on c.oid = i.indexrelid
+     where c.relname = 'crm_tasks_org_external_id_unique'`);
+    expect(indice).toBe("true,true,(external_id IS NOT NULL),organization_id,external_id");
+    expect(
+      um(`select count(*) from pg_trigger
+           where tgname='zz_crm_tasks_chave_externa_ultimo' and not tgisinternal
+             and tgrelid='public.crm_tasks'::regclass and tgenabled='O'`),
+    ).toBe("1");
+    expect(
+      um(`select count(*) from pg_trigger
+           where tgname='trg_crm_tasks_chave_externa' and tgrelid='public.crm_tasks'::regclass`),
+    ).toBe("0");
+  });
+
+  it("⭐ o gatilho da chave é o ÚLTIMO BEFORE ROW da tabela (ordem alfabética do Postgres)", () => {
+    // O limite de composição (cxj §4): outro BEFORE que ordene depois pode mudar a chave sem a
+    // guarda ver. Se este caso ficar vermelho, alguém criou um — e tem de decidir, à vista.
+    expect(
+      um(`select coalesce(string_agg(tgname, ','), '') from pg_trigger
+           where tgrelid='public.crm_tasks'::regclass and not tgisinternal
+             and (tgtype & 1) = 1      -- FOR EACH ROW
+             and (tgtype & 2) = 2      -- BEFORE
+             and tgname > 'zz_crm_tasks_chave_externa_ultimo' collate "C"`),
+    ).toBe("");
+  });
+});
+
+describe("a regra da forma da chave: idêntica à do zod", () => {
+  const ok = (expr: string, n: number) =>
+    erroDe(`insert into public.crm_tasks (id, organization_id, title, external_id)
+            values ('${T(100 + n)}', '${ORG_A}', 'forma', ${expr});`);
+
+  const aceitas: Array<[string, string]> = [
+    ["canônica com acento NFC", `'contab|rotina|6249|Folha/Pró-labore|09/2026'`],
+    ["200 caracteres", `repeat('x', 200)`],
+    ["espaço no meio", `'a b'`],
+    ["% _ e barra invertida", `'pref:100%_a\\b'`],
+    ["ZWJ (emoji composto)", `'a' || chr(8205) || 'b'`],
+  ];
+  it.each(aceitas)("aceita: %s", (_nome, expr) => {
+    expect(
+      ok(
+        expr,
+        aceitas.findIndex((a) => a[0] === _nome),
+      ),
+    ).toBeNull();
+  });
+
+  const recusadas: Array<[string, string]> = [
+    ["vazia", `''`],
+    ["201 caracteres", `repeat('x', 201)`],
+    ["espaço ASCII no início", `' a'`],
+    ["espaço ASCII no fim", `'a '`],
+    ["tabulação", `'a' || chr(9) || 'b'`],
+    ["DEL", `'a' || chr(127) || 'b'`],
+    ["controle C1 (NEL)", `'a' || chr(133) || 'b'`],
+    ["NBSP no meio", `'a' || chr(160) || 'b'`],
+    ["NBSP no fim", `'a' || chr(160)`],
+    ["EM SPACE", `'a' || chr(8195) || 'b'`],
+    ["IDEOGRAPHIC SPACE", `'a' || chr(12288) || 'b'`],
+    ["NARROW NBSP", `'a' || chr(8239) || 'b'`],
+    ["LINE SEPARATOR", `'a' || chr(8232) || 'b'`],
+    ["PARAGRAPH SEPARATOR", `'a' || chr(8233) || 'b'`],
+    ["BOM", `'a' || chr(65279) || 'b'`],
+    ["asterisco", `'a*b'`],
+    ["NFD (ó decomposto)", `'Pro' || chr(769) || '-labore'`],
+  ];
+  it.each(recusadas)("recusa (23514): %s", (nome, expr) => {
+    const erro = ok(expr, 50 + recusadas.findIndex((r) => r[0] === nome));
+    expect(erro).toContain("crm_tasks_external_id_formato");
+  });
+});
+
+describe("D9-1: a identidade (organization_id, external_id) não se move pela sessão", () => {
+  const TAREFA_CHAVE = T(1);
+  const TAREFA_SEM = T(2);
+  const TAREFA_SO_A = T(3);
+  beforeAll(() => {
+    sql(`
+      insert into public.crm_tasks (id, organization_id, title, external_id) values
+        ('${TAREFA_CHAVE}', '${ORG_A}', 'do robo', 'robo:1'),
+        ('${TAREFA_SO_A}', '${ORG_A}', 'do robo 3', 'robo:3')
+        on conflict do nothing;
+      insert into public.crm_tasks (id, organization_id, title) values
+        ('${TAREFA_SEM}', '${ORG_A}', 'da tela') on conflict do nothing;
+    `);
+  });
+
+  const estado = (id: string) =>
+    um(
+      `select organization_id || '|' || coalesce(external_id, '<nulo>') from public.crm_tasks where id='${id}'`,
+    );
+
+  it("⭐ JWT de quem está nas duas organizações NÃO move a tarefa com chave (o achado do cxj)", () => {
+    const erro = erroDe(
+      comoSessao(
+        USER_DUAS,
+        `update public.crm_tasks set organization_id='${ORG_B}' where id='${TAREFA_CHAVE}';`,
+      ),
+    );
+    expect(erro).toContain("tarefa_chave_externa_imutavel");
+    expect(estado(TAREFA_CHAVE)).toBe(`${ORG_A}|robo:1`);
+  });
+
+  it("nem com `external_id = external_id` junto (o retorno antecipado antigo deixava passar)", () => {
+    const erro = erroDe(
+      comoSessao(
+        USER_DUAS,
+        `update public.crm_tasks set organization_id='${ORG_B}', external_id=external_id where id='${TAREFA_CHAVE}';`,
+      ),
+    );
+    expect(erro).toContain("tarefa_chave_externa_imutavel");
+    expect(estado(TAREFA_CHAVE)).toBe(`${ORG_A}|robo:1`);
+  });
+
+  it("a sessão não troca nem limpa a chave posta", () => {
+    for (const novo of [`'outra'`, `null`]) {
+      expect(
+        erroDe(
+          comoSessao(
+            USER_DUAS,
+            `update public.crm_tasks set external_id=${novo} where id='${TAREFA_CHAVE}';`,
+          ),
+        ),
+      ).toContain("tarefa_chave_externa_imutavel");
+    }
+    expect(estado(TAREFA_CHAVE)).toBe(`${ORG_A}|robo:1`);
+  });
+
+  it("a sessão não adota (não grava chave onde não havia), nem no insert", () => {
+    expect(
+      erroDe(
+        comoSessao(
+          USER_DUAS,
+          `update public.crm_tasks set external_id='sequestrada' where id='${TAREFA_SEM}';`,
+        ),
+      ),
+    ).toContain("tarefa_chave_externa_e_do_servidor");
+    expect(
+      erroDe(
+        comoSessao(
+          USER_DUAS,
+          `insert into public.crm_tasks (organization_id, title, external_id) values ('${ORG_A}', 'x', 'k-sessao');`,
+        ),
+      ),
+    ).toContain("tarefa_chave_externa_e_do_servidor");
+    expect(estado(TAREFA_SEM)).toBe(`${ORG_A}|<nulo>`);
+  });
+
+  it("o service_role também não move nem troca nem limpa chave posta, mas repetir o mesmo valor passa", () => {
+    expect(
+      erroDe(
+        comoServico(
+          `update public.crm_tasks set organization_id='${ORG_B}' where id='${TAREFA_CHAVE}';`,
+        ),
+      ),
+    ).toContain("tarefa_chave_externa_imutavel");
+    expect(
+      erroDe(
+        comoServico(`update public.crm_tasks set external_id='outra' where id='${TAREFA_CHAVE}';`),
+      ),
+    ).toContain("tarefa_chave_externa_imutavel");
+    expect(
+      erroDe(
+        comoServico(`update public.crm_tasks set external_id=null where id='${TAREFA_CHAVE}';`),
+      ),
+    ).toContain("tarefa_chave_externa_imutavel");
+    expect(
+      erroDe(
+        comoServico(`update public.crm_tasks set external_id='robo:1' where id='${TAREFA_CHAVE}';`),
+      ),
+    ).toBeNull();
+    expect(estado(TAREFA_CHAVE)).toBe(`${ORG_A}|robo:1`);
+  });
+
+  it("o service_role grava a chave onde não havia (a adoção do robô)", () => {
+    expect(
+      erroDe(
+        comoServico(
+          `update public.crm_tasks set external_id='robo:2' where id='${TAREFA_SEM}' and external_id is null;`,
+        ),
+      ),
+    ).toBeNull();
+    expect(estado(TAREFA_SEM)).toBe(`${ORG_A}|robo:2`);
+  });
+
+  it("edição normal continua: título, status e até mover tarefa SEM chave de organização", () => {
+    const tarefa = T(4);
+    sql(
+      `insert into public.crm_tasks (id, organization_id, title) values ('${tarefa}', '${ORG_A}', 'solta') on conflict do nothing;`,
+    );
+    expect(
+      erroDe(
+        comoSessao(
+          USER_DUAS,
+          `update public.crm_tasks set title='renomeada', status='done' where id='${TAREFA_CHAVE}';`,
+        ),
+      ),
+    ).toBeNull();
+    expect(
+      um(`select title || '|' || status from public.crm_tasks where id='${TAREFA_CHAVE}'`),
+    ).toBe("renomeada|done");
+    expect(
+      erroDe(
+        comoSessao(
+          USER_DUAS,
+          `update public.crm_tasks set organization_id='${ORG_B}' where id='${tarefa}';`,
+        ),
+      ),
+    ).toBeNull();
+    expect(um(`select organization_id from public.crm_tasks where id='${tarefa}'`)).toBe(ORG_B);
+  });
+
+  it("a RLS segue valendo: quem só é da A não enxerga a tarefa da B", () => {
+    expect(
+      um(
+        comoSessao(
+          USER_SO_A,
+          `select count(*) from public.crm_tasks where organization_id='${ORG_B}';`,
+        ),
+      ),
+    ).toBe("0");
+    expect(TAREFA_SO_A).toBeTruthy();
+  });
+
+  it("anonimização (LGPD) segue: o título é redigido e a chave fica", () => {
+    const contato = "d9d9d9d9-3333-4000-8000-000000000001";
+    const tarefa = T(5);
+    sql(`
+      insert into public.contacts (id, organization_id, display_name) values ('${contato}', '${ORG_A}', 'Fulano D9') on conflict do nothing;
+      insert into public.crm_tasks (id, organization_id, title, description, contact_id, external_id)
+        values ('${tarefa}', '${ORG_A}', 'Ligar para Fulano', 'dado pessoal', '${contato}', 'robo:anon') on conflict do nothing;
+      select public.fn_lgpd_cascade_redact_contact('${ORG_A}', '${contato}', gen_random_uuid());
+    `);
+    expect(
+      um(
+        `select title || '|' || coalesce(description, '<nula>') || '|' || external_id from public.crm_tasks where id='${tarefa}'`,
+      ),
+    ).toBe("Tarefa anonimizada|<nula>|robo:anon");
+  });
+
+  it("cascata: apagar a organização apaga as tarefas com chave, sem esbarrar na trava", () => {
+    const org = "d9d9d9d9-0000-4000-8000-0000000000c1";
+    sql(`
+      insert into public.organizations (id, slug, legal_name, display_name) values ('${org}', 'd9-descartavel', 'D9 desc', 'D9 desc') on conflict do nothing;
+      insert into public.crm_tasks (organization_id, title, external_id) values ('${org}', 'a', 'casc:1'), ('${org}', 'b', 'casc:2');
+    `);
+    expect(erroDe(`delete from public.organizations where id='${org}';`)).toBeNull();
+    expect(um(`select count(*) from public.crm_tasks where organization_id='${org}'`)).toBe("0");
+  });
+});
+
+describe("o limite de composição do gatilho (cxj §4), provado numa transação desfeita", () => {
+  const tarefa = T(20);
+  beforeAll(() => {
+    sql(
+      `insert into public.crm_tasks (id, organization_id, title, external_id) values ('${tarefa}', '${ORG_A}', 'limite', 'limite:1') on conflict do nothing;`,
+    );
+  });
+  const gatilho = (nome: string) => `
+    create function public.d9_limpa_${nome}() returns trigger language plpgsql as $f$ begin new.external_id := null; return new; end $f$;
+    create trigger ${nome} before update of title on public.crm_tasks for each row execute function public.d9_limpa_${nome}();`;
+
+  it("um BEFORE que ordena ANTES do nosso e limpa a chave é barrado (a guarda vê o NEW final)", () => {
+    const erro = erroDe(`begin; ${gatilho("aaa_limpa_antes")}
+      update public.crm_tasks set title='x' where id='${tarefa}'; rollback;`);
+    expect(erro).toContain("tarefa_chave_externa_imutavel");
+  });
+
+  it("⚠️ LIMITE: um BEFORE que ordena DEPOIS do nosso limpa a chave sem a guarda ver — por isso o catálogo o proíbe", () => {
+    expect(
+      um(`begin; ${gatilho("zzz_limpa_depois")}
+        update public.crm_tasks set title='x' where id='${tarefa}';
+        select coalesce(external_id, '<nulo>') from public.crm_tasks where id='${tarefa}';`),
+    ).toBe("<nulo>");
+    // (o `begin` ficou aberto na sessão que acabou: o Postgres desfaz sozinho ao fechar.)
+    expect(um(`select external_id from public.crm_tasks where id='${tarefa}'`)).toBe("limite:1");
+  });
+});
+
+describe("concorrência real: várias conexões, a mesma chave", () => {
+  const psql = (script: string) =>
+    execFileAsync(
+      "docker",
+      ["exec", "-i", container, "psql", "-U", "postgres", "-d", "postgres", "-tA", "-c", script],
+      { encoding: "utf8" },
+    ).then(
+      (r) => ({ ok: true, texto: r.stdout + r.stderr }),
+      (e: { stderr?: string }) => ({ ok: false, texto: String(e.stderr ?? e) }),
+    );
+
+  it("20 inserts simultâneos com a mesma chave: 1 grava, 19 recebem 23505 no índice certo", async () => {
+    const r = await Promise.all(
+      Array.from({ length: 20 }, (_, i) =>
+        psql(
+          `insert into public.crm_tasks (organization_id, title, external_id) values ('${ORG_A}', 'massa-${i}', 'massa:1')`,
+        ),
+      ),
+    );
+    expect(r.filter((x) => x.ok)).toHaveLength(1);
+    const falhas = r.filter((x) => !x.ok);
+    expect(falhas).toHaveLength(19);
+    for (const f of falhas) expect(f.texto).toContain("crm_tasks_org_external_id_unique");
+    expect(
+      um(
+        `select count(*) from public.crm_tasks where organization_id='${ORG_A}' and external_id='massa:1'`,
+      ),
+    ).toBe("1");
+  });
+
+  it("20 adoções simultâneas da mesma tarefa com chaves diferentes: 1 `UPDATE 1`, 19 `UPDATE 0`", async () => {
+    const tarefa = T(30);
+    sql(
+      `insert into public.crm_tasks (id, organization_id, title) values ('${tarefa}', '${ORG_A}', 'sem chave') on conflict do nothing;`,
+    );
+    const r = await Promise.all(
+      Array.from({ length: 20 }, (_, i) =>
+        psql(
+          `with u as (update public.crm_tasks set external_id='adotada:${i}' where id='${tarefa}' and organization_id='${ORG_A}' and external_id is null returning 1) select count(*) from u`,
+        ),
+      ),
+    );
+    const contagens = r.map((x) => x.texto.trim());
+    expect(contagens.filter((c) => c === "1")).toHaveLength(1);
+    expect(contagens.filter((c) => c === "0")).toHaveLength(19);
+  });
+});
+
+describe("tabela com dados e reaplicação (a migração é re-aplicável e não mexe nas linhas)", () => {
+  it("reaplicar 9252 com tarefas (com e sem chave) não muda uma linha nem o catálogo", () => {
+    const migracao = readFileSync(
+      join(
+        __dirname,
+        "../../supabase/migrations/20261111132148_9252_tarefas_chave_externa_unica.sql",
+      ),
+      "utf8",
+    );
+    const foto = () =>
+      um(
+        `select md5(string_agg(id::text || organization_id::text || title || coalesce(external_id, '<n>'), ',' order by id)) || ',' || count(*) from public.crm_tasks`,
+      );
+    const antes = foto();
+    expect(Number(antes.split(",")[1])).toBeGreaterThan(5);
+    expect(erroDe(migracao)).toBeNull();
+    expect(foto()).toBe(antes);
+    expect(
+      um(
+        `select convalidated::text from pg_constraint where conname='crm_tasks_external_id_formato'`,
+      ),
+    ).toBe("true");
+  });
+});
