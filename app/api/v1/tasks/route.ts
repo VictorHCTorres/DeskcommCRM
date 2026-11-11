@@ -41,6 +41,7 @@ import {
   ehConflitoDaChave,
   escaparParaLike,
   MAXIMO_DE_CHAVES_NO_FILTRO,
+  prefixoDeChaveSchema,
 } from "@/lib/tarefas/chave-externa";
 import { buscarDonaDaChave } from "@/lib/tarefas/dona-da-chave";
 import { conferirDemanda } from "@/lib/tarefas/demanda";
@@ -50,6 +51,9 @@ import { PRIORIDADES_DA_TAREFA, SITUACOES_DA_TAREFA, type Tarefa } from "@/lib/t
 import { conferirVinculosDaTarefa } from "@/lib/tarefas/vinculos";
 
 export const dynamic = "force-dynamic";
+
+/** O corte da lista. `meta.cortada` compara a contagem da consulta base com ele. */
+const LIMITE_DA_LISTA = 500;
 
 /**
  * Sessão de navegador OU token de servidor (`dsk_…`), mesma dualidade de
@@ -112,14 +116,10 @@ const listaSchema = z.object({
    * D9 — casamento EXATO por chave externa: `?external_id=a&external_id=b`, até 100. Com este
    * filtro ou o de prefixo a resposta traz só as linhas que casaram, sem a expansão de família.
    */
-  external_id: z
-    .array(z.string().min(1).max(200))
-    .min(1)
-    .max(MAXIMO_DE_CHAVES_NO_FILTRO)
-    .optional(),
+  external_id: z.array(chaveExternaSchema).min(1).max(MAXIMO_DE_CHAVES_NO_FILTRO).optional(),
   // Nos dois filtros a RLS segura o que a SESSÃO vê: `meta.total` na sessão conta só o visível.
   /** D9 — casamento por PREFIXO da chave (com `%`, `_` e `\` tratados como texto). */
-  external_id_prefix: z.string().min(1).max(200).optional(),
+  external_id_prefix: prefixoDeChaveSchema.optional(),
 });
 
 /** O sinal de capacidade (contrato D9 §3) vai em toda resposta, inclusive nas recusas. */
@@ -185,14 +185,23 @@ async function listar(req: NextRequest): Promise<Response> {
   // aceita: o token enxerga todas as tarefas da org (é credencial de org); a
   // visibilidade por pessoa da RLS (`fn_can_view_task`) vale só para a sessão.
   // `count: "exact"` conta as linhas que casam com os filtros ANTES do `limit(500)` e na mesma
-  // consulta (mesmo retrato do banco): `meta.total` é o que quem lê compara com o que recebeu.
+  // consulta (mesmo retrato do banco).
+  //
+  // ⚠️ O QUE `meta.total` E `meta.cortada` CERTIFICAM (cxj D9-3): `total` é a contagem da consulta
+  // BASE, antes da expansão de família. Só nas consultas por chave (`external_id` e
+  // `external_id_prefix`, que não expandem) "recebidas == total" prova que a lista veio completa
+  // para aquele filtro. Na lista da tela, que acrescenta pais e filhas vindos de OUTRAS consultas,
+  // a igualdade pode ser verdadeira com uma tarefa que casa faltando (500 filhas + 1 pai
+  // acrescentado = 501 recebidas contra total 501, e a 501ª que casa ficou de fora): ali quem
+  // decide é `meta.cortada`, verdadeira quando a consulta base casou mais linhas que o limite.
+  // Nenhum robô deve usar a lista expandida para provar que uma tarefa NÃO existe.
   let query = supabase
     .from("crm_tasks")
     .select(COLUNAS, { count: "exact" })
     .eq("organization_id", orgId)
     .order("due_date", { ascending: true, nullsFirst: false })
     .order("created_at", { ascending: false })
-    .limit(500);
+    .limit(LIMITE_DA_LISTA);
 
   if (filtros.status) query = query.eq("status", filtros.status);
   if (filtros.priority) query = query.eq("priority", filtros.priority);
@@ -219,10 +228,11 @@ async function listar(req: NextRequest): Promise<Response> {
     return fail("internal_error", t("Erro ao listar as tarefas."), 500, { requestId });
   }
 
+  const cortada = count > LIMITE_DA_LISTA;
   const encontradas = (data ?? []) as unknown as Tarefa[];
   // Consulta por chave é consulta de ROBÔ: só as linhas que casaram, sem a família da tela.
   if (filtros.external_id || filtros.external_id_prefix) {
-    return ok({ tasks: encontradas }, { requestId, meta: { total: count } });
+    return ok({ tasks: encontradas }, { requestId, meta: { total: count, cortada } });
   }
   // Filtro é aplicado à DEMANDA de trabalho, não pode amputar a família. Se
   // uma filha casa com "Minhas" ou "Em aberto", trazemos a raiz e todas as
@@ -265,7 +275,7 @@ async function listar(req: NextRequest): Promise<Response> {
       ...((filhas ?? []) as unknown as Tarefa[]),
     ].map((tarefa) => [tarefa.id, tarefa]),
   );
-  return ok({ tasks: [...porId.values()] }, { requestId, meta: { total: count } });
+  return ok({ tasks: [...porId.values()] }, { requestId, meta: { total: count, cortada } });
 }
 
 async function criar(req: NextRequest): Promise<Response> {
