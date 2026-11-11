@@ -99,6 +99,13 @@ export const MOTIVOS_DE_EXCLUSAO = [
   "suprimido",
   /** Spec 21: o contato virou pessoal e saiu da campanha com a saída própria. */
   "contato_pessoal",
+  // Prospecção (base `legitimate_interest`): o que a revalidação no envio acha
+  // de novo desde a preparação (`travaDaProspeccao`, em `rodada.ts`).
+  "escreveu_depois_da_preparacao",
+  "etiqueta_de_parada",
+  "atendimento_humano",
+  "contato_mesclado",
+  "destino_mudou",
 ] as const;
 
 export type MotivoDeExclusao = (typeof MOTIVOS_DE_EXCLUSAO)[number];
@@ -116,4 +123,9 @@ export const TEXTO_DA_EXCLUSAO: Record<MotivoDeExclusao, string> = {
   ja_em_campanha: "Já está em outra campanha ainda não concluída",
   suprimido: "Está na lista de exclusão de campanhas",
   contato_pessoal: "Contato marcado como pessoal",
+  escreveu_depois_da_preparacao: "Escreveu depois que a campanha foi preparada",
+  etiqueta_de_parada: "Ganhou uma etiqueta que a campanha exclui",
+  atendimento_humano: "Contato travado para atendimento humano",
+  contato_mesclado: "Contato mesclado em outro",
+  destino_mudou: "O telefone mudou depois da preparação",
 };

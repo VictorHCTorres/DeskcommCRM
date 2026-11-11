@@ -48,19 +48,20 @@ import {
   falhaDoEnvioInteiro,
   fraseDaFalha,
 } from "@/lib/channels/erro-da-plataforma";
+import { feriadosDoBrasilDoAno } from "@/lib/lgpd/holidays-br";
 import { logger } from "@/lib/logger";
 import { OrgNaoOperanteError, STATUS_OPERANTE, ehOperante, statusDaOrgEmbutida } from "@/lib/organizacao/operante";
 
 import { baloesDaCampanha, enviarEmBaloes, pausaEntreBaloes } from "./baloes";
 import { motivoParaExcluir, recusouMarketing, statusDaSaida } from "./elegibilidade";
-import { hashDoEndereco } from "./exclusoes";
+import { hashDoEndereco, normalizarEndereco } from "./exclusoes";
 import type { ConteudoDoEnvio } from "./modelo";
 import { renderizar } from "./renderizador";
 import { RAJADA, rodarEmRajada } from "./rajada";
 import { escolherNumero, poolDaCampanha, type NumeroDisponivel } from "./rodizio";
 import { podeMandarAgora, proximaTentativa, type RitmoDaCampanha } from "./ritmo";
 import { nomeDoContato } from "@/lib/contacts/rotulo-do-contato";
-import { TEXTO_DA_EXCLUSAO } from "./tipos";
+import { TEXTO_DA_EXCLUSAO, type MotivoDeExclusao } from "./tipos";
 
 export interface ResultadoDaRodada {
   /** Mensagens que saíram de fato. */
@@ -111,12 +112,19 @@ interface CampanhaRow {
   split_messages: boolean;
   started_at: string | null;
   paused_at: string | null;
+  /** `legitimate_interest` = prospecção: abordagem fria, apoiada na avaliação de legítimo interesse (LIA). */
+  base_legal: string | null;
+  /** O instante da fotografia da audiência: o que mudou depois, a preparação não viu. */
+  prepared_at: string | null;
+  /** O filtro da audiência (`audiencia.ts`); a rodada só lê `sem_tags`, e só na prospecção. */
+  audience_filter: unknown;
 }
 
 const COLUNAS_DA_CAMPANHA =
   "id, organization_id, channel_session_id, name, message_body, content_version, " +
   "intervalo_segundos, janela_inicio_hora, janela_fim_hora, teto_diario, teto_horario, " +
-  "message_mode, provider_template_name, provider_template_language, velocidade, split_messages, started_at, paused_at";
+  "message_mode, provider_template_name, provider_template_language, velocidade, split_messages, started_at, paused_at, " +
+  "base_legal, prepared_at, audience_filter";
 
 /**
  * O status da organização embutido com `!inner` no `select`, e filtrado na
@@ -267,6 +275,10 @@ interface DestinatarioRow {
     is_personal: boolean;
     is_anonymized: boolean;
     consent: unknown;
+    /** Os três abaixo só decidem na prospecção (`travaDaProspeccao`). */
+    tags: string[] | null;
+    force_human: boolean | null;
+    is_merged_into: string | null;
   } | null;
 }
 
@@ -307,7 +319,8 @@ async function pendentesDaCampanha(
     .from("campaign_recipients")
     .select(
       "id, contact_id, recipient_address, rendered_body, variables, " +
-        "contacts(id, name, display_name, phone_number, is_blocked, is_personal, is_anonymized, consent)",
+        "contacts(id, name, display_name, phone_number, is_blocked, is_personal, is_anonymized, consent, " +
+        "tags, force_human, is_merged_into)",
     )
     .eq("campaign_id", campanhaId)
     .eq("status", "pending")
@@ -320,6 +333,98 @@ async function pendentesDaCampanha(
 /** Velocidade rápida só com modelo: o CHECK da 0711 garante, e o despacho confere de novo. */
 function emRajada(campanha: CampanhaRow): boolean {
   return campanha.velocidade === "rapida" && campanha.message_mode === "template";
+}
+
+/**
+ * Prospecção é a campanha de base `legitimate_interest`: abordagem fria, sem
+ * consentimento prévio, apoiada numa avaliação de legítimo interesse (LIA). Só
+ * a ela valem a revalidação da fotografia, o feriado e os dias próprios do
+ * número; a campanha de consentimento segue como sempre foi.
+ */
+function ehProspeccao(campanha: CampanhaRow): boolean {
+  return campanha.base_legal === "legitimate_interest";
+}
+
+/** As etiquetas que o público exclui (`sem_tags`): na prospecção, são os pedidos de parar. */
+function etiquetasExcluidas(filtro: unknown): readonly string[] {
+  const semTags = (filtro as { sem_tags?: unknown } | null)?.sem_tags;
+  return Array.isArray(semTags) ? semTags.filter((t): t is string => typeof t === "string") : [];
+}
+
+/**
+ * A fotografia da preparação, revalidada no instante do envio — só na prospecção.
+ *
+ * A preparação escolheu quem recebe pelo cadastro daquela hora; o envio sai
+ * horas depois. Nesse meio-tempo a pessoa pode ter respondido ao toque
+ * anterior, ganhado a etiqueta de parada (no contato ou no negócio), ido para
+ * atendimento humano, sido mesclada em outro contato ou trocado de número. A
+ * resposta só fecha o destinatário que JÁ recebeu (`resposta.ts`); este ainda
+ * não recebeu nada desta campanha e, sem esta conferência, recebia o toque
+ * seguinte minutos depois de responder ao anterior.
+ *
+ * Falha FECHADA: sem ler as mensagens ou os negócios, não manda agora. Mensagem
+ * fria que sai sem a conferência não se desfaz.
+ */
+async function travaDaProspeccao(
+  admin: SupabaseClient,
+  campanha: CampanhaRow,
+  alvo: DestinatarioRow,
+): Promise<{ pular: MotivoDeExclusao } | { esperar: "sem_leitura" } | null> {
+  const contato = alvo.contacts;
+  const paradas = etiquetasExcluidas(campanha.audience_filter);
+  const temParada = (tags: readonly string[] | null | undefined) => (tags ?? []).some((t) => paradas.includes(t));
+
+  if (temParada(contato?.tags)) return { pular: "etiqueta_de_parada" };
+  if (contato?.force_human === true) return { pular: "atendimento_humano" };
+  if (contato?.is_merged_into) return { pular: "contato_mesclado" };
+  // O número congelado na preparação contra o de agora: o envio resolve o
+  // destino pelo cadastro ATUAL, e quem a preparação conferiu era o do antigo.
+  const congelado = normalizarEndereco(alvo.recipient_address ?? "");
+  const atual = normalizarEndereco(contato?.phone_number ?? "");
+  if (congelado !== "" && atual !== "" && congelado !== atual) return { pular: "destino_mudou" };
+
+  if (paradas.length > 0) {
+    // A operação marca a parada também no NEGÓCIO; a audiência só olhou o contato.
+    const { data: negocios, error } = await admin
+      .from("crm_leads")
+      .select("tags")
+      .eq("organization_id", campanha.organization_id)
+      .eq("contact_id", alvo.contact_id);
+    if (error) return { esperar: "sem_leitura" };
+    if (((negocios ?? []) as Array<{ tags: string[] | null }>).some((n) => temParada(n.tags))) {
+      return { pular: "etiqueta_de_parada" };
+    }
+  }
+
+  if (campanha.prepared_at) {
+    const { data: entradas, error } = await admin
+      .from("messages")
+      .select("id")
+      .eq("organization_id", campanha.organization_id)
+      .eq("contact_id", alvo.contact_id)
+      .eq("direction", "inbound")
+      .gt("created_at", campanha.prepared_at)
+      .limit(1);
+    if (error) return { esperar: "sem_leitura" };
+    if ((entradas ?? []).length > 0) return { pular: "escreveu_depois_da_preparacao" };
+  }
+  return null;
+}
+
+/** O dia de `agora`, no fuso dado, é um dos feriados nacionais de `lib/lgpd/holidays-br.ts`? */
+function ehFeriadoNacional(agora: Date, fuso: string): boolean {
+  const dia = new Intl.DateTimeFormat("sv-SE", {
+    timeZone: fuso,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(agora);
+  return feriadosDoBrasilDoAno(Number(dia.slice(0, 4))).includes(dia);
+}
+
+/** A meia-noite LOCAL seguinte: 36 h depois da de hoje cai sempre no dia seguinte, com ou sem horário de verão. */
+function meiaNoiteSeguinte(agora: Date, fuso: string): Date {
+  return dayStartInTz(new Date(dayStartInTz(agora, fuso).getTime() + 36 * 3_600_000), fuso);
 }
 
 /**
@@ -450,6 +555,24 @@ async function rodarUmaCampanha(
     }
   }
 
+  // ─── A fotografia da PROSPECÇÃO, revalidada (ver `travaDaProspeccao`) ───
+  if (ehProspeccao(campanha)) {
+    const trava = await travaDaProspeccao(admin, campanha, alvo);
+    if (trava && "esperar" in trava) {
+      // Sem a leitura não há como saber se a pessoa respondeu: não manda agora,
+      // e o destinatário fica pendente para o próximo tique.
+      return { enviadas: 0, pulados: 0, concluidas: 0, detalhe: `trava:${trava.esperar}` };
+    }
+    if (trava) {
+      await admin
+        .from("campaign_recipients")
+        .update({ status: "skipped", eligibility_status: "excluded", exclusion_reason: trava.pular })
+        .eq("id", alvo.id)
+        .eq("status", "pending");
+      return { enviadas: 0, pulados: 1, concluidas: 0, detalhe: `pulado:${trava.pular}` };
+    }
+  }
+
   // ─── O ritmo da CAMPANHA, que vale para ela inteira ───
   //
   // Antes do rodízio de propósito: o intervalo e o teto da campanha somam TODOS
@@ -471,6 +594,19 @@ async function rodarUmaCampanha(
   // campanha, e precisa de um relógio só — três números em fusos diferentes
   // fariam a mesma campanha abrir e fechar a janela três vezes.
   const knobsDoPrincipal = await loadChannelKnobs(pool, campanha.organization_id, campanha.channel_session_id);
+  // Prospecção não sai em feriado nacional. O motor sabe os DIAS da semana do
+  // número (`prospeccaoDias`, logo abaixo), não o calendário: a sobra de quinta
+  // saía no feriado de sexta, na abertura da janela. Espera, não exclui: o
+  // destinatário volta à fila à meia-noite seguinte, no fuso do principal. É
+  // `ritmo:` para não ocupar o número — a campanha de consentimento segue.
+  if (ehProspeccao(campanha) && ehFeriadoNacional(agora, knobsDoPrincipal.knobs.timezone)) {
+    await admin
+      .from("campaign_recipients")
+      .update({ next_attempt_at: meiaNoiteSeguinte(agora, knobsDoPrincipal.knobs.timezone).toISOString() })
+      .eq("id", alvo.id)
+      .eq("status", "pending");
+    return { enviadas: 0, pulados: 0, concluidas: 0, detalhe: "ritmo:feriado" };
+  }
   // ⚠️ O estado do ritmo é lido DEPOIS dos knobs porque precisa do MESMO fuso
   // que a janela usa. Com `setUTCHours`, o "dia" virava 21h no horário de
   // Brasília — DENTRO da janela de envio —, e uma campanha que já tinha batido
@@ -541,6 +677,9 @@ async function rodarUmaCampanha(
       // por volume — quem limita ali é a plataforma (nível de mensagens) —, e o
       // ritmo próprio da campanha (intervalo, janela, tetos) continua valendo.
       banRisk: canalTemRiscoDeBanimento(linha.provider),
+      // Prospecção lê os dias próprios do número (`prospeccaoDias`, 0642), como
+      // o worker de prospecção já faz. Sem isto a campanha fria saía no sábado.
+      prospeccao: ehProspeccao(campanha),
     });
     disponiveis.push({
       sessionId,

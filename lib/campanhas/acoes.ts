@@ -393,23 +393,37 @@ export async function cancelarAcao(
 ): Promise<Desfecho<{ cancelados: number }>> {
   const recusa = recusaDeTransicao(c.status, "cancelled");
   if (recusa) return recusa;
-  const { data } = await admin
-    .from("campaigns")
-    .update({ status: "cancelled", cancelled_at: agora.toISOString() })
-    .eq("id", c.id)
-    .eq("status", c.status)
-    .select("id");
-  if ((data ?? []).length === 0) return conflitoDeCorrida();
 
-  // A campanha já está cancelada quando esta linha roda: a rodada não escolhe
-  // mais esta campanha, então não há corrida com o worker por estes pendentes.
+  // A FILA cai primeiro, e só depois a campanha. A reserva da rodada
+  // (`reservarDestinatario`) confere só o destinatário (`pending` → `sending`),
+  // não a campanha: na ordem inversa, o worker que já tinha escolhido um
+  // pendente o reservava entre as duas escritas, e a mensagem saía DEPOIS do
+  // cancelamento. Assim, quem ainda não foi reservado não sai mais; quem já
+  // estava `sending` está na borda e segue (prometer desfazer o que saiu é mentir).
   const { data: cancelados } = await admin
     .from("campaign_recipients")
     .update({ status: "cancelled", cancelled_at: agora.toISOString() })
     .eq("campaign_id", c.id)
     .in("status", ["pending", "queued"])
     .select("id");
-  return { ok: true, cancelados: (cancelados ?? []).length };
+  const quantos = (cancelados ?? []).length;
+
+  const { data } = await admin
+    .from("campaigns")
+    .update({ status: "cancelled", cancelled_at: agora.toISOString() })
+    .eq("id", c.id)
+    .eq("status", c.status)
+    .select("id");
+  if ((data ?? []).length > 0) return { ok: true, cancelados: quantos };
+
+  // Zero linhas: o estado mudou no meio. Se a rodada concluiu a campanha (viu
+  // vazia a fila que acabou de cair) ou outro pedido já a cancelou, o que se
+  // queria está feito: nada mais sai. Outro estado é corrida de verdade, e a
+  // fila fica cancelada — o lado seguro: quem retomar não manda a ninguém.
+  const { data: depois } = await admin.from("campaigns").select("status").eq("id", c.id).maybeSingle();
+  const estado = (depois as { status?: string } | null)?.status;
+  if (estado === "completed" || estado === "cancelled") return { ok: true, cancelados: quantos };
+  return conflitoDeCorrida();
 }
 
 export async function duplicarAcao(
