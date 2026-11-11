@@ -272,7 +272,7 @@ describe("redrive × campanha de prospecção (F4i)", () => {
     wahaBaseUrl: "http://127.0.0.1:9999", wahaApiKey: "test-key",
     intervalMs: 1, redriveMinAgeMs: 0, redriveBatchSize: 10, redriveSpacingMs: 0,
   };
-  function cenario(metadata: unknown, campanha: () => Promise<{ rows: unknown[] }>) {
+  function cenario(metadata: unknown, campanha: (sql: string, params: unknown[]) => Promise<{ rows: unknown[] }>) {
     const send = vi
       .spyOn(globalThis, "fetch")
       .mockResolvedValue(new Response(JSON.stringify({ id: { id: "3EB0NEW" } }), { status: 200 }));
@@ -283,12 +283,14 @@ describe("redrive × campanha de prospecção (F4i)", () => {
         return { rows: [{
           id: "m-1", organization_id: "org-1", conversation_id: "conv-1", contact_id: "ficha-1", body: "Olá",
           waha_session_name: "default", wa_identity: null, wa_lid: null, phone_number: "+5588999990000",
-          is_group: false, group_chat_id: null, metadata,
+          is_group: false, group_chat_id: null,
+          // Como o banco: a coluna só volta se a consulta a pedir.
+          ...(/\bm\.metadata\b/.test(sql) ? { metadata } : {}),
         }] };
       }
       if (/count\(\*\)/i.test(sql)) return { rows: [{ n: "0" }] };
       if (/select\s+s\.metadata/i.test(sql)) return { rows: [{ metadata: {}, phone_number: "+5588999990000", operante: true }] };
-      if (/from campaigns/i.test(sql)) return campanha();
+      if (/from campaigns/i.test(sql)) return campanha(sql, params);
       return { rows: [] };
     });
     const rodar = () => redriveQueued({ query } as unknown as pg.Pool, CFG, createLogger());
@@ -348,5 +350,26 @@ describe("redrive × campanha de prospecção (F4i)", () => {
     expect(await c.rodar()).toBe(1);
     expect(c.send).toHaveBeenCalledTimes(1);
     expect(c.leuCampanha()).toEqual([]);
+  });
+
+  // O arnês de mutações da v4 (11/11/2026, 18h23) achou estas três propriedades sem teste. Só testes: a produção não mudou.
+
+  it("⭐ o bloqueio tira a linha da fila física (`failed`), e só se ela ainda estiver `queued`: não reescreve o que outro caminho mudou", async () => {
+    const c = cenario(daCampanha, async () => ({ rows: [{ base_legal: "legitimate_interest" }] }));
+    await c.rodar();
+    const sql = c.bloqueio()!.sql.replace(/\s+/g, " ");
+    expect(sql).toMatch(/set status = 'failed', error_code = 'campanha_sem_reenvio'/);
+    expect(sql).toMatch(/where id = \$1 and organization_id = \$2 and status = 'queued'/);
+  });
+
+  it("⭐ a campanha é procurada na organização da mensagem: a de consentimento de OUTRA organização, com o mesmo id, não libera o resgate", async () => {
+    const campanhas = [{ organization_id: "org-2", id: "camp-1", base_legal: "consent" }];
+    const c = cenario(daCampanha, async (sql, params) => {
+      const daOrganizacao = /k\.organization_id\s*=\s*\$1/i.test(sql);
+      return { rows: campanhas.filter((k) => (!daOrganizacao || k.organization_id === params[0]) && k.id === params[1]) };
+    });
+    expect(await c.rodar()).toBe(0);
+    expect(c.send).not.toHaveBeenCalled();
+    expect(c.bloqueio()).toBeDefined();
   });
 });

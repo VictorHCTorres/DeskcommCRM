@@ -36,9 +36,13 @@ const mundo = vi.hoisted(() => ({
   aoAbrir: null as null | (() => void),
   /** O contexto que a rodada entregou ao handler, um por balão (F4g, A3 e A5). */
   ctxs: [] as Array<Record<string, unknown>>,
+  /** O que foi para `logger.error`: o veto que não se grava tem de deixar rastro (F4i, H08). */
+  erros: [] as unknown[][],
 }));
 
-vi.mock("@/lib/logger", () => ({ logger: { info: () => undefined, warn: () => undefined, error: () => undefined } }));
+vi.mock("@/lib/logger", () => ({
+  logger: { info: () => undefined, warn: () => undefined, error: (...args: unknown[]) => void mundo.erros.push(args) },
+}));
 vi.mock("@/lib/agent-engine/db/request-pool", () => ({ getRequestPool: () => ({}) }));
 vi.mock("@/lib/agent-engine/pacing/store", () => ({
   loadChannelKnobs: async () => {
@@ -70,10 +74,10 @@ vi.mock("@/app/api/v1/messages/_handler", () => ({
 
 import { cancelarAcao } from "@/lib/campanhas/acoes";
 import { ESTADOS_DE_QUEM_RECEBEU, aplicarVeto } from "@/lib/campanhas/conferencia";
-import { VetoDaCampanhaError, assertCampaignDelivery } from "@/lib/campanhas/entrega";
+import { VetoDaCampanhaError, assertCampaignDelivery, entregaPeloAtor } from "@/lib/campanhas/entrega";
 import { hashDoEndereco } from "@/lib/campanhas/exclusoes";
 import { desfechoParaARajada } from "@/lib/campanhas/rajada";
-import { reservarDestinatario, rodarUmaRodadaDeCampanha } from "@/lib/campanhas/rodada";
+import { reservarDestinatario, retidaPeloCanal, rodarUmaRodadaDeCampanha } from "@/lib/campanhas/rodada";
 
 type Linha = Record<string, unknown>;
 type Tabelas = Record<string, Linha[]>;
@@ -276,6 +280,7 @@ beforeEach(() => {
   mundo.aoEnviar = null;
   mundo.aoAbrir = null;
   mundo.ctxs.length = 0;
+  mundo.erros.length = 0;
   vi.useRealTimers();
 });
 
@@ -1491,5 +1496,140 @@ describe("6. os contratos da revisão F4i do cxj (11/11/2026): a fila do canal, 
     const semGravar = fakeAdmin(tabelas, { falhas: ["campaign_recipients"] });
     expect(await aplicarVeto(semGravar, "r-ana", { pular: "recusou_marketing" }, QUARTA)).toBe("veto_sem_registro");
     expect(unica(tabelas, "campaign_recipients").status).toBe("sending");
+    // O destinatário fica reservado e nenhuma rodada o pega de novo: sem o log, ninguém saberia por quê.
+    expect(mundo.erros).toEqual([
+      ["[campanha] o veto da conferência final não foi gravado", expect.objectContaining({ destinatario: "r-ana" })],
+    ]);
+  });
+
+  // ─── O que o arnês de mutações da v4 achou sem teste (11/11/2026, 18h23). Só testes: a produção não mudou. ───
+
+  it.each(["sent", "delivered", "read"])(
+    "A1 a mensagem que voltou do handler como %s saiu: conta como enviada, e o destinatário fica enviado",
+    async (estado) => {
+      const { tabelas, admin } = cenario(campanha("legitimate_interest"), pendente("ana"));
+      mundo.aoEnviar = async () => ({ id: "m-saiu", status: estado });
+      const r = await rodarUmaRodadaDeCampanha(admin, QUARTA);
+      expect(unica(tabelas, "campaign_recipients")).toMatchObject({ status: "sent", message_id: "m-saiu" });
+      expect(r).toMatchObject({ enviadas: 1 });
+    },
+  );
+
+  it.each([
+    ["queued, com o motivo gravado pelo handler", { status: "queued", metadata: { queued_reason: "channel_session_not_working" } }, true],
+    ["sent, com o motivo que ficou no metadata", { status: "sent", metadata: { queued_reason: "channel_session_not_working" } }, false],
+    ["queued, com o motivo vazio", { status: "queued", metadata: { queued_reason: "" } }, false],
+    ["queued, com um motivo que não é texto", { status: "queued", metadata: { queued_reason: 1 } }, false],
+    ["queued, sem metadata", { status: "queued", metadata: null }, false],
+  ])("A1 retida pelo canal (certeza de que nada saiu) só com queued e o motivo em texto: %s → %s", (_caso, m, esperado) => {
+    expect(retidaPeloCanal(m)).toBe(esperado);
+  });
+
+  it("A1 tirar da fila física só mexe na mensagem da organização da campanha", async () => {
+    const { tabelas, admin } = cenario(campanha("legitimate_interest"), pendente("ana"));
+    const deOutra: Linha = { id: "m-retida", organization_id: "org-2", status: "queued", metadata: {} };
+    tabelas.messages!.push(deOutra);
+    mundo.aoEnviar = async () => naFila(tabelas, "m-retida");
+    await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(deOutra).toMatchObject({ status: "queued" });
+    expect(tabelas.messages!.find((m) => m.id === "m-retida" && m.organization_id === "org-1")).toMatchObject({
+      status: "failed",
+      error_code: "campanha_sem_reenvio",
+    });
+  });
+
+  it("A1 a mensagem que outro caminho já tirou de queued não é reescrita (compare-and-set)", async () => {
+    const { tabelas, admin } = cenario(campanha("legitimate_interest"), pendente("ana"));
+    mundo.aoEnviar = async () => {
+      const devolvida = naFila(tabelas, "m-retida");
+      Object.assign(mensagemDe(tabelas, "m-retida")!, { status: "sent" });
+      return devolvida;
+    };
+    await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(mensagemDe(tabelas, "m-retida")).toMatchObject({ status: "sent" });
+    expect(mensagemDe(tabelas, "m-retida")!.error_code).toBeUndefined();
+  });
+
+  it.each([
+    ["com o motivo (voltaria à fila)", "channel_session_not_working"],
+    ["sem o motivo (envio incerto)", null],
+  ] as const)(
+    "A1 o destinatário que saiu da reserva enquanto o handler respondia (%s) não é reescrito",
+    async (_caso, motivo) => {
+      const { tabelas, admin } = cenario(campanha("legitimate_interest"), pendente("ana"));
+      mundo.aoEnviar = async () => {
+        Object.assign(unica(tabelas, "campaign_recipients"), { status: "cancelled" });
+        return naFila(tabelas, "m-retida", motivo);
+      };
+      await rodarUmaRodadaDeCampanha(admin, QUARTA);
+      expect(unica(tabelas, "campaign_recipients")).toMatchObject({ status: "cancelled" });
+    },
+  );
+
+  it("A1 o envio incerto conta o número como usado: a outra campanha que divide o vinculado não fala por ele na mesma rodada", async () => {
+    const sessao = (id: string, status: string): Linha => ({ id, organization_id: "org-1", status, daily_message_limit: null });
+    const tabelas: Tabelas = {
+      campaigns: [
+        campanha("legitimate_interest", { id: "camp-a", channel_session_id: "principal-a" }),
+        campanha("legitimate_interest", { id: "camp-b", channel_session_id: "principal-b", started_at: "2026-11-18T11:55:05.000Z" }),
+      ],
+      campaign_recipients: [
+        pendente("ana", ["funil-a"], { campaign_id: "camp-a" }),
+        pendente("bia", ["funil-a"], { campaign_id: "camp-b", recipient_address: "+5588999991111" }, { phone_number: "+5588999991111" }),
+      ],
+      // Os dois principais fora do ar: o único número que fala é o vinculado comum.
+      campaign_channel_sessions: [
+        { organization_id: "org-1", campaign_id: "camp-a", channel_session_id: "vinculado" },
+        { organization_id: "org-1", campaign_id: "camp-b", channel_session_id: "vinculado" },
+      ],
+      channel_sessions: [sessao("principal-a", "STOPPED"), sessao("principal-b", "STOPPED"), sessao("vinculado", "WORKING")],
+      campaign_suppressions: [],
+      messages: [],
+      crm_leads: [],
+      conversations: [],
+    };
+    mundo.aoEnviar = async () => naFila(tabelas, `m-${mundo.envios.length}`, null);
+    await rodarUmaRodadaDeCampanha(fakeAdmin(tabelas), QUARTA);
+    expect(mundo.envios).toEqual(["conv:ana:vinculado"]);
+    expect(tabelas.campaign_recipients!.find((d) => d.id === "r-bia")).toMatchObject({ status: "pending" });
+  });
+
+  it("I03 controle: a passagem numa conversa de OUTRA organização não tira a pessoa desta campanha", async () => {
+    const { admin } = cenario(campanha("legitimate_interest"), pendente("ana"), [], {
+      conversas: [{ ...passagem("ana", "2026-11-18T13:00:00.000Z"), organization_id: "org-2" }],
+    });
+    await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(mundo.envios).toEqual(["conv:ana:chip"]);
+  });
+
+  const doAtor = (organizacao: string, tipo: string) => ({ organization_id: organizacao, actor: { type: tipo, id: "campaign:camp" } });
+
+  it("H07 controle: a entrega montada pelo ator da rodada leva a campanha, o destinatário e o número congelado", async () => {
+    const { admin } = cenario(campanha("legitimate_interest"), pendente("ana"));
+    await expect(entregaPeloAtor(admin, doAtor("org-1", "webhook_source"), { campaign_recipient_id: "r-ana" })).resolves.toEqual({
+      organizationId: "org-1",
+      campaignId: "camp",
+      recipientId: "r-ana",
+      destinoAprovado: APROVADO,
+    });
+  });
+
+  it("H07 só o ator da rodada (webhook_source) monta a entrega: outro tipo de ator com o mesmo id segue sem ela", async () => {
+    const { admin } = cenario(campanha("legitimate_interest"), pendente("ana"));
+    await expect(entregaPeloAtor(admin, doAtor("org-1", "user"), { campaign_recipient_id: "r-ana" })).resolves.toBeNull();
+  });
+
+  it("H07 ⭐ a campanha do ator é procurada só na organização do envio: a de outra organização não se acha, e veta", async () => {
+    const { admin } = cenario(campanha("legitimate_interest"), pendente("ana"));
+    await expect(entregaPeloAtor(admin, doAtor("org-2", "webhook_source"), { campaign_recipient_id: "r-ana" })).rejects.toMatchObject({
+      veto: { esperar: "sem_leitura" },
+    });
+  });
+
+  it("H07 ⭐ o destinatário do metadata tem de ser da campanha do ator: o de outra campanha não se acha, e veta", async () => {
+    const { admin } = cenario(campanha("legitimate_interest"), pendente("ana", ["funil-a"], { campaign_id: "outra" }));
+    await expect(entregaPeloAtor(admin, doAtor("org-1", "webhook_source"), { campaign_recipient_id: "r-ana" })).rejects.toMatchObject({
+      veto: { esperar: "sem_leitura" },
+    });
   });
 });
