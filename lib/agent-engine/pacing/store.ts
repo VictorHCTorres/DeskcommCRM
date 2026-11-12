@@ -221,6 +221,26 @@ export async function loadPacingState(
 }
 
 /**
+ * A última linha do número, a mesma de `loadPacingState` (`lastSentAt`); `null` sem linha nenhuma.
+ *
+ * A cadeia de envio a relê durante a espera do intervalo, sob a trava do número (versão 17, F4v do cxj, V02): a linha
+ * de uma saída ainda em curso está na hora mais tardia dela, e recua quando o transporte volta, ou some, se nada saiu.
+ */
+export async function lerUltimaSaida(
+  db: Queryable,
+  tenantId: string,
+  channelSessionId: string,
+): Promise<Date | null> {
+  const { rows } = await db.query<{ sent_at: Date }>(
+    `select sent_at from pacing_ledger
+      where organization_id = $1 and channel_session_id = $2
+      order by sent_at desc limit 1`,
+    [tenantId, channelSessionId],
+  );
+  return rows[0]?.sent_at ?? null;
+}
+
+/**
  * Registra uma saída do número no limite diário e devolve o id da linha.
  *
  * A cadeia de envio (`runBeforeSend`) grava ANTES do transporte e confirma a linha antes de

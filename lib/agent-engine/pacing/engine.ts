@@ -59,6 +59,13 @@ export interface PacingInput {
    */
   resposta?: boolean;
   /**
+   * A hora de onde a espera do intervalo é contada (versão 17, F4v do cxj, V02): o relógio lido SOB a trava do número,
+   * quando o estado (`state.lastSentAt`) também é lido. `now` é lido pelo chamador antes da fila da trava: contada
+   * dele, a espera cobrava de novo o tempo que o envio já tinha passado na fila, e cada resposta seguinte dobrava a
+   * anterior. Só a espera muda: a janela e o teto seguem em `now`. Omitir = `now`.
+   */
+  agoraDoIntervalo?: Date;
+  /**
    * Esta decisão é para a PROSPECÇÃO fria (primeira abordagem a quem nunca
    * falou com a empresa)?
    *
@@ -131,7 +138,8 @@ export function decidePacing(input: PacingInput): PacingDecision {
   //
   // `prospeccao` prevalece: abordagem fria nunca é resposta (ver o contrato do
   // campo), então um chamador que declare as duas coisas não abre o teto.
-  if (!prospeccao && resposta) return { allow: true, waitMs: throttleWaitMs(now, state, knobs, rng) };
+  const agoraDoIntervalo = input.agoraDoIntervalo ?? now;
+  if (!prospeccao && resposta) return { allow: true, waitMs: throttleWaitMs(agoraDoIntervalo, state, knobs, rng) };
 
   const { ageDays, wCap, effectiveCap } = tetosDoDia(now, knobs, state.numberActivatedAt, crmDailyLimit);
   if (state.sentToday >= effectiveCap) {
@@ -149,7 +157,7 @@ export function decidePacing(input: PacingInput): PacingDecision {
     };
   }
 
-  return { allow: true, waitMs: throttleWaitMs(now, state, knobs, rng) };
+  return { allow: true, waitMs: throttleWaitMs(agoraDoIntervalo, state, knobs, rng) };
 }
 
 /** Espera restante do espaçamento (throttle + jitter) desde o último envio do número. */

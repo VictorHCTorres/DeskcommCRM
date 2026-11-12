@@ -445,6 +445,12 @@ async function stampExternalIdAfterEcho(
  * tempo entre o registro dela e a saída. Entre duas vagas do resgate, o intervalo efetivo passa a ser
  * o do número mais duas folgas (5,2 s no padrão): com o espaçamento de 4 s a 8 s, a mensagem que
  * cair antes disso espera o tique seguinte.
+ *
+ * Versão 17 (F4v do cxj, V01): a margem da reserva cobria o tempo entre o registro da IA e a saída
+ * dela só até 2 s, e em produção esse caminho leva de 2 s a 8 s. Agora o registro da IA também
+ * guarda a hora mais tardia da saída enquanto o transporte está em curso, com a idade conferida no
+ * último passo do handler (`pacing/saida-do-agente.ts`), e vai para a hora em que o transporte voltou
+ * quando ele confirma. A margem da reserva deixou de ser a cobertura desse tempo, e foi mantida.
  */
 export const ATRASO_MAXIMO_DA_VAGA_DO_RESGATE_MS = 2_000;
 

@@ -16,6 +16,16 @@
  * da campanha de consentimento respeita a janela da própria campanha. O U01 e o U02 são os do cxj, copiados da cópia da
  * revisão (`tests/invariants/revisao-cxj-f4u-fronteiras.test.ts`); no U02, o `sleep` registra a espera em vez de lançar.
  * Um controle da 15 mudou de premissa (o lote do resgate no mesmo tique): ver o comentário dele.
+ *
+ * Versão 17 (F4v do cxj, 12/11/2026: V01 e V02). V02: a espera do intervalo era calculada com o `now` de antes da fila
+ * da trava, e a hora gravada era a de depois: cada resposta na fila pagava de novo a espera que já tinha passado (cinco
+ * respostas, 197,2 s, contra 16 s). Agora a espera conta do relógio lido sob a trava. V01: a hora do registro da IA era
+ * lida antes do INSERT e do commit, e o resgate media dela: uma consulta de 3,1 s deixava IA → resgate a 3,9 s, com o
+ * intervalo em 5 s. Agora o registro da IA guarda a hora mais tardia da saída (o instante mais a folga de 10 s)
+ * enquanto o transporte está em curso; a saída mais velha do que a folga não acontece (o registro volta, e o job tenta
+ * de novo); e, confirmado o transporte, a linha recua para a hora em que ele voltou. O V02 é o do cxj, copiado da cópia da
+ * revisão (`tests/invariants/revisao-cxj-f4v-fronteiras.test.ts`); o V01 dele é impossível como escrito (a IA sai a
+ * 3,1 s e o resgate a 7 s, com 5 s de intervalo), e entra adaptado: o resgate espera, e sai no tique que cabe.
  */
 import { randomUUID } from "node:crypto";
 import pg from "pg";
@@ -26,6 +36,7 @@ import {
   redriveQueued,
 } from "@/lib/agent-engine/edge/crm/session-reconciler";
 import { pacingGate, runBeforeSend } from "@/lib/agent-engine/guardrails/before-send";
+import { ATRASO_MAXIMO_DA_SAIDA_DO_AGENTE_MS as FOLGA_DA_IA, tomarSaidaDoAgente } from "@/lib/agent-engine/pacing/saida-do-agente";
 import { recordSend, reservarVaga, undoSend } from "@/lib/agent-engine/pacing/store";
 
 if (!process.env.TEST_DB_CONTAINER) throw new Error("rode via pnpm test:db");
@@ -423,7 +434,10 @@ describe("versão 16 — a vaga guarda a hora mais tardia da saída, e todo emis
     const f = await fixture();
     await recordSend(pool, f.org, f.session, new Date(+agora - 1000));
     // O relógio começa depois da pausa humana (3 s) e anda com a espera; o `now` é o de antes da pausa.
+    // Versão 17 (F4v do cxj, V02): a espera conta do relógio sob a trava. A última saída foi 1 s antes do `now`, e o
+    // relógio já marca 3 s: falta 1 s do intervalo de 5 s, e não os 4 s contados do `now` (que cobravam de novo a pausa).
     let relogio = +agora + 3000;
+    const esperas: number[] = [];
     const resultado = await runBeforeSend({
       pool,
       log,
@@ -438,6 +452,7 @@ describe("versão 16 — a vaga guarda a hora mais tardia da saída, e todo emis
       relogio: () => new Date(relogio),
       rng: () => 0,
       sleep: async (ms: number) => {
+        esperas.push(ms);
         relogio += ms;
       },
       gates: [pacingGate],
@@ -446,7 +461,8 @@ describe("versão 16 — a vaga guarda a hora mais tardia da saída, e todo emis
       send: async () => ({ kind: "sent" as const, idempotencyKey: "ficticio", messageId: "ficticio" }),
     });
     expect(resultado.status).toBe("sent");
-    expect(await ultimaVaga(f)).toBe(+agora + 3000 + 4000);
+    expect(esperas).toEqual([1000]);
+    expect(await ultimaVaga(f)).toBe(+agora + 3000 + 1000);
   });
 
   it("IA → resgate: o resgate seguinte mede o intervalo (mais a folga) da hora em que a IA saiu da espera", async () => {
@@ -529,5 +545,567 @@ describe("versão 16 — a vaga guarda a hora mais tardia da saída, e todo emis
     expect(transporte).not.toHaveBeenCalled();
     expect(await vagasDoNumero(f)).toBe(59);
     expect((await pool.query("select status from messages where id=$1", [id])).rows[0].status).toBe("queued");
+  });
+});
+
+const saiu = () => ({ kind: "sent" as const, idempotencyKey: "ficticio", messageId: "ficticio" });
+const soma = (ms: number[]) => ms.reduce((a, b) => a + b, 0);
+/** A resposta da IA pela cadeia de verdade, com tudo injetável (o `responder` do cxj na F4v). */
+function responderCom(f: Fixture, extras: Partial<Parameters<typeof runBeforeSend>[0]> = {}) {
+  return runBeforeSend({
+    pool,
+    log,
+    tenantId: f.org,
+    leadId: f.contact,
+    jobId: f.job,
+    channelSessionId: f.session,
+    body: "Uma resposta de texto.",
+    optedOutThisTurn: false,
+    crmDailyLimit: 60,
+    now: agora,
+    relogio: () => agora,
+    rng: () => 0,
+    sleep: async () => {},
+    gates: [pacingGate],
+    enforceSpinning: false,
+    resposta: true,
+    send: async () => saiu(),
+    ...extras,
+  });
+}
+/** A fachada do cxj (F4v, V01): o banco é o de verdade; `depois` roda logo depois do INSERT do registro da saída. */
+function comInsertDoRegistro(depois: () => void) {
+  return {
+    query: pool.query.bind(pool),
+    connect: async () => {
+      const db = await pool.connect();
+      const query = db.query.bind(db);
+      return {
+        query: async (...args: unknown[]) => {
+          const r = await Reflect.apply(query, db, args);
+          if (String(args[0]).includes("insert into pacing_ledger")) depois();
+          return r;
+        },
+        release: db.release.bind(db),
+      };
+    },
+  } as unknown as pg.Pool;
+}
+
+describe("versão 17 — a espera conta do relógio sob a trava, e a saída da IA tem hora mais tardia (F4v do cxj)", () => {
+  // O V02 do cxj, como ele o escreveu.
+  it("V02 ⭐ (cxj) cinco respostas concorrentes gastam só uma folga e cinco intervalos", async () => {
+    const f = await fixture();
+    await pool.query("update channel_knobs set throttle_ms=1200 where channel_session_id=$1", [f.session]);
+    await reservarVaga(pool, f.org, f.session, agora, { limite: null, desde: agora, vagas: 1, intervaloMs: 0, folgaMs: 10000 });
+    let relogio = +agora;
+    const esperas: number[] = [], saidas: number[] = [];
+    const entradas: Fixture[] = [];
+    for (let i = 0; i < 5; i++) {
+      const contact = randomUUID(), job = randomUUID();
+      await pool.query("insert into contacts(id,organization_id,name) values($1,$2,'Fictício')", [contact, f.org]);
+      await pool.query("insert into job_queue(id,organization_id,contact_id,kind) values($1,$2,$3,'inbound_turn')", [job, f.org, contact]);
+      entradas.push({ ...f, contact, job });
+    }
+    const resultados = await Promise.all(
+      entradas.map((entrada) =>
+        responderCom(entrada, {
+          relogio: () => new Date(relogio),
+          sleep: async (ms) => {
+            esperas.push(ms);
+            relogio += ms;
+          },
+          send: async () => {
+            saidas.push(relogio);
+            return saiu();
+          },
+        }),
+      ),
+    );
+    expect(resultados.every((r) => r.status === "sent")).toBe(true);
+    expect(saidas).toHaveLength(5);
+    expect(relogio - +agora, `esperas: ${esperas.join(", ")} ms`).toBeLessThanOrEqual(16000);
+    // E nenhuma saída a menos do intervalo da anterior.
+    for (let i = 1; i < saidas.length; i++) expect(saidas[i]! - saidas[i - 1]!).toBeGreaterThanOrEqual(1200);
+  });
+
+  it("V02: a espera do intervalo conta do relógio lido sob a trava, e não do `now` de antes da fila", async () => {
+    const f = await fixture();
+    await recordSend(pool, f.org, f.session, new Date(+agora + 1000), { resposta: true });
+    // O job leu o `now` às 14h e passou 3 s na fila da trava: sob a trava, o relógio marca 3 s.
+    let relogio = +agora + 3000;
+    const esperas: number[] = [];
+    const r = await responderCom(f, {
+      relogio: () => new Date(relogio),
+      sleep: async (ms) => {
+        esperas.push(ms);
+        relogio += ms;
+      },
+    });
+    expect(r.status).toBe("sent");
+    // A última saída foi a 1 s, e o intervalo é de 5 s: faltam 3 s, e não os 6 s contados do `now`.
+    expect(esperas).toEqual([3000]);
+    expect(await ultimaVaga(f)).toBe(+agora + 6000);
+  });
+
+  it("V01: com o transporte da IA em curso, a linha guarda a hora mais tardia da saída; confirmado, a hora em que ele voltou", async () => {
+    const f = await fixture();
+    let durante: number | null = null;
+    const r = await responderCom(f, {
+      send: async () => {
+        durante = await ultimaVaga(f);
+        return saiu();
+      },
+    });
+    expect(r.status).toBe("sent");
+    expect(durante).toBe(+agora + FOLGA_DA_IA);
+    expect(await ultimaVaga(f)).toBe(+agora);
+    expect(await vagasDoNumero(f)).toBe(60);
+    // Só a linha desta saída muda de hora: as outras do número ficam onde estavam.
+    const maisAntiga = await pool.query("select min(sent_at) instante from pacing_ledger where channel_session_id=$1", [f.session]);
+    expect(+maisAntiga.rows[0].instante).toBe(+agora - 3600000);
+  });
+
+  it("V01 ⭐ a saída da IA mais velha do que a folga não acontece: o transporte não é chamado, e o registro volta", async () => {
+    const f = await fixture();
+    let relogio = +agora;
+    const send = vi.fn(async () => saiu());
+    const r = await responderCom(f, {
+      pool: comInsertDoRegistro(() => {
+        relogio += FOLGA_DA_IA + 1;
+      }),
+      relogio: () => new Date(relogio),
+      send,
+    });
+    // O desfecho é o do transporte indisponível: o job tenta de novo pela fila, com a mesma chave.
+    expect(r).toMatchObject({ status: "sent", outcome: { kind: "unavailable", reason: "saida_do_agente_vencida" } });
+    expect(send).not.toHaveBeenCalled();
+    expect(await vagasDoNumero(f)).toBe(59);
+    // A tentativa que não saiu fica na auditoria da cadeia, sem veto.
+    const auditoria = await pool.query("select vetoed_code from before_send_traces where job_id=$1", [f.job]);
+    expect(auditoria.rows).toEqual([{ vetoed_code: null }]);
+  });
+
+  it("controle do V01: no limite da folga, a resposta sai, e a linha fica na hora em que saiu", async () => {
+    const f = await fixture();
+    let relogio = +agora;
+    const r = await responderCom(f, {
+      pool: comInsertDoRegistro(() => {
+        relogio += FOLGA_DA_IA;
+      }),
+      relogio: () => new Date(relogio),
+    });
+    expect(r.status).toBe("sent");
+    expect(await ultimaVaga(f)).toBe(+agora + FOLGA_DA_IA);
+    expect(await vagasDoNumero(f)).toBe(60);
+  });
+
+  // O V01 do cxj, adaptado: como escrito, é impossível (a IA sai `atraso` depois do registro, e o tique dele cai a menos
+  // do intervalo dessa saída). O que se cobra é o que ele mede: a distância entre as duas saídas.
+  it.each([
+    [5000, 3100],
+    [1200, 2500],
+  ])("V01 ⭐ (cxj, adaptado) intervalo %i ms e demora %i ms no INSERT: IA → resgate não fica a menos do intervalo", async (intervalo, atraso) => {
+    const f = await fixture();
+    await enfileirar(f);
+    await pool.query("update channel_knobs set throttle_ms=$2 where channel_session_id=$1", [f.session, intervalo]);
+    let relogio = +agora;
+    const saidas: number[] = [];
+    await responderCom(f, {
+      pool: comInsertDoRegistro(() => {
+        relogio += atraso;
+      }),
+      relogio: () => new Date(relogio),
+      send: async () => {
+        saidas.push(relogio);
+        return saiu();
+      },
+    });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      saidas.push(relogio);
+      return new Response("{}", { status: 200 });
+    });
+    // O tique do cxj: o intervalo mais a folga do resgate depois do REGISTRO. A IA saiu `atraso` depois, e o resgate espera.
+    relogio = +agora + intervalo + FOLGA;
+    expect(await redriveQueued(pool, cfg, log, undefined, () => new Date(relogio))).toBe(0);
+    // O intervalo mais a folga do resgate, contados da saída de verdade: sai.
+    relogio = +agora + atraso + intervalo + FOLGA;
+    expect(await redriveQueued(pool, cfg, log, undefined, () => new Date(relogio))).toBe(1);
+    expect(saidas).toHaveLength(2);
+    expect(saidas[1]! - saidas[0]!, `distância medida: ${saidas[1]! - saidas[0]!} ms`).toBeGreaterThanOrEqual(intervalo);
+  });
+
+  it("V01: IA → IA em sequência, com a 1ª lenta: a 2ª mede o intervalo da hora em que a 1ª saiu", async () => {
+    const f = await fixture();
+    let relogio = +agora, lento = true;
+    const saidas: number[] = [];
+    const opts = {
+      pool: comInsertDoRegistro(() => {
+        if (lento) relogio += 3100;
+      }),
+      relogio: () => new Date(relogio),
+      sleep: async (ms: number) => {
+        relogio += ms;
+      },
+      send: async () => {
+        saidas.push(relogio);
+        return saiu();
+      },
+    };
+    await responderCom(f, opts);
+    lento = false;
+    await responderCom(f, { ...opts, now: new Date(relogio) });
+    expect(saidas).toHaveLength(2);
+    expect(saidas[1]! - saidas[0]!, `distância medida: ${saidas[1]! - saidas[0]!} ms`).toBeGreaterThanOrEqual(5000);
+  });
+
+  it("V01: IA → IA em paralelo: com a 1ª ainda no transporte, a 2ª espera o intervalo a partir da hora mais tardia dela", async () => {
+    const f = await fixture();
+    const entrou = portao(), soltar = portao();
+    const esperas: number[] = [];
+    const primeira = responderCom(f, {
+      send: async () => {
+        entrou.abrir();
+        await soltar.espera;
+        return saiu();
+      },
+    });
+    try {
+      await entrou.espera;
+      const segunda = await responderCom(f, {
+        sleep: async (ms) => {
+          esperas.push(ms);
+        },
+      });
+      expect(segunda.status).toBe("sent");
+    } finally {
+      soltar.abrir();
+      await primeira;
+    }
+    // A 1ª não voltou durante a espera: a 2ª espera a hora mais tardia dela mais o intervalo, em fatias.
+    expect(soma(esperas)).toBe(FOLGA_DA_IA + 5000);
+    // Em fatias de 500 ms, com a linha relida depois de cada uma: 30 fatias, mesmo com o relógio parado.
+    expect(esperas).toEqual(Array.from({ length: 30 }, () => 500));
+    // A 2ª saiu na hora da espera dela, e a linha não recua para antes do registro.
+    expect(await ultimaVaga(f)).toBe(+agora + FOLGA_DA_IA + 5000);
+  });
+
+  it("o transporte que lança deixa a linha na hora mais tardia: a saída é incerta, e conta a mais, nunca a menos", async () => {
+    const f = await fixture();
+    const erro = await responderCom(f, {
+      send: async () => {
+        throw new Error("transporte fora");
+      },
+    }).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect((erro as Error).message).toBe("transporte fora");
+    expect(await vagasDoNumero(f)).toBe(60);
+    expect(await ultimaVaga(f)).toBe(+agora + FOLGA_DA_IA);
+  });
+
+  it("se o ajuste da linha falhar, a resposta já saiu: a linha fica na hora mais tardia, e o log avisa", async () => {
+    const f = await fixture();
+    const erros = vi.fn();
+    const query = pool.query.bind(pool);
+    const fachada = {
+      query: async (...args: unknown[]) => {
+        if (String(args[0]).includes("update pacing_ledger")) throw new Error("banco indisponível");
+        return Reflect.apply(query, pool, args);
+      },
+      connect: pool.connect.bind(pool),
+    } as unknown as pg.Pool;
+    const r = await responderCom(f, { pool: fachada, log: { ...log, error: erros } });
+    expect(r.status).toBe("sent");
+    expect(await ultimaVaga(f)).toBe(+agora + FOLGA_DA_IA);
+    expect(erros).toHaveBeenCalledWith(
+      expect.stringContaining("hora mais tardia"),
+      expect.objectContaining({ channel_session_id: f.session }),
+    );
+  });
+
+  it("o transporte roda com a saída no escopo: a 1ª mensagem física a toma, a 2ª não, e fora dele não há saída", async () => {
+    const f = await fixture();
+    let primeira: ReturnType<typeof tomarSaidaDoAgente> | undefined, segunda: ReturnType<typeof tomarSaidaDoAgente> | undefined;
+    await responderCom(f, {
+      send: async () => {
+        primeira = tomarSaidaDoAgente();
+        segunda = tomarSaidaDoAgente();
+        return saiu();
+      },
+    });
+    expect(primeira?.instante).toEqual(agora);
+    expect(primeira?.folgaMs).toBe(FOLGA_DA_IA);
+    expect(segunda).toBeNull();
+    expect(tomarSaidaDoAgente()).toBeNull();
+  });
+
+  it("controle: sem intervalo no número, o registro da IA fica no instante, e a demora não barra a resposta", async () => {
+    const f = await fixture();
+    await pool.query("update channel_knobs set throttle_ms=0 where channel_session_id=$1", [f.session]);
+    let relogio = +agora, durante: number | null = null, noEscopo: unknown = "não lido";
+    const r = await responderCom(f, {
+      pool: comInsertDoRegistro(() => {
+        relogio += 60_000;
+      }),
+      relogio: () => new Date(relogio),
+      send: async () => {
+        durante = await ultimaVaga(f);
+        noEscopo = tomarSaidaDoAgente();
+        return saiu();
+      },
+    });
+    expect(r.status).toBe("sent");
+    expect(durante).toBe(+agora);
+    expect(noEscopo).toBeNull();
+    expect(await ultimaVaga(f)).toBe(+agora);
+  });
+
+  it("controle: sem o relógio não há como medir a idade: o registro fica em `now` mais a espera, sem folga", async () => {
+    const f = await fixture();
+    let durante: number | null = null, noEscopo: unknown = "não lido";
+    const r = await responderCom(f, {
+      relogio: undefined,
+      send: async () => {
+        durante = await ultimaVaga(f);
+        noEscopo = tomarSaidaDoAgente();
+        return saiu();
+      },
+    });
+    expect(r.status).toBe("sent");
+    expect(durante).toBe(+agora);
+    expect(noEscopo).toBeNull();
+  });
+
+  it("a resposta que não saiu (`queued`) devolve o registro inteiro, mesmo gravado na hora mais tardia", async () => {
+    const f = await fixture();
+    const r = await responderCom(f, {
+      send: async () => ({ kind: "queued" as const, idempotencyKey: "ficticio", messageId: null }),
+    });
+    expect(r.status).toBe("sent");
+    expect(await vagasDoNumero(f)).toBe(59);
+  });
+
+  it("V01: o transporte que volta depois da hora mais tardia leva a linha para a hora em que voltou, e a resposta seguinte mede dela", async () => {
+    const f = await fixture();
+    let relogio = +agora;
+    const esperas: number[] = [];
+    const opts = {
+      relogio: () => new Date(relogio),
+      sleep: async (ms: number) => {
+        esperas.push(ms);
+        relogio += ms;
+      },
+    };
+    const r = await responderCom(f, {
+      ...opts,
+      send: async () => {
+        // A chamada ao provedor levou 30 s, e a mensagem pode ter saído no fim dela.
+        relogio += 30_000;
+        return saiu();
+      },
+    });
+    expect(r.status).toBe("sent");
+    // A linha não fica antes da saída de verdade: vai para a hora em que o transporte voltou, depois da hora mais tardia.
+    expect(await ultimaVaga(f)).toBe(+agora + 30_000);
+    expect(await vagasDoNumero(f)).toBe(60);
+    // A resposta seguinte chega 1 s depois e espera o resto do intervalo, contado dessa hora.
+    relogio += 1000;
+    await responderCom(f, { ...opts, now: new Date(relogio) });
+    expect(esperas).toEqual([4000]);
+  });
+
+  it("o relógio que recua durante o transporte não leva a linha para antes do instante do registro", async () => {
+    const f = await fixture();
+    let relogio = +agora;
+    const r = await responderCom(f, {
+      relogio: () => new Date(relogio),
+      send: async () => {
+        relogio -= 5000;
+        return saiu();
+      },
+    });
+    expect(r.status).toBe("sent");
+    expect(await ultimaVaga(f)).toBe(+agora);
+  });
+
+  it("V02: a hora do registro é a do relógio sob a trava mais a espera, mesmo que o relógio não ande durante a espera", async () => {
+    const f = await fixture();
+    await recordSend(pool, f.org, f.session, new Date(+agora + 1000), { resposta: true });
+    const esperas: number[] = [];
+    let durante: number | null = null;
+    const r = await responderCom(f, {
+      // Sob a trava, o relógio marca 3 s, e fica parado: quem leva o instante à hora da saída é a espera.
+      relogio: () => new Date(+agora + 3000),
+      sleep: async (ms) => {
+        esperas.push(ms);
+      },
+      send: async () => {
+        durante = await ultimaVaga(f);
+        return saiu();
+      },
+    });
+    expect(r.status).toBe("sent");
+    expect(esperas).toEqual([3000]);
+    expect(durante).toBe(+agora + 6000 + FOLGA_DA_IA);
+    expect(await ultimaVaga(f)).toBe(+agora + 6000);
+  });
+
+  it("controle: em canal sem risco de banimento não há intervalo a medir: o registro fica no instante, e a demora não barra a resposta", async () => {
+    const f = await fixture();
+    await pool.query("update channel_sessions set provider='meta_cloud', meta_phone_number_id=$1::text where id=$1", [f.session]);
+    let relogio = +agora, durante: number | null = null, noEscopo: unknown = "não lido";
+    const r = await responderCom(f, {
+      pool: comInsertDoRegistro(() => {
+        relogio += 60_000;
+      }),
+      relogio: () => new Date(relogio),
+      send: async () => {
+        durante = await ultimaVaga(f);
+        noEscopo = tomarSaidaDoAgente();
+        return saiu();
+      },
+    });
+    expect(r.status).toBe("sent");
+    expect(durante).toBe(+agora);
+    expect(noEscopo).toBeNull();
+    expect(await ultimaVaga(f)).toBe(+agora);
+  });
+
+  it("V02 ⭐ a resposta que encontra outra em curso acompanha a linha: sai o intervalo depois de o transporte da anterior voltar, e não a folga inteira", async () => {
+    const f = await fixture();
+    const entrou = portao(), soltar = portao();
+    let relogio = +agora;
+    const esperas: number[] = [];
+    const primeira = responderCom(f, {
+      relogio: () => new Date(relogio),
+      send: async () => {
+        entrou.abrir();
+        await soltar.espera;
+        return saiu();
+      },
+    });
+    try {
+      await entrou.espera;
+      // A 2ª mede com a 1ª ainda no transporte: a linha dela está na hora mais tardia (10 s).
+      const segunda = await responderCom(f, {
+        relogio: () => new Date(relogio),
+        sleep: async (ms) => {
+          esperas.push(ms);
+          relogio += ms;
+          // Na 3ª fatia (1,5 s), o transporte da 1ª volta, e a linha dela recua para essa hora.
+          if (esperas.length === 3) {
+            soltar.abrir();
+            await primeira;
+          }
+        },
+      });
+      expect(segunda.status).toBe("sent");
+    } finally {
+      soltar.abrir();
+      await primeira;
+    }
+    // 1,5 s até a 1ª voltar, e os 5 s do intervalo contados daí: 6,5 s, e não os 15 s da hora mais tardia mais o intervalo.
+    expect(soma(esperas)).toBe(6500);
+    expect(await ultimaVaga(f)).toBe(+agora + 6500);
+    expect(await vagasDoNumero(f)).toBe(61);
+  });
+
+  it("V02: se a linha em curso avança durante a espera (o transporte voltou depois da hora mais tardia), o intervalo conta da hora nova", async () => {
+    const f = await fixture();
+    const entrou = portao(), soltar = portao();
+    let relogio = +agora;
+    const esperas: number[] = [];
+    const primeira = responderCom(f, {
+      relogio: () => new Date(relogio),
+      send: async () => {
+        entrou.abrir();
+        await soltar.espera;
+        return saiu();
+      },
+    });
+    try {
+      await entrou.espera;
+      const segunda = await responderCom(f, {
+        relogio: () => new Date(relogio),
+        sleep: async (ms) => {
+          esperas.push(ms);
+          relogio += ms;
+          // Aos 12 s, 2 s depois da hora mais tardia, o transporte da 1ª volta: a linha dela avança para os 12 s.
+          if (esperas.length === 24) {
+            soltar.abrir();
+            await primeira;
+          }
+        },
+      });
+      expect(segunda.status).toBe("sent");
+    } finally {
+      soltar.abrir();
+      await primeira;
+    }
+    // A 2ª sairia aos 15 s (a hora mais tardia mais o intervalo); com a linha nos 12 s, sai aos 17 s.
+    expect(soma(esperas)).toBe(17_000);
+    expect(await ultimaVaga(f)).toBe(+agora + 17_000);
+  });
+
+  it("V02: a vaga da campanha devolvida durante a espera libera a resposta", async () => {
+    const f = await fixture();
+    const daCampanha = { limite: null, desde: agora, vagas: 1, intervaloMs: 0, folgaMs: 10_000 };
+    expect(await reservarVaga(pool, f.org, f.session, agora, daCampanha)).toBe("reservada");
+    let relogio = +agora;
+    const esperas: number[] = [];
+    const r = await responderCom(f, {
+      relogio: () => new Date(relogio),
+      sleep: async (ms) => {
+        esperas.push(ms);
+        relogio += ms;
+        // Na 2ª fatia (1 s), a campanha devolve a vaga: o balão não saiu.
+        if (esperas.length === 2) await undoSend(pool, f.org, f.session, agora, { folgaMs: 10_000 });
+      },
+    });
+    expect(r.status).toBe("sent");
+    // Sem a vaga, a última saída do número é a de uma hora atrás: a resposta sai na hora, 1 s depois de começar a esperar.
+    expect(soma(esperas)).toBe(1000);
+    expect(await ultimaVaga(f)).toBe(+agora + 1000);
+    expect(await vagasDoNumero(f)).toBe(60);
+  });
+
+  it("V02: se a vaga devolvida era a única linha do número, a resposta sai na hora: não há saída anterior a respeitar", async () => {
+    const f = await fixture();
+    await pool.query("delete from pacing_ledger where channel_session_id=$1", [f.session]);
+    const daCampanha = { limite: null, desde: agora, vagas: 1, intervaloMs: 0, folgaMs: 10_000 };
+    expect(await reservarVaga(pool, f.org, f.session, agora, daCampanha)).toBe("reservada");
+    let relogio = +agora;
+    const esperas: number[] = [];
+    const r = await responderCom(f, {
+      relogio: () => new Date(relogio),
+      sleep: async (ms) => {
+        esperas.push(ms);
+        relogio += ms;
+        // Na 2ª fatia (1 s), a campanha devolve a vaga, e o número fica sem linha nenhuma.
+        if (esperas.length === 2) await undoSend(pool, f.org, f.session, agora, { folgaMs: 10_000 });
+      },
+    });
+    expect(r.status).toBe("sent");
+    expect(soma(esperas)).toBe(1000);
+    expect(await ultimaVaga(f)).toBe(+agora + 1000);
+    expect(await vagasDoNumero(f)).toBe(1);
+  });
+
+  it("controle: sem o relógio, a espera do intervalo é uma só, mesmo com a última linha no futuro", async () => {
+    const f = await fixture();
+    const daCampanha = { limite: null, desde: agora, vagas: 1, intervaloMs: 0, folgaMs: 10_000 };
+    expect(await reservarVaga(pool, f.org, f.session, agora, daCampanha)).toBe("reservada");
+    const esperas: number[] = [];
+    const r = await responderCom(f, {
+      relogio: undefined,
+      sleep: async (ms) => {
+        esperas.push(ms);
+      },
+    });
+    expect(r.status).toBe("sent");
+    expect(esperas).toEqual([15_000]);
+    expect(await ultimaVaga(f)).toBe(+agora + 15_000);
   });
 });

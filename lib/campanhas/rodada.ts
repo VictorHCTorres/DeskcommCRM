@@ -395,6 +395,10 @@ function meiaNoiteSeguinte(agora: Date, fuso: string): Date {
  * intervalo dela. O 1º balão segue reservando com o intervalo mais a folga: a cadeia da IA grava o registro antes do
  * transporte, e a margem cobre o tempo entre o registro dela e a saída. Entre duas vagas da campanha, o intervalo
  * efetivo passa a ser o do número mais duas folgas (21,2 s no padrão), ainda abaixo do minuto do envio gradual.
+ *
+ * Versão 17 (F4v do cxj, V01): o registro da IA também passou a guardar a hora mais tardia da saída enquanto o
+ * transporte está em curso, com a idade conferida no último passo do handler (`pacing/saida-do-agente.ts`); a margem da
+ * reserva deixou de ser a única cobertura desse tempo, e foi mantida.
  */
 export const ATRASO_MAXIMO_DA_VAGA_DA_CAMPANHA_MS = 10_000;
 

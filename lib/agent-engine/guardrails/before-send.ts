@@ -59,7 +59,15 @@ import type { Queryable } from '../queue/queue';
 import { decidePacing } from '../pacing/engine';
 import type { PacingState } from '../pacing/engine';
 import type { PacingKnobs } from '../pacing/defaults';
-import { loadChannelKnobs, loadPacingState, recordSend } from '../pacing/store';
+import { lerUltimaSaida, loadChannelKnobs, loadPacingState, recordSend } from '../pacing/store';
+import {
+  ATRASO_MAXIMO_DA_SAIDA_DO_AGENTE_MS,
+  MOTIVO_DA_SAIDA_VENCIDA,
+  SaidaDoAgenteVencidaError,
+  comSaidaDoAgente,
+  conferirSaidaDoAgente,
+  novaSaidaDoAgente,
+} from '../pacing/saida-do-agente';
 import { decideSpinning } from '../spinning/engine';
 import type { RecentCopy } from '../spinning/engine';
 import { loadRecentCopies, loadSpinningKnobs, recordCopy } from '../spinning/store';
@@ -172,6 +180,11 @@ export interface GateContext {
      * só distingue resposta de retomada por follow-up.
      */
     resposta?: boolean;
+    /**
+     * O relógio lido sob a trava do número, de onde a espera do intervalo é contada (versão 17, F4v do cxj, V02): ver
+     * `PacingInput.agoraDoIntervalo`. Omitir = `now`.
+     */
+    agora?: Date;
   };
   spinning: {
     knobs: SpinningKnobs;
@@ -1106,6 +1119,7 @@ export const pacingGate: Gate = {
       banRisk,
       resposta: ctx.pacing.resposta,
       rng: ctx.pacing.rng,
+      ...(ctx.pacing.agora !== undefined ? { agoraDoIntervalo: ctx.pacing.agora } : {}),
     });
     if (!decision.allow) {
       return {
@@ -1369,8 +1383,14 @@ export interface RunBeforeSendArgs {
    * intervalo. `now` é lido pelo chamador antes da pausa humana, da classificação, da espera pela trava e da espera
    * do intervalo: gravado, ele deixava o registro segundos antes da saída de verdade, e o envio seguinte do número
    * (o resgate, a campanha, outra resposta) saía a menos do intervalo desta. O registro leva o maior entre o relógio e
-   * `now` mais a espera do intervalo; sem o relógio, `now` mais a espera. A decisão (a janela, o teto, a espera)
-   * segue contada de `now`: lido antes, ele só alonga a espera.
+   * `now` mais a espera do intervalo; sem o relógio, `now` mais a espera. A janela e o teto seguem contados de `now`.
+   *
+   * Versão 17 (F4v do cxj). V02: a espera do intervalo conta do relógio lido sob a trava, e não mais de `now`: lido
+   * antes da fila da trava, `now` cobrava de novo o tempo que o envio já tinha esperado. Com a última linha do número
+   * no futuro (uma saída ainda em curso), a espera vai em fatias e relê a linha (`esperarOIntervalo`). V01: com o
+   * relógio, e com intervalo no número, o registro guarda a hora mais tardia da saída, e a idade dela é conferida
+   * antes do transporte (`pacing/saida-do-agente.ts`). Sem o relógio não há como medir a idade nem acompanhar a linha:
+   * o registro fica sem a folga, e a espera é uma só, como antes.
    */
   relogio?: () => Date;
   /** injeções de teste (jitter determinístico + espera sem relógio real). */
@@ -1772,6 +1792,9 @@ export async function runBeforeSend(args: RunBeforeSendArgs): Promise<BeforeSend
       args.channelSessionId,
     );
 
+    // O relógio sob a trava, lido depois de todo o estado (versão 17, F4v do cxj, V02): a espera do intervalo conta
+    // dele. O `now` do chamador é de antes da fila da trava.
+    const agoraSobATrava = args.relogio ? args.relogio() : args.now;
     const ctx: GateContext = {
       now: args.now,
       body: bodyDoModelo,
@@ -1787,6 +1810,7 @@ export async function runBeforeSend(args: RunBeforeSendArgs): Promise<BeforeSend
         crmDailyLimit,
         rng: args.rng,
         ...(args.resposta !== undefined ? { resposta: args.resposta } : {}),
+        agora: agoraSobATrava,
       },
       spinning: { knobs: spinningKnobs, window },
       ...(args.enforceSpinning === false ? { spinningEnforced: false as const } : {}),
@@ -1852,8 +1876,9 @@ export async function runBeforeSend(args: RunBeforeSendArgs): Promise<BeforeSend
       transacaoFechada = true;
       decisao = { tipo: 'veto', trace, veto };
     } else {
-      // Throttle: espera o gap restante (bounded pelos knobs) antes do envio.
-      if (throttleWaitMs > 0) await (args.sleep ?? realSleep)(throttleWaitMs);
+      // Throttle: espera o gap restante (bounded pelos knobs) antes do envio. Com a última linha do número no futuro
+      // (uma saída ainda em curso), a espera acompanha a linha (`esperarOIntervalo`).
+      const esperado = await esperarOIntervalo(args, client, throttleWaitMs, pacingState.lastSentAt, agoraSobATrava);
 
       // ctx.body é o corpo FINAL (emendado pelo disclosureGate F4-05 quando aplicável).
       if (args.approvedReply && ctx.body !== args.body)
@@ -1874,14 +1899,28 @@ export async function runBeforeSend(args: RunBeforeSendArgs): Promise<BeforeSend
       //
       // O registro leva a hora da saída, depois da espera (versão 16, F4u do cxj, U02): o próximo envio do número, de
       // qualquer emissor, mede o intervalo a partir dela. Com `args.now`, de antes da pausa humana e da espera, a linha
-      // ficava segundos antes da saída de verdade. O transporte vem depois do commit, e a campanha e o resgate pedem o
-      // intervalo mais a folga deles para cobrir esse tempo.
+      // ficava segundos antes da saída de verdade.
+      //
+      // Versão 17 (F4v do cxj). V02: a espera foi contada do relógio lido sob a trava, e o instante é o maior entre o
+      // relógio de agora e aquele mais o que se esperou. V01: o transporte vem depois do commit, e leva segundos; com
+      // intervalo no número, a linha guarda a hora mais tardia em que a mensagem chega ao provedor (o instante mais a
+      // folga), a idade é conferida antes do transporte, e a linha vai para a hora em que ele voltou quando confirma
+      // (`enviarComORegistroConfirmado`). Quem pega a trava com o transporte em curso mede o intervalo da hora mais
+      // tardia.
       const instanteDaSaida = new Date(
-        Math.max(args.relogio ? args.relogio().getTime() : -Infinity, args.now.getTime() + throttleWaitMs),
+        Math.max(args.relogio ? args.relogio().getTime() : -Infinity, agoraSobATrava.getTime() + esperado),
       );
-      const linha = await recordSend(client, args.tenantId, args.channelSessionId, instanteDaSaida, {
-        resposta: tipoDeEnvio(args.resposta) === 'resposta',
-      });
+      const folgaDaSaida =
+        args.relogio && capabilitiesOf(provider).banRisk && pacingCfg.knobs.throttleMs > 0
+          ? ATRASO_MAXIMO_DA_SAIDA_DO_AGENTE_MS
+          : 0;
+      const linha = await recordSend(
+        client,
+        args.tenantId,
+        args.channelSessionId,
+        new Date(instanteDaSaida.getTime() + folgaDaSaida),
+        { resposta: tipoDeEnvio(args.resposta) === 'resposta' },
+      );
       // Simetria com o gate desarmado: quem não é julgado pela janela não entra
       // nela. Ver `GateContext.spinningEnforced`.
       const copia =
@@ -1890,7 +1929,12 @@ export async function runBeforeSend(args: RunBeforeSendArgs): Promise<BeforeSend
           : null;
       await client.query('commit');
       transacaoFechada = true;
-      decisao = { tipo: 'envio', trace, corpo: ctx.body, registro: { linha, copia, instante: instanteDaSaida } };
+      decisao = {
+        tipo: 'envio',
+        trace,
+        corpo: ctx.body,
+        registro: { linha, copia, instante: instanteDaSaida, folgaMs: folgaDaSaida },
+      };
     }
   } catch (err) {
     erroNaTransacao = err instanceof Error ? err : new Error(String(err));
@@ -1920,6 +1964,49 @@ export async function runBeforeSend(args: RunBeforeSendArgs): Promise<BeforeSend
   return enviarComORegistroConfirmado(args, decisao);
 }
 
+/** A fatia da espera do intervalo enquanto a última linha do número está no futuro (`esperarOIntervalo`). */
+const PASSO_DA_ESPERA_DO_INTERVALO_MS = 500;
+
+/**
+ * A espera do intervalo, sob a trava do número; devolve quanto esperou (versão 17, F4v do cxj, V02).
+ *
+ * A última linha do número no passado não muda mais: a espera é uma só, como sempre. No futuro, ela é a hora mais
+ * tardia de uma saída ainda em curso (a vaga da campanha ou do resgate, ou o registro de outra resposta do agente), e
+ * muda sem a trava: vai para a hora em que o transporte voltou, ou some, se nada saiu. Esperar a hora mais tardia
+ * inteira cobrava de cada resposta em fila a folga de uma saída que já tinha acontecido. Por isso, com o relógio, a
+ * espera vai em fatias, e depois de cada uma a linha é relida, nesta conexão: o intervalo conta da última linha
+ * lida, para menos ou para mais, e a espera só termina quando a leitura diz que ele passou.
+ *
+ * O tempo conta pela soma das fatias, e não pelo relógio: é o piso do tempo que passou (o lado seguro), e a espera
+ * termina mesmo que o relógio não ande. Sem o relógio, a espera é uma só, como antes.
+ */
+async function esperarOIntervalo(
+  args: RunBeforeSendArgs,
+  client: pg.PoolClient,
+  espera: number,
+  ultimaSaida: Date | null,
+  agora: Date,
+): Promise<number> {
+  if (espera <= 0) return 0;
+  const sleep = args.sleep ?? realSleep;
+  if (!args.relogio || ultimaSaida === null || ultimaSaida.getTime() <= agora.getTime()) {
+    await sleep(espera);
+    return espera;
+  }
+  // O intervalo desta decisão, com o jitter dela: a espera era ele menos o tempo desde a última linha.
+  const intervalo = espera + agora.getTime() - ultimaSaida.getTime();
+  let esperado = 0;
+  let falta = espera;
+  while (falta > 0) {
+    const fatia = Math.min(falta, PASSO_DA_ESPERA_DO_INTERVALO_MS);
+    await sleep(fatia);
+    esperado += fatia;
+    const ultima = await lerUltimaSaida(client, args.tenantId, args.channelSessionId);
+    falta = ultima === null ? 0 : Math.max(0, ultima.getTime() + intervalo - (agora.getTime() + esperado));
+  }
+  return esperado;
+}
+
 /** O veto que a cadeia devolve (`evaluateBeforeSend`). */
 type VetoDaCadeia = NonNullable<ReturnType<typeof evaluateBeforeSend>['veto']>;
 
@@ -1929,8 +2016,14 @@ interface RegistroDaSaida {
   linha: string | null;
   /** O id da cópia em `outbound_copies`; `null` sem a janela de cópias. */
   copia: string | null;
-  /** A hora gravada na linha: a da saída, depois da espera do intervalo (versão 16). */
+  /** O instante da saída, lido sob a trava, depois da espera do intervalo (versão 16). */
   instante: Date;
+  /**
+   * A folga da saída (versão 17, F4v do cxj, V01): a linha é gravada em `instante + folgaMs`, a hora mais tardia em
+   * que a mensagem chega ao provedor, e vai para a hora em que o transporte voltou quando ele confirma. `0` = sem folga
+   * (número sem intervalo, canal sem risco de banimento, ou cadeia sem o relógio): a linha fica no instante.
+   */
+  folgaMs: number;
 }
 
 /** O que a cadeia decidiu sob a trava do número, lido depois de a conexão voltar ao pool. */
@@ -1999,9 +2092,40 @@ async function enviarComORegistroConfirmado(
   args: RunBeforeSendArgs,
   decisao: { trace: GateTraceEntry[]; corpo: string; registro: RegistroDaSaida },
 ): Promise<BeforeSendResult> {
+  // A saída do agente (versão 17, F4v do cxj, V01): com a folga, o transporte roda com ela no escopo, e a idade é
+  // conferida aqui, logo antes dele (o INSERT, o commit e a devolução da conexão já passaram), e de novo no último
+  // passo do handler, sem espera nenhuma entre a conta e o provedor.
+  const saida =
+    decisao.registro.folgaMs > 0 && args.relogio
+      ? novaSaidaDoAgente(decisao.registro.instante, decisao.registro.folgaMs, args.relogio)
+      : null;
+  if (saida) {
+    try {
+      conferirSaidaDoAgente(saida);
+    } catch (erroDaIdade) {
+      if (!(erroDaIdade instanceof SaidaDoAgenteVencidaError)) throw erroDaIdade;
+      // Nada saiu, e nenhuma mensagem nasceu: o registro volta, e o desfecho é o do transporte indisponível. O job
+      // tenta de novo pela fila, com a mesma chave, e passa por esta cadeia com um registro novo.
+      args.log.warn('saída do agente mais velha do que a folga antes do transporte: não enviada, o job tenta de novo', {
+        organization_id: args.tenantId,
+        channel_session_id: args.channelSessionId,
+        idade_ms: erroDaIdade.idadeMs,
+        folga_ms: saida.folgaMs,
+      });
+      await apagarRegistroDaSaida(args, decisao.registro, MOTIVO_DA_SAIDA_VENCIDA);
+      await persistTrace(args, decisao.trace, null);
+      return {
+        status: 'sent',
+        outcome: { kind: 'unavailable', reason: MOTIVO_DA_SAIDA_VENCIDA },
+        trace: decisao.trace,
+      };
+    }
+  }
   let outcome: ChannelSendResult & MarcaDeSaidaParcial;
   try {
-    outcome = await args.send(decisao.corpo);
+    outcome = saida
+      ? await comSaidaDoAgente(saida, () => args.send(decisao.corpo))
+      : await args.send(decisao.corpo);
   } catch (erroDoEnvio) {
     // Organização parada: o handler barra na primeira linha (`assertOrgOperante`), antes de
     // gravar a mensagem e de chamar o canal — nada saiu NESTA mensagem física. No envio composto
@@ -2022,10 +2146,46 @@ async function enviarComORegistroConfirmado(
   // (`redriveQueued`) reserva a vaga antes de mandá-la — como resposta, quando o job que a mandou
   // responde a quem escreveu (F4q do cxj, Q08); a nova tentativa de um job passa por esta cadeia.
   if (!saiuAlgo(outcome)) await apagarRegistroDaSaida(args, decisao.registro, outcome.kind);
+  // O transporte confirmou: a linha sai da hora mais tardia e vai para a hora em que ele voltou (versão 17). Antes da
+  // auditoria: quem pega a trava em seguida já lê a hora em que a mensagem saiu.
+  else if (saida) await ajustarRegistroDaSaida(args, decisao.registro, saida.relogio());
   // Auditoria DURÁVEL por run (F4-08 acc 3), gravada sem a conexão da cadeia na mão (#2426, P05).
   // Autônoma no pool; falha vira log.error (o logger é o backup).
   await persistTrace(args, decisao.trace, null);
   return { status: 'sent', outcome, trace: decisao.trace };
+}
+
+/**
+ * Leva a linha da saída da hora mais tardia (`instante + folgaMs`) para a hora em que o transporte voltou (versão 17,
+ * F4v do cxj, V01). Essa hora é lida depois de o transporte devolver que a mensagem saiu: nunca fica antes da saída de
+ * verdade, por onde quer que o transporte tenha passado. Quase sempre a linha recua (o transporte volta dentro da
+ * folga), e a resposta seguinte não paga a folga de uma saída que já aconteceu. Se a chamada ao provedor passou da hora
+ * mais tardia, a linha avança até a hora em que ela voltou: quem mede depois mede da saída de verdade. Nunca para antes
+ * do instante do registro.
+ *
+ * Nunca lança: a mensagem já saiu. Se o banco recusar, a linha fica na hora mais tardia, e o log leva o número e as
+ * duas horas.
+ */
+async function ajustarRegistroDaSaida(args: RunBeforeSendArgs, registro: RegistroDaSaida, voltouEm: Date): Promise<void> {
+  const saiuEm = new Date(Math.max(voltouEm.getTime(), registro.instante.getTime()));
+  try {
+    await args.pool.query(
+      `update pacing_ledger set sent_at = $4
+        where organization_id = $1 and channel_session_id = $2 and id = $3`,
+      [args.tenantId, args.channelSessionId, registro.linha, saiuEm],
+    );
+  } catch (err) {
+    args.log.error(
+      'a linha da saída ficou na hora mais tardia: a hora em que o transporte voltou não foi gravada',
+      {
+        organization_id: args.tenantId,
+        channel_session_id: args.channelSessionId,
+        sent_at: new Date(registro.instante.getTime() + registro.folgaMs).toISOString(),
+        voltou_em: saiuEm.toISOString(),
+        error: err instanceof Error ? err.name : 'unknown',
+      },
+    );
+  }
 }
 
 /**
@@ -2058,7 +2218,7 @@ async function apagarRegistroDaSaida(
       {
         organization_id: args.tenantId,
         channel_session_id: args.channelSessionId,
-        sent_at: registro.instante.toISOString(),
+        sent_at: new Date(registro.instante.getTime() + registro.folgaMs).toISOString(),
         resposta: tipoDeEnvio(args.resposta) === 'resposta',
         desfecho,
         error: err instanceof Error ? err.name : 'unknown',

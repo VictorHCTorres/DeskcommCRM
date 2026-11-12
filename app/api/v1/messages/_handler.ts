@@ -1,5 +1,11 @@
 import { assertProspectingDelivery } from "@/lib/prospecting/guard";
 import { assertCampaignDelivery, assertCampaignSlot, entregaPeloAtor, VetoDaCampanhaError } from "@/lib/campanhas/entrega";
+import {
+  MOTIVO_DA_SAIDA_VENCIDA,
+  SaidaDoAgenteVencidaError,
+  conferirSaidaDoAgente,
+  tomarSaidaDoAgente,
+} from "@/lib/agent-engine/pacing/saida-do-agente";
 import { assertAgentOperationSupabase, mesmaOperacao } from "@/lib/ai/agents/operation";
 import {
   assertApprovedReplySupabase,
@@ -1186,6 +1192,9 @@ export async function sendMessageHandler(
       // sendo a única conferência e segue aqui.
       const fronteiraJaConferida = mesmaFronteira(currentExecutionBoundary(), ctx.serviceBoundary ?? null);
       const operacaoJaConferida = mesmaOperacao(currentExecutionAgentOperation(), ctx.agentOperation);
+      // A saída do agente que este transporte carrega no escopo (versão 17, F4v do cxj, V01): só a 1ª mensagem física
+      // do envio a toma. Fora da cadeia do agente, `null`.
+      const saidaDoAgente = tomarSaidaDoAgente();
       const checkBoundary = async () => {
         await guardServiceEffect();
         await guardAgendaEffect();
@@ -1202,6 +1211,9 @@ export async function sendMessageHandler(
         // nessa espera a janela da campanha pode fechar e a vaga, envelhecer. É a conta mais perto do provedor, sem
         // espera nenhuma entre ela e ele.
         if (ctx.campaignSlot) assertCampaignSlot(ctx.campaignSlot);
+        // E a idade da saída do agente, pela mesma razão (F4v do cxj, V01): o registro dela no limite do número foi
+        // gravado antes de o handler começar, e quem mede o intervalo conta com a mensagem saindo até a folga depois.
+        if (saidaDoAgente) conferirSaidaDoAgente(saidaDoAgente);
       };
       // O que separa mídia de texto é a presença de `media` no envelope — o
       // adapter preserva o mesmo branch (e a mesma mensagem de erro de cada
@@ -1437,6 +1449,21 @@ export async function sendMessageHandler(
       if (updated) message = updated as unknown as Message;
       }
     } catch (err) {
+      if (err instanceof SaidaDoAgenteVencidaError) {
+        // A saída do agente envelheceu no caminho até o provedor (versão 17, F4v do cxj, V01): a conferência do último
+        // passo lançou antes de chamá-lo, e nada saiu. A linha fica em `queued`, com o motivo, como no canal fora do
+        // ar: a nova tentativa do job e o resgate do watchdog a mandam, cada um com o próprio registro no limite do
+        // número. Não é falha de entrega: nada de `emitirFalhaDeEntrega`.
+        const { data: emFila } = await supabase
+          .from("messages")
+          .update({ metadata: { ...(message.metadata ?? {}), queued_reason: MOTIVO_DA_SAIDA_VENCIDA } })
+          .eq("id", message.id)
+          .eq("organization_id", ctx.organization_id)
+          .select(MSG_COLS)
+          .maybeSingle();
+        if (emFila) message = emFila as unknown as Message;
+        return message;
+      }
       if (err instanceof VetoDaCampanhaError) {
         // O veto da conferência final da campanha no instante do efeito (F4g,
         // A3), DEPOIS do INSERT: a linha sai de `queued`, só se ainda estiver
