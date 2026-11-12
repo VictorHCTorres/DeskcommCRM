@@ -90,6 +90,7 @@ import { renderVetoDeAfirmacao, type ConferenciaDeFato } from './factual-claim';
 // segundo caminho de envio que não passa pelo gate de elegibilidade, e é ele que
 // barra o texto FIXO do worker e o modelo aprovado.
 import { sqlContatoInterno } from '@/lib/contacts/tags-internas';
+import { OrgNaoOperanteError } from '@/lib/organizacao/operante';
 import { avaliarHorarios, type HorariosDaAgenda } from './horario-da-agenda';
 
 /** O que os gates enxergam — carregado UMA vez sob o lock, por tentativa de envio. */
@@ -1344,9 +1345,9 @@ export interface RunBeforeSendArgs {
    */
   agentId?: string | null;
   /**
-   * channel_sessions.daily_message_limit do CRM (fonte única do cap absoluto). null =
-   * ainda não lido do CRM no runtime → os degraus de warm-up (conservadores) seguram
-   * o cap. Ponto de injeção: quando o drain expuser o limite da sessão, passar aqui.
+   * channel_sessions.daily_message_limit do CRM (fonte única do cap absoluto). null = o
+   * chamador não o traz, e a cadeia o lê do número, sob a trava (F4o do cxj, O07); antes,
+   * null deixava só os degraus de warm-up segurarem o cap.
    */
   crmDailyLimit: number | null;
   /**
@@ -1649,6 +1650,12 @@ export async function runBeforeSend(args: RunBeforeSendArgs): Promise<BeforeSend
   // enquanto a tx aberta segura o `contacts` (readStopFlags). `undefined` = a cadeia ainda
   // não avaliou (falha numa leitura sob o lock) → nada a persistir.
   let traceDaAuditoria: GateTraceEntry[] | undefined;
+  // F4o do cxj, O06: a saída possível cujo registro no limite diário a transação ainda não
+  // confirmou. Preenchida quando o transporte é chamado; esvaziada pelo commit ou por um
+  // desfecho que prova que nada saiu. Se sobrar, o `finally` grava o registro fora da transação.
+  let saidaAConfirmar: { corpo: string } | null = null;
+  // F4o, O06: o transporte lançou — a saída é incerta (o provedor pode ter aceitado antes do erro).
+  let saidaIncerta = false;
   try {
     await client.query('begin');
     // Serialização por número: dois workers no MESMO channel_session esperam a vez.
@@ -1701,6 +1708,13 @@ export async function runBeforeSend(args: RunBeforeSendArgs): Promise<BeforeSend
       args.channelSessionId,
       args.log,
     );
+    // F4o do cxj, O07: o teto do CRM do número vale também para o agente. O turno de entrada,
+    // o follow-up, o aviso de escalação e a prévia passam `null` (o limite do CRM não chegava
+    // ao runtime), e o disparo do agente só esbarrava no aquecimento — num chip de 19 dias, 200
+    // por dia contra os 60 do CRM que a campanha respeita. Sem o teto do chamador, a cadeia o
+    // lê do número, sob a trava; com ele, vale o dele.
+    const crmDailyLimit =
+      args.crmDailyLimit ?? (await loadCrmDailyLimit(client, args.tenantId, args.channelSessionId));
     const pacingState = await loadPacingState(client, args.tenantId, args.channelSessionId, {
       now: args.now,
       timezone: pacingCfg.knobs.timezone,
@@ -1749,7 +1763,7 @@ export async function runBeforeSend(args: RunBeforeSendArgs): Promise<BeforeSend
       pacing: {
         knobs: pacingCfg.knobs,
         state: pacingState,
-        crmDailyLimit: args.crmDailyLimit,
+        crmDailyLimit,
         rng: args.rng,
         ...(args.resposta !== undefined ? { resposta: args.resposta } : {}),
       },
@@ -1862,23 +1876,47 @@ export async function runBeforeSend(args: RunBeforeSendArgs): Promise<BeforeSend
     // ctx.body é o corpo FINAL (emendado pelo disclosureGate F4-05 quando aplicável).
     if (args.approvedReply && ctx.body !== args.body)
       throw new Error('reply_body_changed_reapproval_required');
-    const outcome = await args.send(ctx.body);
 
-    // Registra pacing + copy SÓ no envio físico fresco ('sent'). 'already_sent'/'queued'
-    // já foram (ou serão) contabilizados na tentativa original — o ledger F2-06 faz as
-    // repetições curto-circuitarem, então re-registrar aqui inflaria o cap.
-    if (outcome.kind === 'sent') {
-      await recordSend(client, args.tenantId, args.channelSessionId, args.now, {
-        resposta: tipoDeEnvio(args.resposta) === 'resposta',
-      });
-      // Simetria com o gate desarmado: quem não é julgado pela janela não entra
-      // nela. Ver `GateContext.spinningEnforced`.
-      if (args.enforceSpinning !== false) {
-        await recordCopy(client, args.tenantId, args.channelSessionId, ctx.body, args.now);
-      }
+    // ═══ A SAÍDA ENTRA NA CONTAGEM DO NÚMERO ANTES DE ACONTECER (F4o do cxj, O06) ═══
+    //
+    // O pacing e a cópia eram gravados DEPOIS do transporte. Se a gravação ou o commit
+    // falhassem com a mensagem já fora, o rollback apagava o registro, e a reserva seguinte da
+    // campanha (`reservarVaga`, sob esta mesma trava) não via a saída: liberava o 61º disparo
+    // do dia, ou passava por cima do intervalo depois de uma resposta.
+    //
+    // O registro vem antes, sob a trava, depois de um savepoint: recusado, nada sai. Só um
+    // desfecho que prova que nada saiu AGORA o desfaz: 'already_sent' foi contado na tentativa
+    // original (o ledger F2-06 curto-circuita a repetição), e 'queued', 'failed', 'blocked' e
+    // 'unavailable' não saíram (o job reagenda com a mesma chave e conta quando sair). O
+    // transporte que lança deixa a saída incerta (o provedor pode ter aceitado antes do erro,
+    // como no `store.update` do `sendWithLedger`), e o registro fica: a mais, nunca a menos.
+    await client.query('savepoint antes_do_envio');
+    await recordSend(client, args.tenantId, args.channelSessionId, args.now, {
+      resposta: tipoDeEnvio(args.resposta) === 'resposta',
+    });
+    // Simetria com o gate desarmado: quem não é julgado pela janela não entra
+    // nela. Ver `GateContext.spinningEnforced`.
+    if (args.enforceSpinning !== false) {
+      await recordCopy(client, args.tenantId, args.channelSessionId, ctx.body, args.now);
+    }
+    saidaAConfirmar = { corpo: ctx.body };
+    let outcome: ChannelSendResult;
+    try {
+      outcome = await args.send(ctx.body);
+    } catch (erroDoEnvio) {
+      // Organização parada: o handler barra na primeira linha (`assertOrgOperante`), antes de
+      // gravar a mensagem e de chamar o canal — nada saiu. Outro erro deixa a saída incerta.
+      if (erroDoEnvio instanceof OrgNaoOperanteError) saidaAConfirmar = null;
+      else saidaIncerta = true;
+      throw erroDoEnvio;
+    }
+    if (outcome.kind !== 'sent') {
+      saidaAConfirmar = null;
+      await client.query('rollback to savepoint antes_do_envio');
     }
     await client.query('commit');
     transacaoFechada = true;
+    saidaAConfirmar = null;
     // Auditoria DURÁVEL por run (F4-08 acc 3): gravada DEPOIS do commit — antes, o insert em
     // `before_send_traces` (FK `contacts`) saía pelo pool enquanto a tx aberta segurava o
     // `contacts` e podia enfileirar atrás de um DDL (#2426). Autônoma no pool; falha vira
@@ -1889,7 +1927,22 @@ export async function runBeforeSend(args: RunBeforeSendArgs): Promise<BeforeSend
     erroNaTransacao = err instanceof Error ? err : new Error(String(err));
     // Uma tx já fechada (commit/rollback explícito acima) não pode ser rollback de novo.
     if (!transacaoFechada) {
-      await rollback(client, err);
+      // O06: o transporte lançou com a transação sã (ele não usa esta conexão), e ela só leu
+      // e registrou a saída. O commit guarda o registro sob a mesma trava, sem deixar brecha
+      // para outra reserva; recusado, o `finally` grava o registro fora da transação.
+      if (saidaIncerta) {
+        try {
+          await client.query('commit');
+          transacaoFechada = true;
+          saidaAConfirmar = null;
+        } catch (erroDoCommit) {
+          args.log.error('commit recusado depois de uma saída incerta: o registro vai fora da transação', {
+            channel_session_id: args.channelSessionId,
+            error: erroDoCommit instanceof Error ? erroDoCommit.name : 'unknown',
+          });
+        }
+      }
+      if (!transacaoFechada) await rollback(client, err);
       // Auditoria da tentativa que ERROU (ex.: envio com o transporte fora): o rollback desfaz
       // a tx, mas a linha de auditoria é autônoma no pool e sobrevive — gravada AQUI, fora da
       // janela, para não reabrir o ciclo do #2426. O veto já gravou o seu no ramo dele.
@@ -1898,6 +1951,60 @@ export async function runBeforeSend(args: RunBeforeSendArgs): Promise<BeforeSend
     throw err;
   } finally {
     client.release(erroNaTransacao);
+    // O06: a saída possível que a transação não confirmou entra na contagem por fora. Depois
+    // do release, e não antes: a conexão que falhou volta destruída (e, com ela, o que tenha
+    // sobrado da transação no servidor), e a gravação autônoma não disputa nada com ela (#2426).
+    if (saidaAConfirmar !== null) await registrarSaidaForaDaTransacao(args, saidaAConfirmar.corpo);
+  }
+}
+
+/** A espera antes de cada nova tentativa do registro de uma saída fora da transação (O06). */
+const ESPERAS_DO_REGISTRO_DE_FORA_MS = [250, 1_000] as const;
+
+/**
+ * F4o do cxj, O06: a saída possível (envio confirmado, ou transporte que lançou) cuja transação
+ * não confirmou o registro entra no limite diário do número por fora dela, autônoma no pool,
+ * como a auditoria. Mesmo instante e mesma marca de resposta do registro desfeito: a reserva
+ * seguinte da campanha vê a saída no teto e no intervalo.
+ *
+ * Nunca lança: quem chama já está propagando o erro da cadeia. São três tentativas; sem
+ * nenhuma, o log leva o número e o instante para a reconciliação, em vez de o débito sumir
+ * calado. A cópia (anti-repetição) vai depois, uma vez.
+ */
+async function registrarSaidaForaDaTransacao(args: RunBeforeSendArgs, corpo: string): Promise<void> {
+  const resposta = tipoDeEnvio(args.resposta) === 'resposta';
+  const detalhe = {
+    organization_id: args.tenantId,
+    channel_session_id: args.channelSessionId,
+    sent_at: args.now.toISOString(),
+    resposta,
+  };
+  const esperar = args.sleep ?? realSleep;
+  for (let tentativa = 0; ; tentativa++) {
+    try {
+      await recordSend(args.pool, args.tenantId, args.channelSessionId, args.now, { resposta });
+      break;
+    } catch (err) {
+      const espera = ESPERAS_DO_REGISTRO_DE_FORA_MS[tentativa];
+      if (espera === undefined) {
+        args.log.error(
+          'envio sem registro no limite diário do número: a gravação fora da transação falhou (reconciliar)',
+          { ...detalhe, tentativas: tentativa + 1, error: err instanceof Error ? err.name : 'unknown' },
+        );
+        return;
+      }
+      await esperar(espera);
+    }
+  }
+  args.log.warn('commit recusado: o envio entrou no limite diário do número fora da transação', detalhe);
+  if (args.enforceSpinning === false) return;
+  try {
+    await recordCopy(args.pool, args.tenantId, args.channelSessionId, corpo, args.now);
+  } catch (err) {
+    args.log.error('cópia do envio fora da janela anti-repetição: a gravação fora da transação falhou', {
+      ...detalhe,
+      error: err instanceof Error ? err.name : 'unknown',
+    });
   }
 }
 
@@ -1926,6 +2033,23 @@ export async function loadChannelProvider(
   );
   const provider = rows[0]?.provider;
   return provider === undefined ? DEFAULT_CHANNEL_PROVIDER : (provider as ChannelProvider);
+}
+
+/**
+ * O limite diário que o CRM dá ao número (`channel_sessions.daily_message_limit`); `null` =
+ * sem limite, ou número que não aparece. É a fonte do teto quando o chamador não o traz (F4o
+ * do cxj, O07), lida sob a trava, como o resto do estado do pacing.
+ */
+async function loadCrmDailyLimit(
+  db: Queryable,
+  organizationId: string,
+  channelSessionId: string,
+): Promise<number | null> {
+  const { rows } = await db.query<{ daily_message_limit: number | null }>(
+    'select daily_message_limit from channel_sessions where organization_id = $1 and id = $2',
+    [organizationId, channelSessionId],
+  );
+  return rows[0]?.daily_message_limit ?? null;
 }
 
 /**

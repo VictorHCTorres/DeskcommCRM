@@ -144,7 +144,7 @@ describe('#2426 · runBeforeSend não grava pelo pool enquanto a transação est
     expect(escritas.some((s) => s.includes('insert into agent_inbox_items'))).toBe(true);
   });
 
-  it('envio que ERRA: a auditoria é gravada depois do rollback, sem escrita pela transação aberta', async () => {
+  it('envio que ERRA: a auditoria é gravada depois de a transação fechar, sem escrita pela transação aberta', async () => {
     const { cliente, estado } = clienteComTransacao();
     const { pool, violacoes, escritas } = poolAuditoriado(cliente, estado);
 
@@ -159,7 +159,10 @@ describe('#2426 · runBeforeSend não grava pelo pool enquanto a transação est
     ).rejects.toThrow('transporte fora');
 
     expect(violacoes, 'escrita pelo pool durante a transação aberta (#2426)').toEqual([]);
-    // A tentativa que errou ainda tem linha de auditoria (autônoma, pós-rollback).
+    // A tentativa que errou ainda tem linha de auditoria (autônoma, gravada depois de a
+    // transação fechar). Desde a F4o (O06), o transporte que lança deixa a saída incerta e a
+    // transação fecha com commit, para guardar o registro no limite diário do número
+    // (`tests/unit/registro-da-ia-antes-do-envio.test.ts`).
     expect(escritas.some((s) => s.includes('insert into before_send_traces'))).toBe(true);
   });
 });

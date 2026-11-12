@@ -4410,9 +4410,8 @@ async function executarTurnoDoAgente(
             // janela de RESPOSTA (0495). `followup_turn` retoma conversa parada e
             // continua na janela de DISPARO.
             resposta: eTurnoDeResposta(liveJob()),
-            // ponytail: channel_sessions.daily_message_limit do CRM ainda não é lido
-            // no runtime — null cai nos degraus de warm-up (conservadores). Injetar
-            // aqui quando o drain expuser o limite da sessão.
+            // `null` = a cadeia lê o `channel_sessions.daily_message_limit` do número,
+            // sob a trava (F4o do cxj, O07). Antes, null caía só nos degraus de warm-up.
             crmDailyLimit: null,
             now: clock(),
             sleep: deps.sleep,
