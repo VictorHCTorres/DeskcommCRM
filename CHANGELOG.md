@@ -8,6 +8,12 @@ Se você roda o DeskcommCRM numa VPS, **leia a seção da versão para a qual es
 
 ## [Não lançado]
 
+## [1.102.0] — 2026-11-12
+
+### Adicionado
+
+- **Tarefas criadas por integração ganham chave externa única** `POST /api/v1/tasks` aceita o campo opcional `external_id`: de 1 a 200 caracteres, só letras (A–Z, a–z e as acentuadas pré-compostas do Latin-1, como ç e ã), dígitos de 0 a 9 e os sinais `| / . : -`, sem espaço nenhum; qualquer outro caractere é recusado com `422`. A chave é única por organização, garantida pelo banco: se outra tarefa já a tem, a resposta é `409` com o id dessa tarefa em `details.task_id`, e nada é criado. Quem grava por token pode assim repetir a chamada sem criar a mesma tarefa em dobro. `GET /api/v1/tasks` ganha os filtros `external_id` (exato, repetível até 100 vezes) e `external_id_prefix` (por prefixo), que devolvem só as linhas que casam, com um orçamento em bytes por consulta (a soma de `len(encodeURIComponent(valor))` de todos os valores, prefixo incluso, até 4096; acima disso é `422` com o orçamento em `details.limite_get` e a orientação de subdividir), e passa a informar em `meta.total` o número de tarefas que casam com a consulta base e, em `meta.cortada`, se essa consulta passou do limite de 500 linhas. "Recebidas igual a `meta.total`" só certifica que a lista veio completa nas consultas por chave (`external_id` e `external_id_prefix`), nunca na lista comum, que acrescenta pais e filhas; `meta.total` conta o que o chamador enxerga naquele instante, não o inventário global. `PATCH /api/v1/tasks/{id}` preenche a chave de uma tarefa que ainda não tem; trocar ou apagar uma chave existente é recusado. Toda resposta dessas rotas traz o cabeçalho `x-tasks-external-id: 1`, que diz só que esta versão da rota entende o campo; ele não prova que o banco foi migrado. A chave só pode ser gravada por token de servidor: pela sessão do navegador o campo é recusado com `422`, e o banco impede que a sessão grave ou mude a chave, e que qualquer um troque, limpe ou mude de organização uma tarefa que já tem chave. Exige aplicar a migration 9338 (aditiva: a coluna nasce vazia, com `COLLATE "C"` fixado, e nenhuma tarefa existente muda; num banco que já tenha a coluna com outra collation, a migration a converte para "C" preservando os valores). O número 9338 é o próximo livre medido em 11/11/2026 sobre a main do produto e os PRs abertos; não há reserva e ele é conferido de novo na hora de implantar. Crédito: @VictorHCTorres.
+
 ## [1.101.0] — 2026-11-10
 
 ### Adicionado
@@ -14115,7 +14121,8 @@ Primeira versão marcada do DeskcommCRM. O projeto vinha sendo desenvolvido publ
 
 - **Node 22 é obrigatório para desenvolvimento.** A suíte de invariantes instancia o cliente do Supabase, que exige o `WebSocket` global — nativo apenas a partir do Node 22. Isso não afeta quem apenas hospeda: a VPS roda a imagem pronta.
 
-[Não lançado]: https://github.com/melgarafael/DeskcommCRM/compare/v1.101.0...HEAD
+[Não lançado]: https://github.com/melgarafael/DeskcommCRM/compare/v1.102.0...HEAD
+[1.102.0]: https://github.com/melgarafael/DeskcommCRM/compare/v1.101.0...v1.102.0
 [1.101.0]: https://github.com/melgarafael/DeskcommCRM/compare/v1.100.3...v1.101.0
 [1.100.3]: https://github.com/melgarafael/DeskcommCRM/compare/v1.100.2...v1.100.3
 [1.100.2]: https://github.com/melgarafael/DeskcommCRM/compare/v1.100.1...v1.100.2
