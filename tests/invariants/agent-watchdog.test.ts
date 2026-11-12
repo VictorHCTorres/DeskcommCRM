@@ -118,6 +118,15 @@ beforeAll(async () => {
      values ($1, $2, $3, 'STARTING', '\\x00'::bytea) on conflict (id) do nothing`,
     [SESSION, ORG, WAHA_SESSION_NAME],
   );
+  // O resgate reserva a vaga no limite do número antes de mandar (F4p do cxj, P07). Este
+  // arquivo reenvia várias vezes no mesmo número, a milissegundos de distância, e prende o
+  // espelho, o eco e a lista de testadores, não o limite: aqui o número não tem intervalo nem
+  // aquecimento. O limite do resgate mora em `resgate-da-fila-conta-a-saida.test.ts`.
+  await pool.query(
+    `insert into channel_knobs (organization_id, channel_session_id, throttle_ms, number_activated_at)
+     values ($1, $2, 0, now() - interval '365 days') on conflict do nothing`,
+    [ORG, SESSION],
+  );
   await pool.query(
     `insert into conversations (id, organization_id, contact_id, channel_session_id, status, is_group)
      values ($1, $2, $3, $4, 'open', false) on conflict (id) do nothing`,

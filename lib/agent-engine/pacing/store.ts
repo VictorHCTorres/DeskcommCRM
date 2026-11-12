@@ -221,7 +221,11 @@ export async function loadPacingState(
 }
 
 /**
- * Registra um envio efetivado — chamado pela cadeia de envio (F2-13) após o accept do CRM.
+ * Registra uma saída do número no limite diário e devolve o id da linha.
+ *
+ * A cadeia de envio (`runBeforeSend`) grava ANTES do transporte e confirma a linha antes de
+ * chamá-lo (F4p do cxj): se nada sair, ela apaga esta linha pelo id. `null` só quando o banco
+ * não devolve a linha (dublê de teste).
  *
  * `resposta: true` marca a linha como resposta a quem escreveu: ela segue valendo
  * para o espaçamento (`lastSentAt`), mas não gasta o teto do dia (`sentToday`),
@@ -233,12 +237,14 @@ export async function recordSend(
   channelSessionId: string,
   sentAt: Date = new Date(),
   opts: { resposta?: boolean } = {},
-): Promise<void> {
-  await db.query(
+): Promise<string | null> {
+  const { rows } = await db.query<{ id: string }>(
     `insert into pacing_ledger (organization_id, channel_session_id, sent_at, resposta)
-     values ($1, $2, $3, $4)`,
+     values ($1, $2, $3, $4)
+     returning id`,
     [tenantId, channelSessionId, sentAt, opts.resposta === true],
   );
+  return rows?.[0]?.id ?? null;
 }
 
 /** A regra que a vaga de um disparo tem de cumprir na hora de ser gravada (`reservarVaga`). */
@@ -259,9 +265,9 @@ export interface RegraDaVaga {
 export type ReservaDaVaga = 'reservada' | 'teto_cheio' | 'intervalo';
 
 /**
- * Até quanto a reserva espera a trava do número. A cadeia do agente a segura durante
- * o próprio envio (até o POST ao CRM voltar); passado isto, a reserva lança, e o
- * balão não sai.
+ * Até quanto a reserva espera a trava do número. A cadeia do agente a segura durante a
+ * decisão (as leituras, os gates, a espera do throttle e o registro da saída), e não mais
+ * durante o transporte (F4p do cxj); passado isto, a reserva lança, e o balão não sai.
  */
 export const ESPERA_PELA_TRAVA_MS = 15_000;
 

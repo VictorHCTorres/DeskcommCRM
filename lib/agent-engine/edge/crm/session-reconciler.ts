@@ -31,8 +31,11 @@ import { canonicalWahaExternalId, chatIdFromWaMessageId, parseWahaMessageId, wah
 import { chatIndividualDaMensagem } from '@/lib/waha/ultima-recebida';
 import { lerNumerosDeTeste, numeroPodeTestar, preGoLiveAtivo } from '@/lib/ai/elegibilidade/pre-go-live';
 import { canalDesativado } from '@/lib/channels/desativado';
+import { canalTemRiscoDeBanimento } from '@/lib/channels/capabilities';
 
 import type { Logger } from '../../obs/logger';
+import { dayStartInTz, tetoDoDia } from '../../pacing/engine';
+import { loadChannelKnobs, reservarVaga, undoSend, type ReservaDaVaga } from '../../pacing/store';
 
 export interface WatchdogConfig {
   wahaBaseUrl: string;
@@ -183,6 +186,11 @@ interface QueuedRow {
   group_chat_id: string | null;
   /** De onde veio a mensagem: a de campanha leva `source` e `campaign_id` (F4i). */
   metadata: unknown;
+  /** O número que manda: a vaga no limite diário é dele (F4p do cxj, P07). */
+  channel_session_id: string;
+  /** O teto do CRM do número (`null` = sem teto) e o canal, para a regra da vaga. */
+  daily_message_limit: number | null;
+  provider: string | null;
 }
 
 /**
@@ -387,6 +395,46 @@ async function stampExternalIdAfterEcho(
 }
 
 /**
+ * Reserva a vaga de uma saída do resgate no limite diário do número (F4p do cxj, P07), com a
+ * mesma regra da campanha (`rodada.ts`): o teto do dia (`tetoDoDia`: o aquecimento e o teto do
+ * CRM) e o intervalo do número (o throttle, sem o jitter), conferidos e gravados por
+ * `reservarVaga`, sob a trava do número que a cadeia do agente e a campanha também usam.
+ */
+async function reservarVagaDoResgate(pool: pg.Pool, m: QueuedRow, quando: Date, log: Logger): Promise<ReservaDaVaga> {
+  const { knobs, numberActivatedAt } = await loadChannelKnobs(pool, m.organization_id, m.channel_session_id, log);
+  const banRisk = canalTemRiscoDeBanimento(m.provider);
+  return reservarVaga(pool, m.organization_id, m.channel_session_id, quando, {
+    limite: tetoDoDia({
+      now: quando,
+      knobs,
+      numberActivatedAt,
+      crmDailyLimit: m.daily_message_limit ?? null,
+      banRisk,
+    }),
+    desde: dayStartInTz(quando, knobs.timezone),
+    vagas: 1,
+    intervaloMs: banRisk ? knobs.throttleMs : 0,
+  });
+}
+
+/**
+ * Devolve a vaga de uma saída do resgate que certamente não aconteceu (o WAHA recusou com 4xx).
+ * Se o banco recusar, a vaga fica — o teto conta uma a mais, o lado seguro —, e o log diz.
+ */
+async function devolverVagaDoResgate(pool: pg.Pool, m: QueuedRow, quando: Date, log: Logger): Promise<void> {
+  try {
+    await undoSend(pool, m.organization_id, m.channel_session_id, quando);
+  } catch (err) {
+    log.error('watchdog: a vaga de um reenvio que não saiu ficou no limite do número', {
+      message_id: m.id,
+      channel_session_id: m.channel_session_id,
+      sent_at: quando.toISOString(),
+      error: (err instanceof Error ? err.message : String(err)).slice(0, 120),
+    });
+  }
+}
+
+/**
  * Reenvia mensagens AI presas em queued com sessão WORKING.
  *
  * `signal` é o do desligamento (#2823) e é OPCIONAL: sem ele o lote anda inteiro
@@ -400,10 +448,13 @@ export async function redriveQueued(
   cfg: WatchdogConfig,
   log: Logger,
   signal?: AbortSignal,
+  // O relógio da vaga (F4p, P07). Fixo só nos testes.
+  agora: () => Date = () => new Date(),
 ): Promise<number> {
   const { rows } = await pool.query<QueuedRow>(
     `select m.id, m.organization_id, m.conversation_id, m.contact_id, m.body, s.waha_session_name,
-            c.wa_identity, c.wa_lid, c.phone_number, v.is_group, v.group_chat_id, m.metadata
+            c.wa_identity, c.wa_lid, c.phone_number, v.is_group, v.group_chat_id, m.metadata,
+            m.channel_session_id, s.daily_message_limit, s.provider
      from messages m
      join channel_sessions s on s.id = m.channel_session_id and s.organization_id = m.organization_id
      join conversations v on v.id = m.conversation_id and v.organization_id = m.organization_id
@@ -550,6 +601,22 @@ export async function redriveQueued(
           continue;
         }
       }
+      // ─── A VAGA NO LIMITE DO NÚMERO, ANTES DE MANDAR (F4p do cxj, P07) ───
+      //
+      // Este resgate manda direto ao WAHA, por fora da cadeia do agente, e não contava a saída:
+      // com 59 de 60 no dia, a campanha seguinte liberava a 61ª; depois de uma resposta
+      // resgatada, passava 1 s depois. Agora ele reserva a vaga como a campanha: o teto do dia e
+      // o intervalo do número, conferidos e gravados sob a trava do número. Sem vaga, nada sai, e
+      // a mensagem fica `queued` para o próximo tique (ou para o job, que reagenda com a mesma
+      // chave e a manda pela cadeia). A reserva conta como disparo: o resgate não sabe se a
+      // mensagem respondia alguém, e contar a mais é o lado seguro. Erro na reserva cai no
+      // `catch` de baixo, antes de qualquer envio.
+      const quando = agora();
+      const vaga = await reservarVagaDoResgate(pool, m, quando, log);
+      if (vaga !== 'reservada') {
+        log.info('watchdog: reenvio adiado — o número está sem vaga agora', { message_id: m.id, motivo: vaga });
+        continue;
+      }
       const res = await fetch(`${cfg.wahaBaseUrl}/api/sendText`, {
         method: 'POST',
         headers: { 'X-Api-Key': cfg.wahaApiKey, 'Content-Type': 'application/json' },
@@ -557,6 +624,10 @@ export async function redriveQueued(
         signal: AbortSignal.timeout(15_000),
       });
       if (!res.ok) {
+        // 4xx: o WAHA recusou o pedido, e nada saiu — a vaga volta. 5xx deixa a saída incerta
+        // (o provedor pode ter aceitado antes do erro), e a vaga fica: a mais, nunca a menos.
+        // O erro de rede e o tempo esgotado também ficam com ela (caem no `catch`).
+        if (res.status >= 400 && res.status < 500) await devolverVagaDoResgate(pool, m, quando, log);
         log.warn('watchdog: redrive falhou no WAHA — mantida queued para o próximo tick', {
           message_id: m.id,
           status_code: res.status,

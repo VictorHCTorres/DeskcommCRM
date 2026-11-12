@@ -74,6 +74,21 @@ function msg(id: string): Msg {
   };
 }
 
+/**
+ * O pool do resgate: a consulta falsa da fila e a conexão da vaga no limite do número, que o
+ * resgate reserva antes de mandar (F4p do cxj, P07). Aqui a vaga sempre existe: este arquivo
+ * prende o abort; o limite mora em `tests/invariants/resgate-da-fila-conta-a-saida.test.ts`.
+ */
+function poolDoResgate(query: unknown): pg.Pool {
+  const conexaoDaVaga = {
+    query: vi.fn(async (sql: string) =>
+      /as ultimo/.test(String(sql)) ? { rows: [{ ultimo: null, do_dia: "0" }] } : { rows: [] },
+    ),
+    release: vi.fn(),
+  };
+  return { query, connect: vi.fn(async () => conexaoDaVaga) } as unknown as pg.Pool;
+}
+
 /** Banco falso que DESCOBRE cada consulta pelo vocabulário, como o teste #652. */
 function bancoComFila(fila: Msg[], aoLerElegibilidade: () => void = () => undefined) {
   const consultas: string[] = [];
@@ -146,7 +161,7 @@ describe("redrive: para entre itens, não cancela o envio em voo (#2823)", () =>
     const { query } = bancoComFila([msg("m-1"), msg("m-2")], () => controller.abort());
 
     const reenviadas = await redriveQueued(
-      { query } as unknown as pg.Pool,
+      poolDoResgate(query),
       CFG,
       log,
       controller.signal,
@@ -165,7 +180,7 @@ describe("redrive: para entre itens, não cancela o envio em voo (#2823)", () =>
     const { query, consultas } = bancoComFila([msg("m-1"), msg("m-2")]);
 
     const reenviadas = await redriveQueued(
-      { query } as unknown as pg.Pool,
+      poolDoResgate(query),
       CFG,
       log,
       controller.signal,

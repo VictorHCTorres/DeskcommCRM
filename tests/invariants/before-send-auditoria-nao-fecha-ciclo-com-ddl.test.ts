@@ -12,11 +12,12 @@
  * `lock_timeout` curto para o teste terminar: com o defeito, o insert estoura, o
  * `persistTrace` engole o erro e a linha de auditoria NÃO existe.
  *
- * O #2827 tira da janela só a AUDITORIA (trace, timeline do veto, escalação de LGPD). O
- * `args.send` de produção (`sendWithLedger` → `send_ledger` e `messages`, as duas com FK
- * para `contacts`) ainda grava por OUTRA conexão com a tx aberta. O último caso imita isso
- * e está em `it.fails`: é a metade que o #2426 segue pedindo (advisory lock de SESSÃO).
- * Quando ela fechar, o `it.fails` reprova — troque por `it` e apague esta nota.
+ * O #2827 tirou da janela a AUDITORIA (trace, timeline do veto, escalação de LGPD). A outra
+ * metade do #2426 era o `args.send` de produção (`sendWithLedger` → `send_ledger` e
+ * `messages`, as duas com FK para `contacts`), que gravava por OUTRA conexão com a tx aberta.
+ * Desde a F4p do cxj (12/11/2026), a transação da cadeia termina antes do transporte: o
+ * registro da saída é confirmado antes, e a conexão volta ao pool. O último caso, que era
+ * `it.fails`, agora passa.
  */
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
@@ -75,10 +76,11 @@ it('controle positivo: sem DDL na fila, o envio que grava send_ledger pelo pool 
   expect(n).toBe(1);
 });
 
-// #2426, a metade ABERTA: com o envio gravando o ledger pelo pool, o insert espera o DDL,
-// o DDL espera a tx e a tx espera o envio. Aqui o `lock_timeout` do pool estoura (55P03) e
-// o `runBeforeSend` lança; em produção, sem `lock_timeout`, o worker pendura.
-it.fails('caminho enviado com o envio gravando send_ledger pelo pool: metade aberta do #2426', async () => {
+// #2426, a metade que ficou aberta até a F4p: com o envio gravando o ledger pelo pool e a tx
+// ainda aberta, o insert esperava o DDL, o DDL esperava a tx e a tx esperava o envio (aqui o
+// `lock_timeout` do pool estourava; em produção, sem ele, o worker pendurava). Com a tx
+// fechada antes do transporte, o DDL passa e o envio completa.
+it('caminho enviado com o envio gravando send_ledger pelo pool: a tx já fechou, e o ciclo do #2426 não se forma', async () => {
   const f = await fixture();
   await rodarComDdlNaFila(f, [], sendQueGravaOLedger(f), 'sent');
 });

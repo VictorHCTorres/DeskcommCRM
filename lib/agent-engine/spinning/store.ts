@@ -88,8 +88,10 @@ export async function loadRecentCopies(
 }
 
 /**
- * Registra uma copy efetivamente enviada — SEAM da cadeia de envio (F2-13), após o
- * accept do CRM. Normaliza e guarda o hash aqui (a mesma normalização do gate).
+ * Registra a copy de uma saída — SEAM da cadeia de envio (F2-13) — e devolve o id da
+ * linha. A cadeia grava ANTES do transporte, com a linha do limite diário, e apaga as
+ * duas pelo id se nada sair (F4p do cxj). `null` só quando o banco não devolve a linha
+ * (dublê de teste). Normaliza e guarda o hash aqui (a mesma normalização do gate).
  * A poda é `fn_expurgar_copias_enviadas_vencidas` (migration 0587, cron
  * `data-retention`), que nunca apaga as últimas `windowSize` do número.
  */
@@ -99,11 +101,13 @@ export async function recordCopy(
   channelSessionId: string,
   body: string,
   sentAt: Date = new Date(),
-): Promise<void> {
+): Promise<string | null> {
   const normalized = normalizeCopy(body);
-  await db.query(
+  const { rows } = await db.query<{ id: string }>(
     `insert into outbound_copies (organization_id, channel_session_id, normalized_text, normalized_hash, sent_at)
-     values ($1, $2, $3, $4, $5)`,
+     values ($1, $2, $3, $4, $5)
+     returning id`,
     [tenantId, channelSessionId, normalized, hashNormalized(normalized), sentAt],
   );
+  return rows?.[0]?.id ?? null;
 }

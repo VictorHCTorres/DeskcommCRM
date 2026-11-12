@@ -11,9 +11,11 @@ import {
  *
  * `runBeforeSend` é o dono da posse do lock do NÚMERO: ele toma conexão do pool,
  * abre transação, `select pg_advisory_xact_lock(hashtext(channelSessionId))`,
- * carrega o estado, julga a cadeia, envia e só então commita. Enquanto essa
- * transação está aberta, dois workers escrevendo no MESMO WhatsApp ficam em fila —
- * é exatamente para isso que o lock existe.
+ * carrega o estado, julga a cadeia, grava o registro da saída e commita. Enquanto
+ * essa transação está aberta, dois workers escrevendo no MESMO WhatsApp ficam em
+ * fila — é exatamente para isso que o lock existe. Desde a F4p do cxj (P01, P02 e
+ * P05), o envio sai DEPOIS do commit, já sem a transação e sem a conexão: a trava
+ * serializa a decisão e o registro, não o transporte.
  *
  * A pausa humana ("digitando…", 1.2s–7.5s) morava DO LADO DE DENTRO desse caminho:
  * no `antesDaPrimeira` do `sendInBubbles`, que roda dentro do callback `send`, isto é,
@@ -111,7 +113,8 @@ describe('a pausa humana é paga FORA da posse do lock do número (#654)', () =>
     // ...e é paga ANTES de qualquer contato com o banco. Sem isso ela volta a
     // acontecer com a transação aberta e o número fica em fila durante a pausa.
     expect(eventos[0]).toBe('connect');
-    expect(eventos).toEqual(['connect', 'begin', 'lock', 'send', 'commit']);
+    // O envio sai depois do commit do registro (F4p do cxj): fora da trava, como a espera.
+    expect(eventos).toEqual(['connect', 'begin', 'lock', 'commit', 'send']);
   });
 
   it('a janela begin→commit não contém a espera: a posse fica menor que a pausa', async () => {
@@ -157,7 +160,7 @@ describe('a pausa humana é paga FORA da posse do lock do número (#654)', () =>
   it('sem o gancho, nada muda para os outros chamadores do guardrail', async () => {
     // Os outros call sites (marcação por regra, cadência/heartbeat, fecho de
     // handoff, retomada) não têm pausa humana: gancho ausente = sem pausa, e o envio
-    // sai pelo caminho de sempre, já com a posse do lock — que é o desenho deles.
+    // sai pelo caminho de sempre — depois do commit do registro, fora da trava (F4p do cxj).
     const eventos: Eventos = [];
     const { pool } = poolFalso(eventos);
 
@@ -171,6 +174,6 @@ describe('a pausa humana é paga FORA da posse do lock do número (#654)', () =>
     );
 
     expect(r.status).toBe('sent');
-    expect(eventos).toEqual(['connect', 'begin', 'lock', 'send', 'commit']);
+    expect(eventos).toEqual(['connect', 'begin', 'lock', 'commit', 'send']);
   });
 });

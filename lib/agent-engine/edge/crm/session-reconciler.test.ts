@@ -7,6 +7,22 @@ import { deveRetomarSessao, redriveQueued } from "./session-reconciler";
 afterEach(() => vi.restoreAllMocks());
 
 /**
+ * O pool do resgate. Desde a F4p do cxj (P07), o resgate reserva a vaga no limite do número
+ * antes de mandar (`reservarVaga`), numa conexão própria: o dublê dela responde como um número
+ * com vaga (nenhuma saída no dia, nenhuma recente). A prova da vaga no Postgres real está em
+ * `tests/invariants/resgate-da-fila-conta-a-saida.test.ts`.
+ */
+function poolDoResgate(query: unknown): pg.Pool {
+  const conexaoDaVaga = {
+    query: vi.fn(async (sql: string) =>
+      /as ultimo/.test(String(sql)) ? { rows: [{ ultimo: null, do_dia: "0" }] } : { rows: [] },
+    ),
+    release: vi.fn(),
+  };
+  return { query, connect: vi.fn(async () => conexaoDaVaga) } as unknown as pg.Pool;
+}
+
+/**
  * A regra que decide se o watchdog RELIGA a sessão. Religar FAILED é o que o
  * vigia de saúde recusa (pode ser banimento); SCAN_QR_CODE e STARTING já têm
  * dono. Só STOPPED: credencial no disco, sessão parada depois de restart.
@@ -37,7 +53,7 @@ describe("redrive pré-go-live", () => {
       .mockResolvedValueOnce({ rows: [{ n: "0" }] })
       .mockRejectedValueOnce(new Error("banco indisponível"));
 
-    expect(await redriveQueued({ query } as unknown as pg.Pool, {
+    expect(await redriveQueued(poolDoResgate(query), {
       wahaBaseUrl: "http://127.0.0.1:9999", wahaApiKey: "test-key",
       intervalMs: 1, redriveMinAgeMs: 0, redriveBatchSize: 10, redriveSpacingMs: 0,
     }, createLogger())).toBe(0);
@@ -120,7 +136,7 @@ describe("resgate da fila — a mensagem da AUTOMAÇÃO é alcançada (#652)", (
       },
     ]);
 
-    const reenviadas = await redriveQueued({ query } as unknown as pg.Pool, {
+    const reenviadas = await redriveQueued(poolDoResgate(query), {
       wahaBaseUrl: "http://127.0.0.1:9999",
       wahaApiKey: "test-key",
       intervalMs: 1,
@@ -157,7 +173,7 @@ describe("resgate da fila — a mensagem da AUTOMAÇÃO é alcançada (#652)", (
     ]);
 
     expect(
-      await redriveQueued({ query } as unknown as pg.Pool, {
+      await redriveQueued(poolDoResgate(query), {
         wahaBaseUrl: "http://127.0.0.1:9999",
         wahaApiKey: "test-key",
         intervalMs: 1,
@@ -184,7 +200,7 @@ describe("redrive × organização parada", () => {
       .mockResolvedValueOnce({ rows: [{ metadata: {}, phone_number: "+5511999998888", operante: false }] })
       .mockResolvedValue({ rows: [] });
 
-    expect(await redriveQueued({ query } as unknown as pg.Pool, {
+    expect(await redriveQueued(poolDoResgate(query), {
       wahaBaseUrl: "http://127.0.0.1:9999", wahaApiKey: "test-key",
       intervalMs: 1, redriveMinAgeMs: 0, redriveBatchSize: 10, redriveSpacingMs: 0,
     }, createLogger())).toBe(0);
@@ -207,7 +223,7 @@ describe("redrive × canal pausado (#2318)", () => {
       .mockResolvedValueOnce({ rows: [{ metadata: { disabled: true }, phone_number: "+5511999998888", operante: true }] })
       .mockResolvedValue({ rows: [] });
 
-    expect(await redriveQueued({ query } as unknown as pg.Pool, {
+    expect(await redriveQueued(poolDoResgate(query), {
       wahaBaseUrl: "http://127.0.0.1:9999", wahaApiKey: "test-key",
       intervalMs: 1, redriveMinAgeMs: 0, redriveBatchSize: 10, redriveSpacingMs: 0,
     }, createLogger())).toBe(0);
@@ -246,7 +262,7 @@ describe("redrive × ficha com telefone extra (Spec 31 B1)", () => {
       return { rows: [] };
     });
 
-    const reenviadas = await redriveQueued({ query } as unknown as pg.Pool, {
+    const reenviadas = await redriveQueued(poolDoResgate(query), {
       wahaBaseUrl: "http://127.0.0.1:9999", wahaApiKey: "test-key",
       intervalMs: 1, redriveMinAgeMs: 0, redriveBatchSize: 10, redriveSpacingMs: 0,
     }, createLogger());
@@ -293,7 +309,7 @@ describe("redrive × campanha de prospecção (F4i)", () => {
       if (/from campaigns/i.test(sql)) return campanha(sql, params);
       return { rows: [] };
     });
-    const rodar = () => redriveQueued({ query } as unknown as pg.Pool, CFG, createLogger());
+    const rodar = () => redriveQueued(poolDoResgate(query), CFG, createLogger());
     const bloqueio = () => consultas.find((c) => c.sql.includes("error_code = 'campanha_sem_reenvio'"));
     const leuCampanha = () => consultas.filter((c) => /from campaigns/i.test(c.sql));
     return { send, rodar, bloqueio, leuCampanha };
@@ -371,5 +387,74 @@ describe("redrive × campanha de prospecção (F4i)", () => {
     expect(await c.rodar()).toBe(0);
     expect(c.send).not.toHaveBeenCalled();
     expect(c.bloqueio()).toBeDefined();
+  });
+});
+
+describe("resgate × vaga no limite do número (F4p do cxj, P07)", () => {
+  const CFG_DA_VAGA = {
+    wahaBaseUrl: "http://127.0.0.1:9999",
+    wahaApiKey: "test-key",
+    intervalMs: 1,
+    redriveMinAgeMs: 0,
+    redriveBatchSize: 10,
+    redriveSpacingMs: 0,
+  };
+  const presa = {
+    id: "m-vaga",
+    organization_id: "org-1",
+    conversation_id: "conversa-1",
+    body: "Oi! Consegui ver o seu caso.",
+    sent_via: "ai",
+    waha_session_name: "default",
+    wa_identity: null,
+    wa_lid: null,
+    phone_number: "+5531999998888",
+    is_group: false,
+    group_chat_id: null,
+    channel_session_id: "numero-1",
+    daily_message_limit: 60,
+    provider: "waha",
+  };
+
+  it("o WAHA recusa (4xx) e o banco recusa devolver a vaga: a mensagem fica na fila, e o log leva o número e o instante", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("{}", { status: 422 }));
+    const { query: daFila } = bancoComFila([presa]);
+    const query = vi.fn(async (sql: string) => {
+      if (/delete from pacing_ledger/i.test(sql)) throw new Error("banco fora do ar");
+      return daFila(sql);
+    });
+    const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const agora = new Date("2026-11-18T14:00:00Z");
+
+    const reenviadas = await redriveQueued(
+      poolDoResgate(query),
+      CFG_DA_VAGA,
+      log as unknown as ReturnType<typeof createLogger>,
+      undefined,
+      () => agora,
+    );
+
+    expect(reenviadas).toBe(0);
+    expect(log.error).toHaveBeenCalledWith(
+      expect.stringMatching(/vaga de um reenvio que não saiu ficou no limite do número/),
+      expect.objectContaining({ message_id: "m-vaga", channel_session_id: "numero-1", sent_at: agora.toISOString() }),
+    );
+  });
+
+  it("sem vaga no número: o resgate não chama o WAHA nem mexe na mensagem", async () => {
+    const send = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("{}", { status: 200 }));
+    const { query } = bancoComFila([presa]);
+    const semVaga = {
+      query: vi.fn(async (sql: string) =>
+        /as ultimo/.test(String(sql)) ? { rows: [{ ultimo: null, do_dia: "60" }] } : { rows: [] },
+      ),
+      release: vi.fn(),
+    };
+    const pool = { query, connect: vi.fn(async () => semVaga) } as unknown as pg.Pool;
+
+    expect(await redriveQueued(pool, CFG_DA_VAGA, createLogger())).toBe(0);
+
+    expect(send).not.toHaveBeenCalled();
+    expect(query).not.toHaveBeenCalledWith(expect.stringMatching(/update messages/i), expect.anything());
   });
 });
