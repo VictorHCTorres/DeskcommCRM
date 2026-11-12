@@ -40,6 +40,8 @@ const mundo = vi.hoisted(() => ({
   erros: [] as unknown[][],
   /** O que foi para `logger.warn`: a rodada que falhou diz o que a rajada já tinha feito (F4k, K08). */
   avisos: [] as unknown[][],
+  /** Roda dentro do registro do envio no ledger do número; o que lançar é o INSERT recusado (F4l, L03/L06). */
+  aoRegistrar: null as null | ((numero: string) => void),
 }));
 
 vi.mock("@/lib/logger", () => ({
@@ -60,6 +62,7 @@ vi.mock("@/lib/agent-engine/pacing/store", () => ({
     return { lastSentAt: envios.at(-1) ?? null, sentToday: envios.length, numberActivatedAt: null };
   },
   recordSend: async (_pool: unknown, _org: string, sessionId: string, quando: Date) => {
+    mundo.aoRegistrar?.(sessionId);
     mundo.ledger.set(sessionId, [...(mundo.ledger.get(sessionId) ?? []), quando]);
   },
 }));
@@ -296,6 +299,7 @@ beforeEach(() => {
   mundo.ctxs.length = 0;
   mundo.erros.length = 0;
   mundo.avisos.length = 0;
+  mundo.aoRegistrar = null;
   vi.useRealTimers();
 });
 
@@ -1910,5 +1914,271 @@ describe("8. o contrato da revisão F4k do cxj (11/11/2026): a rajada que para p
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("9. os contratos da revisão F4l do cxj (11/11/2026): o envio fora do teto do número, o andamento que não se lê", () => {
+  /** A campanha A sozinha, em rajada (rápida, com modelo), falando só pelo vinculado, com estes pendentes. */
+  const rajadaSozinha = (...contatos: string[]): Tabelas => {
+    const tabelas = duasCampanhasNoVinculado();
+    tabelas.campaigns = tabelas.campaigns!.filter((c) => c.id === "camp-a");
+    Object.assign(tabelas.campaigns[0]!, { velocidade: "rapida", message_mode: "template" });
+    tabelas.campaign_recipients = contatos.map((contato) =>
+      pendente(contato, ["funil-a"], { campaign_id: "camp-a", variables: { modelo: {} } }),
+    );
+    return tabelas;
+  };
+  /** A rodada com o relógio falso: a rajada espera entre um início e outro. */
+  const rodadaNoRelogio = async (admin: unknown) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(QUARTA);
+    try {
+      const rodada = rodarUmaRodadaDeCampanha(admin as never, QUARTA);
+      await vi.runAllTimersAsync();
+      return await rodada;
+    } finally {
+      vi.useRealTimers();
+    }
+  };
+  /**
+   * O banco que devolve erro na 1ª leitura do status da campanha feita com `envios` envios já saídos. Na
+   * rajada, a 1ª com 0 é a do andamento antes do 1º lote; a 1ª com 1 é a do andamento depois do 1º envio (a da
+   * reserva, que também lê o status, vem antes do envio).
+   */
+  const andamentoComErro = (tabelas: Tabelas, envios: number) => {
+    const inteiro = fakeAdmin(tabelas) as unknown as { from: (t: string) => Record<string, unknown> };
+    let falhou = false;
+    return {
+      from: (tabela: string) => {
+        const consulta = inteiro.from(tabela);
+        if (tabela !== "campaigns") return consulta;
+        return new Proxy(consulta, {
+          get: (alvo, metodo) =>
+            metodo === "select"
+              ? (colunas: string, opcoes?: unknown) => {
+                  if (colunas === "status" && !falhou && mundo.envios.length === envios) {
+                    falhou = true;
+                    return cadeiaComErro("andamento indisponível");
+                  }
+                  return (alvo.select as (c: string, o?: unknown) => unknown)(colunas, opcoes);
+                }
+              : alvo[metodo as string],
+        });
+      },
+    };
+  };
+  const TETO_SEM_REGISTRO = {
+    status: "paused",
+    failure_code: "teto_sem_registro",
+    failure_detail: "Um envio não entrou na contagem do limite diário do número.",
+  };
+  const ledgerRecusa = (quando: (numero: string) => boolean = () => true) => {
+    mundo.aoRegistrar = (numero) => {
+      if (quando(numero)) throw new Error("INSERT no ledger recusado");
+    };
+  };
+
+  // ─── L01: o andamento que não se lê não pode passar por “a campanha parou” ───
+
+  it.each([
+    [0, "rajada:0:erro"],
+    [1, "rajada:1(enviado×1):erro"],
+  ] as const)(
+    "L01 ⭐ a leitura do andamento da rajada falha com %i envio(s) feito(s): a rodada diz erro, avisa o motivo, e a campanha segue em andamento",
+    async (envios, parcial) => {
+      const tabelas = rajadaSozinha("ana");
+      const r = await rodadaNoRelogio(andamentoComErro(tabelas, envios));
+      expect(r.detalhe).toContain("camp-a:erro");
+      expect(r.enviadas).toBe(envios);
+      expect(mundo.avisos).toEqual([
+        [
+          "[campanha] rodada falhou",
+          { campanha: "camp-a", motivo: "o andamento da campanha não foi lido: andamento indisponível", parcial },
+        ],
+      ]);
+      expect(unica(tabelas, "campaigns").status).toBe("running");
+      expect(unica(tabelas, "campaigns").failure_code).toBeUndefined();
+    },
+  );
+
+  it("L01 controle: a campanha pausada pela tela depois do 1º envio (lida sem erro) para a rajada sem aviso", async () => {
+    const tabelas = rajadaSozinha("ana");
+    mundo.aoEnviar = async () => void Object.assign(unica(tabelas, "campaigns"), { status: "paused" });
+    const r = await rodadaNoRelogio(fakeAdmin(tabelas));
+    expect(mundo.envios).toEqual(["conv:ana:vinculado"]);
+    expect(mundo.avisos).toEqual([]);
+    expect(r.detalhe).toContain("fora_de_andamento");
+    expect(r.detalhe).not.toContain("erro");
+  });
+
+  // ─── L03/L06: o envio que saiu e não entrou no teto do número ───
+
+  it("L03 ⭐ rajada: o ledger recusa o registro do 1º envio: só ele sai, conta como enviado, e a campanha pausa com o motivo", async () => {
+    const tabelas = rajadaSozinha("ana", "caio", "dora");
+    ledgerRecusa();
+    const r = await rodadaNoRelogio(fakeAdmin(tabelas));
+    expect(mundo.envios).toEqual(["conv:ana:vinculado"]);
+    expect(r.enviadas).toBe(1);
+    expect(r.concluidas).toBe(0);
+    expect(r.detalhe).toContain("pausada:teto_sem_registro");
+    expect(unica(tabelas, "campaigns")).toMatchObject(TETO_SEM_REGISTRO);
+    const [ana, caio, dora] = tabelas.campaign_recipients!;
+    expect(ana).toMatchObject({ status: "sent", message_id: "msg-1", last_error_code: null });
+    expect(caio).toMatchObject({ status: "pending" });
+    expect(dora).toMatchObject({ status: "pending" });
+    expect(mundo.erros).toEqual([
+      [
+        "[campanha] o envio não entrou no teto do número; a campanha pausou",
+        { campanha: "camp-a", destinatario: "r-ana", numero: "vinculado", motivo: "INSERT no ledger recusado" },
+      ],
+    ]);
+  });
+
+  /** A gradual com 59 de 60 no dia do número, e três pendentes, em três rodadas seguidas (L06 do cxj). */
+  const tresRodadasComUmaVaga = async (falhar: boolean) => {
+    const { tabelas, admin } = cenario(campanha("legitimate_interest"), pendente("ana"));
+    tabelas.campaign_recipients!.push(pendente("bia"), pendente("caio"));
+    Object.assign(tabelas.channel_sessions![0]!, { daily_message_limit: 60 });
+    mundo.knobs = { ...mundo.knobs, warmupDailyCaps: [{ minAgeDays: 0, cap: null }] } as PacingKnobs;
+    mundo.ledger.set("chip", Array.from({ length: 59 }, () => new Date(QUARTA.getTime() - 3_600_000)));
+    if (falhar) ledgerRecusa();
+    let enviadas = 0;
+    for (let i = 0; i < 3; i++) enviadas += (await rodarUmaRodadaDeCampanha(admin, new Date(QUARTA.getTime() + i * 60_000))).enviadas;
+    return { tabelas, enviadas };
+  };
+
+  it("L06 ⭐ gradual com uma vaga no dia: o ledger recusa o registro: sai uma só em três rodadas, conta, e a campanha pausa", async () => {
+    const { tabelas, enviadas } = await tresRodadasComUmaVaga(true);
+    expect(mundo.envios).toEqual(["conv:ana:chip"]);
+    expect(enviadas).toBe(1);
+    expect(unica(tabelas, "campaigns")).toMatchObject({ ...TETO_SEM_REGISTRO, paused_at: QUARTA.toISOString() });
+    expect(tabelas.campaign_recipients!.map((d) => d.status)).toEqual(["sent", "pending", "pending"]);
+    expect(mundo.erros).toHaveLength(1);
+  });
+
+  it("L06 controle: sem a falha, o teto do número segura as outras duas, e a campanha segue em andamento", async () => {
+    const { tabelas, enviadas } = await tresRodadasComUmaVaga(false);
+    expect(mundo.envios).toEqual(["conv:ana:chip"]);
+    expect(enviadas).toBe(1);
+    expect(unica(tabelas, "campaigns")).toMatchObject({ status: "running" });
+    expect(mundo.ledger.get("chip")).toHaveLength(60);
+    expect(mundo.erros).toEqual([]);
+  });
+
+  it("L06 ⭐ o ledger recusa o registro: as outras campanhas em andamento do mesmo número também pausam; as de outro número, de outra organização e as encerradas, não", async () => {
+    const outra = (contato: string, telefone: string, campanhaId: string) =>
+      pendente(contato, ["funil-a"], { campaign_id: campanhaId, recipient_address: telefone }, { phone_number: telefone });
+    const tabelas: Tabelas = {
+      campaigns: [
+        campanha("legitimate_interest", { id: "camp-a" }),
+        campanha("legitimate_interest", { id: "camp-b", started_at: "2026-11-18T11:55:05.000Z" }),
+        campanha("legitimate_interest", { id: "camp-c", channel_session_id: "outro" }),
+        campanha("legitimate_interest", { id: "camp-x", organization_id: "org-2" }),
+        campanha("legitimate_interest", { id: "camp-z", status: "completed" }),
+      ],
+      campaign_recipients: [
+        pendente("ana", ["funil-a"], { campaign_id: "camp-a" }),
+        outra("bia", "+5588999991111", "camp-b"),
+        outra("cleo", "+5588999992222", "camp-c"),
+        outra("dani", "+5588999993333", "camp-c"),
+      ],
+      campaign_channel_sessions: [],
+      channel_sessions: [
+        { id: "chip", organization_id: "org-1", status: "WORKING", daily_message_limit: null },
+        { id: "outro", organization_id: "org-1", status: "WORKING", daily_message_limit: null },
+      ],
+      campaign_suppressions: [],
+      messages: [],
+      crm_leads: [],
+      conversations: [],
+    };
+    ledgerRecusa((numero) => numero === "chip");
+    await rodarUmaRodadaDeCampanha(fakeAdmin(tabelas), QUARTA);
+    await rodarUmaRodadaDeCampanha(fakeAdmin(tabelas), new Date(QUARTA.getTime() + 60_000));
+    const daCampanha = (id: string) => tabelas.campaigns!.find((c) => c.id === id)!;
+    expect(mundo.envios).not.toContain("conv:bia:chip");
+    expect(daCampanha("camp-a")).toMatchObject(TETO_SEM_REGISTRO);
+    expect(daCampanha("camp-b")).toMatchObject(TETO_SEM_REGISTRO);
+    for (const id of ["camp-c", "camp-x", "camp-z"]) expect(daCampanha(id).failure_code).toBeUndefined();
+    expect(daCampanha("camp-c").status).toBe("running");
+    expect(daCampanha("camp-z").status).toBe("completed");
+    // Pelo número sem registro, só o envio que achou a recusa; pelo outro número, a campanha segue.
+    expect(mundo.envios.filter((e) => e.endsWith(":chip"))).toEqual(["conv:ana:chip"]);
+    expect(mundo.envios).toContain("conv:cleo:outro");
+    expect(tabelas.campaign_recipients!.find((d) => d.id === "r-bia")).toMatchObject({ status: "pending" });
+  });
+
+  it.each([1, 2])(
+    "a %iª escrita da pausa do teto sem registro é recusada pelo banco: fica o log de erro",
+    async (qual) => {
+      const { tabelas } = cenario(campanha("legitimate_interest"), pendente("ana"));
+      let escritas = 0;
+      const admin = fakeAdmin(tabelas, {
+        recusar: (tabela, patch) =>
+          tabela === "campaigns" && patch.failure_code === "teto_sem_registro" && ++escritas === qual,
+      });
+      ledgerRecusa();
+      await rodarUmaRodadaDeCampanha(admin, QUARTA);
+      expect(mundo.erros).toContainEqual([
+        "[campanha] a pausa do teto sem registro não foi gravada",
+        { campanha: "camp", numero: "chip", motivo: "o banco recusou a escrita em campaigns" },
+      ]);
+    },
+  );
+
+  it.each(["legitimate_interest", "consent"] as const)(
+    "⭐ balões (%s): o ledger recusa o registro do 1º: o 2º não sai, o destinatário conta como enviado, e a campanha pausa",
+    async (base) => {
+      const { tabelas, admin } = cenario(
+        campanha(base, { split_messages: true }),
+        pendente("ana", ["funil-a"], { rendered_body: "Primeiro parágrafo.\n\nSegundo parágrafo." }),
+      );
+      ledgerRecusa();
+      const r = await rodarUmaRodadaDeCampanha(admin, QUARTA);
+      expect(mundo.envios).toEqual(["conv:ana:chip"]);
+      expect(r).toMatchObject({ enviadas: 1, detalhe: "camp:pausada:teto_sem_registro" });
+      expect(unica(tabelas, "campaign_recipients")).toMatchObject({ status: "sent", message_id: "msg-1" });
+      expect(unica(tabelas, "campaigns")).toMatchObject(TETO_SEM_REGISTRO);
+    },
+  );
+
+  it("⭐ balões: o ledger registra o 1º e recusa o 2º: o 3º não sai, e o destinatário conta como enviado pelo 1º", async () => {
+    const { tabelas, admin } = emBaloes("Um.\n\nDois.\n\nTrês.");
+    ledgerRecusa(() => mundo.envios.length === 2);
+    const r = await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(mundo.envios).toHaveLength(2);
+    expect(r.enviadas).toBe(1);
+    expect(unica(tabelas, "campaign_recipients")).toMatchObject({ status: "sent", message_id: "msg-1" });
+    expect(unica(tabelas, "campaigns")).toMatchObject(TETO_SEM_REGISTRO);
+    expect(mundo.ledger.get("chip")).toHaveLength(1);
+  });
+
+  it("⭐ o envio incerto (queued sem o motivo) que não entrou no teto: a campanha pausa do mesmo jeito, e o destinatário fica incerto", async () => {
+    const { tabelas, admin } = cenario(campanha("legitimate_interest"), pendente("ana"));
+    mundo.aoEnviar = async () => naFila(tabelas, "m-incerta", null);
+    ledgerRecusa();
+    await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(unica(tabelas, "campaign_recipients")).toMatchObject({ status: "failed", last_error_code: "envio_incerto" });
+    expect(unica(tabelas, "campaigns")).toMatchObject(TETO_SEM_REGISTRO);
+  });
+
+  it("controle: na campanha de consentimento, o balão retido pelo canal não para os seguintes, como antes (o resgate manda o retido)", async () => {
+    const { tabelas, admin } = cenario(
+      campanha("consent", { split_messages: true }),
+      pendente("ana", ["funil-a"], { rendered_body: "Primeiro parágrafo.\n\nSegundo parágrafo." }),
+    );
+    mundo.aoEnviar = async () => (mundo.envios.length === 1 ? naFila(tabelas, "m-1") : undefined);
+    await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(mundo.envios).toHaveLength(2);
+    expect(unica(tabelas, "campaigns")).toMatchObject({ status: "running" });
+  });
+
+  it("controle: com o ledger registrando, a campanha segue em andamento, sem motivo de pausa e sem log de erro", async () => {
+    const { tabelas, admin } = cenario(campanha("legitimate_interest"), pendente("ana"));
+    const r = await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(r.detalhe).toMatch(/^camp:enviado:sent:/);
+    expect(unica(tabelas, "campaigns")).toMatchObject({ status: "running" });
+    expect(unica(tabelas, "campaigns").failure_code).toBeUndefined();
+    expect(mundo.erros).toEqual([]);
   });
 });

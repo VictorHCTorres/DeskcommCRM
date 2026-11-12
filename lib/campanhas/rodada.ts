@@ -382,7 +382,11 @@ async function rodarCampanhaEmRajada(
       buscarLote: (quantos) => pendentesDaCampanha(admin, campanha.id, new Date(), quantos),
       enviarUm: (alvo) => rodarUmaCampanha(admin, campanha, new Date(), numerosJaUsados, alvo),
       aindaEmAndamento: async () => {
-        const { data } = await admin.from("campaigns").select("status").eq("id", campanha.id).maybeSingle();
+        const { data, error } = await admin.from("campaigns").select("status").eq("id", campanha.id).maybeSingle();
+        // Sem ler, ninguém sabe se a campanha parou (F4l, L01 do cxj): o erro lido
+        // como “parou” encerrava a rajada calado, e a campanha seguia `running` sem
+        // aviso. Lança, e a rodada registra o erro com o que a rajada já tinha feito.
+        if (error) throw new Error(`o andamento da campanha não foi lido: ${error.message}`);
         return (data as { status?: string } | null)?.status === "running";
       },
       concluirSeAcabou: () => rodarUmaCampanha(admin, campanha, new Date(), numerosJaUsados),
@@ -706,6 +710,10 @@ async function rodarUmaCampanha(
     // `maxBaloes = baloesPrevistos`: o teto foi conferido para esse número.
     const baloes = comModelo ? [corpo] : baloesDaCampanha(corpo, dividir, baloesPrevistos);
     const relogioDosBaloes = Date.now();
+    // O registro no ledger que o banco recusou depois de o balão sair (F4l, L03/L06
+    // do cxj). Uma lista, e não um `let`: preenchida só dentro do `registrar`, o
+    // compilador a daria como sempre vazia aqui fora.
+    const registrosRecusados: unknown[] = [];
     // O tipo vai explícito: com o `registrar` e o `parar` lendo o desfecho, o
     // compilador não o tira mais do retorno do `enviar`.
     const { primeira, desfecho: mensagem, indiceDoDesfecho } = await enviarEmBaloes<Message>(baloes, {
@@ -765,15 +773,23 @@ async function rodarUmaCampanha(
       // chamou o provedor) não entra: ela não sai nunca (F4i, A1), e contá-la
       // gastava o teto do dia do número com uma tentativa que não falou com
       // ninguém (F4j, J05/J09 do cxj). A incerta entra: pode ter saído.
-      registrar: (i, desfecho) =>
-        ehProspeccao(campanha) && retidaPeloCanal(desfecho)
-          ? Promise.resolve()
-          : recordSend(
-              pool,
-              campanha.organization_id,
-              sessionEscolhida,
-              i === 0 ? agora : new Date(agora.getTime() + (Date.now() - relogioDosBaloes)),
-            ),
+      // O registro recusado não sobe mais como exceção (F4l, L03/L06 do cxj): ela
+      // dava o envio que saiu como falha (`send_exception`), sem contá-lo, e a
+      // campanha seguia sem o teto do dia ver a mensagem — com 59 de 60, saíam
+      // mais três em três rodadas. Fica guardado, e a campanha pausa abaixo.
+      registrar: async (i, desfecho) => {
+        if (ehProspeccao(campanha) && retidaPeloCanal(desfecho)) return;
+        try {
+          await recordSend(
+            pool,
+            campanha.organization_id,
+            sessionEscolhida,
+            i === 0 ? agora : new Date(agora.getTime() + (Date.now() - relogioDosBaloes)),
+          );
+        } catch (err) {
+          registrosRecusados.push(err);
+        }
+      },
       // Pausa curta e fixa no ritmo anti-ban do número, nunca o intervalo da
       // campanha: este laço é dividido por todas as campanhas da instalação.
       esperar: () => new Promise((ok) => setTimeout(ok, pausaEntreBaloes(knobs))),
@@ -785,15 +801,33 @@ async function rodarUmaCampanha(
       ...(ehProspeccao(campanha)
         ? {
             continuar: async () => (await conferenciaFinal(admin, entrega, agora, ESTADOS_DE_QUEM_RECEBEU)) === null,
-            // O balão que não saiu para os seguintes: o que o canal segurou na
-            // fila física (F4i, A1), porque se o canal voltasse na pausa o
-            // próximo sairia sem ele; e o incerto (`queued` sem o motivo), porque
-            // o seguinte que saísse viraria o desfecho e esconderia a incerteza
-            // (F4j, J04 do cxj).
-            parar: (desfecho) => !SAIU.has(desfecho.status ?? ""),
           }
         : {}),
+      // Na prospecção, o balão que não saiu para os seguintes: o que o canal
+      // segurou na fila física (F4i, A1), porque se o canal voltasse na pausa o
+      // próximo sairia sem ele; e o incerto (`queued` sem o motivo), porque o
+      // seguinte que saísse viraria o desfecho e esconderia a incerteza (F4j, J04
+      // do cxj). Em toda campanha, o que não entrou no teto do número (F4l): cada
+      // balão seguinte seria mais uma saída fora da conta do dia.
+      parar: (desfecho) =>
+        registrosRecusados.length > 0 || (ehProspeccao(campanha) && !SAIU.has(desfecho.status ?? "")),
     });
+
+    // O ledger recusou o registro (F4l, L03/L06 do cxj): a campanha pausa antes de
+    // qualquer desfecho — inclusive o da fila do canal e o do limite —, junto com
+    // as outras do mesmo número, e nada sai delas até alguém conferir o número e
+    // retomar. O desfecho segue como sempre: o envio que saiu conta, e o
+    // destinatário fica `sent`.
+    if (registrosRecusados.length > 0) {
+      const [recusa] = registrosRecusados;
+      logger.error("[campanha] o envio não entrou no teto do número; a campanha pausou", {
+        campanha: campanha.id,
+        destinatario: alvo.id,
+        numero: sessionEscolhida,
+        motivo: recusa instanceof Error ? recusa.message : String(recusa),
+      });
+      await pausarPeloTetoSemRegistro(admin, campanha, sessionEscolhida, agora);
+    }
 
     // O desfecho vem do ESTADO da mensagem, nunca da ausência de exceção — o
     // handler marca `failed` e devolve normalmente. Com balões, o desfecho é o
@@ -874,7 +908,11 @@ async function rodarUmaCampanha(
       enviadas: falhou ? 0 : 1,
       pulados: 0,
       concluidas: 0,
-      detalhe: `enviado:${status ?? "?"}:${escolha.motivo}`,
+      // A pausa do teto sem registro aparece na rodada e para a rajada (`pausada:`).
+      detalhe:
+        registrosRecusados.length > 0
+          ? `pausada:${TETO_SEM_REGISTRO.codigo}`
+          : `enviado:${status ?? "?"}:${escolha.motivo}`,
       numero: sessionEscolhida,
     };
   } catch (err) {
@@ -1236,6 +1274,51 @@ export async function falhaQueParaACampanha(
     }
   }
   return null;
+}
+
+/**
+ * A pausa do envio que não entrou no teto do número (F4l, L03/L06 do cxj). A
+ * frase vai à tela em `failure_detail`, traduzida pelo dicionário.
+ */
+const TETO_SEM_REGISTRO = {
+  codigo: "teto_sem_registro",
+  detalhe: "Um envio não entrou na contagem do limite diário do número.",
+} as const;
+
+/**
+ * Pausa a campanha do envio e as outras em andamento cujo número PRINCIPAL é o do
+ * envio: elas leriam o ledger sem a mensagem, e o número passaria do teto do dia
+ * (F4l, L06 do cxj; na Linha A, o 1º toque, o 2º e a despedida dividem o chip). A
+ * que só usa o número no rodízio segue. A escrita recusada fica no log: sem ela,
+ * ninguém saberia que a campanha continuou mandando.
+ */
+async function pausarPeloTetoSemRegistro(
+  admin: SupabaseClient,
+  campanha: CampanhaRow,
+  numero: string,
+  agora: Date,
+): Promise<void> {
+  const pausa = {
+    status: "paused",
+    paused_at: agora.toISOString(),
+    failure_code: TETO_SEM_REGISTRO.codigo,
+    failure_detail: TETO_SEM_REGISTRO.detalhe,
+  };
+  const daCampanha = await admin.from("campaigns").update(pausa).eq("id", campanha.id).eq("status", "running");
+  const doNumero = await admin
+    .from("campaigns")
+    .update(pausa)
+    .eq("organization_id", campanha.organization_id)
+    .eq("channel_session_id", numero)
+    .eq("status", "running");
+  const recusa = daCampanha.error ?? doNumero.error;
+  if (recusa) {
+    logger.error("[campanha] a pausa do teto sem registro não foi gravada", {
+      campanha: campanha.id,
+      numero,
+      motivo: recusa.message,
+    });
+  }
 }
 
 /**
