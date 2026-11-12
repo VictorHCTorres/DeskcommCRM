@@ -26,6 +26,11 @@
  * de novo); e, confirmado o transporte, a linha recua para a hora em que ele voltou. O V02 é o do cxj, copiado da cópia da
  * revisão (`tests/invariants/revisao-cxj-f4v-fronteiras.test.ts`); o V01 dele é impossível como escrito (a IA sai a
  * 3,1 s e o resgate a 7 s, com 5 s de intervalo), e entra adaptado: o resgate espera, e sai no tique que cabe.
+ *
+ * Versão 18 (F4w do cxj, 12/11/2026: W12). A espera que acompanha a linha contava só a soma das fatias, e o tempo de
+ * cada releitura ficava de fora: com leituras de 1 s, a resposta que devia esperar 11,2 s esperava 34,2 s. Agora o
+ * tempo que passou é o maior entre a soma das fatias e o relógio: a espera termina quando o intervalo passou. O W12 é
+ * o do cxj, copiado da cópia da revisão (`tests/invariants/revisao-cxj-f4w-fronteiras.test.ts`), com a conta nova.
  */
 import { randomUUID } from "node:crypto";
 import pg from "pg";
@@ -1107,5 +1112,94 @@ describe("versão 17 — a espera conta do relógio sob a trava, e a saída da I
     expect(r.status).toBe("sent");
     expect(esperas).toEqual([15_000]);
     expect(await ultimaVaga(f)).toBe(+agora + 15_000);
+  });
+});
+
+/** A fachada do cxj (F4w, W12): o banco é o de verdade; `depois` roda logo depois de cada releitura da última linha. */
+function comReleituraDaUltimaLinha(depois: () => void) {
+  return {
+    query: pool.query.bind(pool),
+    connect: async () => {
+      const db = await pool.connect();
+      const query = db.query.bind(db);
+      return {
+        query: async (...args: unknown[]) => {
+          const r = await Reflect.apply(query, db, args);
+          if (String(args[0]).trim().startsWith("select sent_at from pacing_ledger")) depois();
+          return r;
+        },
+        release: db.release.bind(db),
+      };
+    },
+  } as unknown as pg.Pool;
+}
+
+describe("versão 18 — a espera que acompanha a linha conta o tempo das releituras (F4w do cxj, W12)", () => {
+  /** O número com intervalo de 1,2 s e uma saída em curso com a hora mais tardia aos 10 s: a resposta sai aos 11,2 s. */
+  async function comSaidaEmCurso() {
+    const f = await fixture();
+    await pool.query("update channel_knobs set throttle_ms=1200 where channel_session_id=$1", [f.session]);
+    await recordSend(pool, f.org, f.session, new Date(+agora + 10_000), { resposta: true });
+    return f;
+  }
+
+  it("W12 ⭐ (cxj) com releituras de 1 s, a espera termina quando o intervalo passou, e não 23 releituras depois", async () => {
+    const f = await comSaidaEmCurso();
+    let relogio = +agora, leituras = 0, dormiu = 0;
+    const r = await responderCom(f, {
+      pool: comReleituraDaUltimaLinha(() => {
+        leituras++;
+        relogio += 1000;
+      }),
+      relogio: () => new Date(relogio),
+      sleep: async (ms) => {
+        dormiu += ms;
+        relogio += ms;
+      },
+    });
+    expect(r.status).toBe("sent");
+    // Cada fatia de 500 ms custa mais 1 s de releitura: a 8ª termina aos 12 s, a primeira depois dos 11,2 s.
+    expect(dormiu).toBe(4000);
+    expect(leituras).toBe(8);
+    expect(relogio - +agora).toBe(12_000);
+    expect(await ultimaVaga(f)).toBe(+agora + 12_000);
+  });
+
+  it("o tempo que a espera contou vale no registro: se o relógio recua logo depois dela, a linha não fica a menos do intervalo", async () => {
+    const f = await comSaidaEmCurso();
+    let relogio = +agora, leituras = 0, lidoDepoisDaEspera = 0;
+    const r = await responderCom(f, {
+      pool: comReleituraDaUltimaLinha(() => {
+        leituras++;
+        relogio += 1000;
+      }),
+      // A espera termina na 8ª releitura, com o relógio nos 12 s; quem o lê depois dela já o acha nos 5 s.
+      relogio: () => new Date(leituras === 8 && lidoDepoisDaEspera++ > 0 ? +agora + 5000 : relogio),
+      sleep: async (ms) => {
+        relogio += ms;
+      },
+    });
+    expect(r.status).toBe("sent");
+    expect(leituras).toBe(8);
+    // A última linha do número estava nos 10 s, e o intervalo é de 1,2 s: o registro não pode ficar antes dos 11,2 s.
+    expect(await ultimaVaga(f)).toBe(+agora + 12_000);
+  });
+
+  it("controle: com o relógio parado, a espera conta pela soma das fatias, e termina", async () => {
+    const f = await comSaidaEmCurso();
+    let leituras = 0;
+    const esperas: number[] = [];
+    const r = await responderCom(f, {
+      pool: comReleituraDaUltimaLinha(() => {
+        leituras++;
+      }),
+      sleep: async (ms) => {
+        esperas.push(ms);
+      },
+    });
+    expect(r.status).toBe("sent");
+    expect(soma(esperas)).toBe(11_200);
+    expect(leituras).toBe(23);
+    expect(await ultimaVaga(f)).toBe(+agora + 11_200);
   });
 });

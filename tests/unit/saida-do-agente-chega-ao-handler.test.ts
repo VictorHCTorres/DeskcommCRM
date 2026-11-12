@@ -6,6 +6,9 @@
  * fronteira, o ledger (`sendWithLedger`) e a chamada do handler, tudo no mesmo processo, numa cadeia de esperas. É o
  * que faz o escopo chegar. Se esse caminho passar por uma fila, por outro processo ou por uma chamada de rede, o
  * handler deixa de achar a saída e para de conferir a idade dela, em silêncio. Esta cerca cobra que ela chega.
+ *
+ * Versão 18 (F4w do cxj, W02). A saída leva também a ordem (a resposta retida não é ultrapassada), e o handler a lê no
+ * escopo sem tomá-la (`saidaDoAgenteNoEscopo`): a 2ª mensagem física do envio não confere a idade, mas confere a ordem.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -18,6 +21,7 @@ import {
   ATRASO_MAXIMO_DA_SAIDA_DO_AGENTE_MS as FOLGA,
   comSaidaDoAgente,
   novaSaidaDoAgente,
+  saidaDoAgenteNoEscopo,
   tomarSaidaDoAgente,
   type SaidaDoAgente,
 } from "@/lib/agent-engine/pacing/saida-do-agente";
@@ -55,12 +59,15 @@ const entrada = (seq: number): SendMessageInput => ({
   body: "Uma resposta de texto.",
 });
 
-/** O que o handler acha no escopo, a cada mensagem física que chega a ele. */
+/** O que o handler acha no escopo, a cada mensagem física que chega a ele: o que lê, e o que toma. */
+let lidas: Array<SaidaDoAgente | null>;
 let achadas: Array<SaidaDoAgente | null>;
 beforeEach(() => {
+  lidas = [];
   achadas = [];
   sendMessageHandlerMock.mockReset();
   sendMessageHandlerMock.mockImplementation(async () => {
+    lidas.push(saidaDoAgenteNoEscopo());
     achadas.push(tomarSaidaDoAgente());
     return { id: "msg1", status: "sent" };
   });
@@ -78,9 +85,22 @@ describe("a saída do agente chega ao handler pelo envio do turno (F4v, V01)", (
     expect(achadas).toEqual([saida, null]);
   });
 
+  it("a ordem chega a todas as mensagens físicas do envio: a 2ª não toma a saída, mas a lê no escopo", async () => {
+    const ordem = { resposta: true, haRespostaRetidaAntes: async () => false };
+    const saida = novaSaidaDoAgente(AGORA, FOLGA, () => AGORA, ordem);
+    await comSaidaDoAgente(saida, async () => {
+      await sendTurnMessage(dbComJob(), cfg, entrada(1)).catch(() => {});
+      await sendTurnMessage(dbComJob(), cfg, entrada(2)).catch(() => {});
+    });
+    expect(lidas).toEqual([saida, saida]);
+    expect(lidas.map((s) => s?.ordem)).toEqual([ordem, ordem]);
+    expect(achadas).toEqual([saida, null]);
+  });
+
   it("controle: fora da cadeia do agente, o handler não acha saída nenhuma", async () => {
     await sendTurnMessage(dbComJob(), cfg, entrada(1)).catch(() => {});
     expect(sendMessageHandlerMock).toHaveBeenCalledTimes(1);
+    expect(lidas).toEqual([null]);
     expect(achadas).toEqual([null]);
   });
 });

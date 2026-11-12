@@ -37,6 +37,13 @@ export interface OpcoesDoDubleDoHandler {
   /** Linhas que já estavam em `messages` antes deste envio (eco do webhook). */
   mensagensIniciais?: LinhaDoDuble[];
   /**
+   * Reproduz a chave primária de `messages`: gravar um `id` que outra linha já tem devolve `23505` em vez de gravar
+   * uma segunda linha. É o que o handler lê para retomar a mensagem pelo mesmo id (a nova tentativa do job).
+   *
+   * LIGADO SÓ por quem prova a retomada: nos demais casos o `id` vem do contador do dublê e nunca repete.
+   */
+  chavePrimariaDaMensagem?: boolean;
+  /**
    * Reproduz o índice único `(organization_id, external_id)` de `messages`:
    * gravar um `external_id` que outra linha já tem devolve `23505` em vez de
    * gravar em cima.
@@ -424,6 +431,20 @@ export function criarDubleDoHandler(
 
         return {
           insert: (row: LinhaDoDuble) => {
+            if (
+              opcoes.chavePrimariaDaMensagem === true &&
+              row.id !== undefined &&
+              mensagens.some((r) => r.id === row.id)
+            ) {
+              return {
+                select: () => ({
+                  single: async () => ({
+                    data: null,
+                    error: { code: "23505", message: 'duplicate key value violates "messages_pkey"' },
+                  }),
+                }),
+              };
+            }
             contadorDeMensagens += 1;
             const nova: LinhaDoDuble = {
               id: `msg-${contadorDeMensagens}`,

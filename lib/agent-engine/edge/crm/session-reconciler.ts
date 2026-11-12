@@ -38,6 +38,7 @@ import { regraDoStop, vereditoDoStop, type LinhaDoStop, type MotivoDoStop } from
 import type { Logger } from '../../obs/logger';
 import type { PacingKnobs } from '../../pacing/defaults';
 import { dayStartInTz, janelaDeEnvioAberta, tetoDoDia } from '../../pacing/engine';
+import { respostaRetidaAntesSql } from '../../pacing/resposta-retida';
 import { loadChannelKnobs, reservarVagaRelida, undoSend, type ReservaDaVaga } from '../../pacing/store';
 import { KINDS_DE_RESPOSTA, type Queryable } from '../../queue/queue';
 
@@ -216,6 +217,14 @@ const SEM_JOB_VIVO = `not exists (
          join job_queue j on j.id = l.job_id and j.organization_id = l.organization_id
          where l.organization_id = m.organization_id and l.id = m.id
            and j.status in ('pending', 'running'))`;
+
+/**
+ * A mensagem presa sem resposta retida mais antiga na conversa (versão 18, F4w do cxj, W02): a resposta do agente que
+ * ficou na fila por idade, ou por ordem, sai antes do que veio depois dela. Fragmento de SQL sobre o alias `m` de
+ * `messages`, na consulta do resgate e na releitura de `conferirElegibilidade`. A regra, a validade e o porquê estão em
+ * `lib/agent-engine/pacing/resposta-retida.ts`.
+ */
+const SEM_RESPOSTA_RETIDA_ANTES = `not ${respostaRetidaAntesSql('m')}`;
 
 /** O que a mensagem da IA que não sai pela parada da cadeia (F4r do cxj, R06) grava como erro. */
 const ERRO_DA_PARADA: Record<MotivoDoStop, string> = {
@@ -631,14 +640,16 @@ type Elegibilidade = 'pode_sair' | 'desligando' | 'nao_sai';
 
 /**
  * Relê o que decide se a mensagem presa ainda pode sair por este resgate: ela segue `queued`, a
- * sessão do número segue no ar (`WORKING`), o contato não foi bloqueado e nenhum job vivo tem a
- * chave dela (as condições da consulta do resgate; F4r do cxj, R08), a organização opera, o canal
+ * sessão do número segue no ar (`WORKING`), o contato não foi bloqueado, nenhum job vivo tem a
+ * chave dela e não há resposta retida mais antiga na conversa (as condições da consulta do
+ * resgate; F4r do cxj, R08; versão 18, W02), a organização opera, o canal
  * não está pausado, o modo de teste deixa o número, o envio original iria ao contato (a cadeia,
  * na mensagem da IA; o contato pessoal, em todas; F4r do cxj, R06), e ela não é de campanha de
  * prospecção. Quando não pode, grava o desfecho na mensagem e diz `nao_sai` (a que deixou a fila,
- * a da sessão fora do ar, a do contato bloqueado e a do job vivo não são tocadas: ficam como a
- * consulta do resgate as deixa). Roda ANTES da reserva da vaga e de novo DEPOIS dela (F4q do cxj,
- * Q03): a reserva espera a conexão e a trava do número, e o que muda nessa espera vale.
+ * a da sessão fora do ar, a do contato bloqueado, a do job vivo e a que espera uma resposta retida
+ * não são tocadas: ficam como a consulta do resgate as deixa). Roda ANTES da reserva da vaga e de
+ * novo DEPOIS dela (F4q do cxj, Q03): a reserva espera a conexão e a trava do número, e o que muda
+ * nessa espera vale.
  *
  * O que muda com a mensagem na fila é lido numa consulta só, no mesmo instante, e ela é a última
  * leitura antes do envio (F4s do cxj, S09): até a versão 13, a régua do envio original e a
@@ -684,7 +695,8 @@ async function conferirElegibilidade(
      join contacts c on c.id = m.contact_id and c.organization_id = m.organization_id${parada.juncao}
      where m.id = $1 and m.organization_id = $2 and m.status = 'queued'
        and s.status = 'WORKING' and c.is_blocked = false
-       and ${SEM_JOB_VIVO}`,
+       and ${SEM_JOB_VIVO}
+       and ${SEM_RESPOSTA_RETIDA_ANTES}`,
     [m.id, m.organization_id],
   );
   // ABORT DURANTE a espera de elegibilidade (#2823): a releitura terminou e
@@ -810,6 +822,14 @@ export async function redriveQueued(
        -- chave e todos os portões. Reenviada também daqui, ela saía duas vezes: os dois liam
        -- 'queued'. O resgate fica com a mensagem sem dono: a do job terminado, e a sem job.
        and ${SEM_JOB_VIVO}
+       -- ─── A resposta retida mais antiga da conversa sai primeiro (versão 18, F4w do cxj, W02) ───
+       --
+       -- A resposta do agente que ficou na fila por idade (ou atrás de outra) é mandada por este
+       -- resgate, ou pela nova tentativa do job dela. O que veio depois dela na conversa espera: a
+       -- mensagem com uma resposta retida mais antiga não entra no lote, nem quando a retida ainda é
+       -- de um job vivo. Sai uma por conversa a cada tique, da mais antiga para a mais nova; a
+       -- releitura de antes do envio (conferirElegibilidade) confere de novo.
+       and ${SEM_RESPOSTA_RETIDA_ANTES}
        -- ─── Só as sessões que ESTE resgate consegue alcançar ───────────────
        --
        -- Este worker fala um transporte só, direto, e não resolve adapter: ele

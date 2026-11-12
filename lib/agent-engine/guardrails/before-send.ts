@@ -68,6 +68,7 @@ import {
   conferirSaidaDoAgente,
   novaSaidaDoAgente,
 } from '../pacing/saida-do-agente';
+import { haRespostaRetidaAntes } from '../pacing/resposta-retida';
 import { decideSpinning } from '../spinning/engine';
 import type { RecentCopy } from '../spinning/engine';
 import { loadRecentCopies, loadSpinningKnobs, recordCopy } from '../spinning/store';
@@ -1391,6 +1392,10 @@ export interface RunBeforeSendArgs {
    * relógio, e com intervalo no número, o registro guarda a hora mais tardia da saída, e a idade dela é conferida
    * antes do transporte (`pacing/saida-do-agente.ts`). Sem o relógio não há como medir a idade nem acompanhar a linha:
    * o registro fica sem a folga, e a espera é uma só, como antes.
+   *
+   * Versão 18 (F4w do cxj). W12: a espera em fatias conta também o tempo das releituras, pelo relógio. W02: a saída
+   * leva ao handler a ordem, e o texto do agente não sai na frente de uma resposta retida e mais antiga da conversa
+   * (`pacing/resposta-retida.ts`).
    */
   relogio?: () => Date;
   /** injeções de teste (jitter determinístico + espera sem relógio real). */
@@ -1977,8 +1982,11 @@ const PASSO_DA_ESPERA_DO_INTERVALO_MS = 500;
  * espera vai em fatias, e depois de cada uma a linha é relida, nesta conexão: o intervalo conta da última linha
  * lida, para menos ou para mais, e a espera só termina quando a leitura diz que ele passou.
  *
- * O tempo conta pela soma das fatias, e não pelo relógio: é o piso do tempo que passou (o lado seguro), e a espera
- * termina mesmo que o relógio não ande. Sem o relógio, a espera é uma só, como antes.
+ * O tempo que passou é o maior entre a soma das fatias e o relógio (versão 18, F4w do cxj, W12). A soma das fatias é
+ * o piso: a espera termina mesmo que o relógio não ande, ou recue. O relógio conta o que a soma não vê, o tempo de
+ * cada releitura: só com a soma, releituras de 1 s levavam a 34,2 s uma espera de 11,2 s. Quem chama recebe o tempo
+ * que passou, e grava o registro nele: a linha nunca fica a menos do intervalo da última linha lida, mesmo que o
+ * relógio recue logo depois. Sem o relógio, a espera é uma só, como antes.
  */
 async function esperarOIntervalo(
   args: RunBeforeSendArgs,
@@ -1996,15 +2004,17 @@ async function esperarOIntervalo(
   // O intervalo desta decisão, com o jitter dela: a espera era ele menos o tempo desde a última linha.
   const intervalo = espera + agora.getTime() - ultimaSaida.getTime();
   let esperado = 0;
+  let passou = 0;
   let falta = espera;
   while (falta > 0) {
     const fatia = Math.min(falta, PASSO_DA_ESPERA_DO_INTERVALO_MS);
     await sleep(fatia);
     esperado += fatia;
     const ultima = await lerUltimaSaida(client, args.tenantId, args.channelSessionId);
-    falta = ultima === null ? 0 : Math.max(0, ultima.getTime() + intervalo - (agora.getTime() + esperado));
+    passou = Math.max(esperado, args.relogio().getTime() - agora.getTime());
+    falta = ultima === null ? 0 : Math.max(0, ultima.getTime() + intervalo - (agora.getTime() + passou));
   }
-  return esperado;
+  return passou;
 }
 
 /** O veto que a cadeia devolve (`evaluateBeforeSend`). */
@@ -2095,9 +2105,17 @@ async function enviarComORegistroConfirmado(
   // A saída do agente (versão 17, F4v do cxj, V01): com a folga, o transporte roda com ela no escopo, e a idade é
   // conferida aqui, logo antes dele (o INSERT, o commit e a devolução da conexão já passaram), e de novo no último
   // passo do handler, sem espera nenhuma entre a conta e o provedor.
+  //
+  // E a ordem (versão 18, F4w do cxj, W02): a mensagem que vence no último passo do handler fica na fila, e o turno
+  // segue. A saída leva ao handler se este envio responde a quem escreveu, e a pergunta “há, nesta conversa, uma
+  // resposta do agente retida e mais antiga do que esta mensagem?”, lida no banco: havendo, o texto não sai na frente
+  // dela (`lib/agent-engine/pacing/resposta-retida.ts`).
   const saida =
     decisao.registro.folgaMs > 0 && args.relogio
-      ? novaSaidaDoAgente(decisao.registro.instante, decisao.registro.folgaMs, args.relogio)
+      ? novaSaidaDoAgente(decisao.registro.instante, decisao.registro.folgaMs, args.relogio, {
+          resposta: tipoDeEnvio(args.resposta) === 'resposta',
+          haRespostaRetidaAntes: (mensagem) => haRespostaRetidaAntes(args.pool, args.tenantId, mensagem),
+        })
       : null;
   if (saida) {
     try {

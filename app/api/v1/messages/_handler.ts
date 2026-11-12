@@ -1,9 +1,13 @@
 import { assertProspectingDelivery } from "@/lib/prospecting/guard";
 import { assertCampaignDelivery, assertCampaignSlot, entregaPeloAtor, VetoDaCampanhaError } from "@/lib/campanhas/entrega";
 import {
+  MARCA_DE_RESPOSTA_RETIDA,
+  MOTIVO_DA_SAIDA_ATRAS_DE_RETIDA,
   MOTIVO_DA_SAIDA_VENCIDA,
+  SaidaAtrasDeRespostaRetidaError,
   SaidaDoAgenteVencidaError,
   conferirSaidaDoAgente,
+  saidaDoAgenteNoEscopo,
   tomarSaidaDoAgente,
 } from "@/lib/agent-engine/pacing/saida-do-agente";
 import { assertAgentOperationSupabase, mesmaOperacao } from "@/lib/ai/agents/operation";
@@ -1194,6 +1198,11 @@ export async function sendMessageHandler(
       const operacaoJaConferida = mesmaOperacao(currentExecutionAgentOperation(), ctx.agentOperation);
       // A saída do agente que este transporte carrega no escopo (versão 17, F4v do cxj, V01): só a 1ª mensagem física
       // do envio a toma. Fora da cadeia do agente, `null`.
+      //
+      // A ordem (versão 18, F4w do cxj, W02) é lida antes da tomada, e vale para toda mensagem de TEXTO do envio, a 1ª
+      // e as bolhas seguintes: o texto do agente não sai na frente de uma resposta retida e mais antiga da conversa. A
+      // mídia fica fora: o resgate, que manda a retida, só manda texto.
+      const ordemDoAgente = input.type === "text" ? (saidaDoAgenteNoEscopo()?.ordem ?? null) : null;
       const saidaDoAgente = tomarSaidaDoAgente();
       const checkBoundary = async () => {
         await guardServiceEffect();
@@ -1207,6 +1216,14 @@ export async function sendMessageHandler(
         if (ctx.approvedReply) await prepareApprovedReplySupabase(supabase, ctx.approvedReply);
         if (ctx.agentOperation && !operacaoJaConferida)
           await assertAgentOperationSupabase(supabase, ctx.agentOperation);
+        // A ordem (versão 18, F4w do cxj, W02): havendo na conversa uma resposta do agente retida e mais antiga do que
+        // esta mensagem, ela não sai agora. A pergunta lê o banco, e por isso vem antes das contas de hora, que seguem
+        // sendo as últimas antes do provedor; se a leitura falhar, o erro sobe, e a mensagem não sai.
+        if (
+          ordemDoAgente &&
+          (await ordemDoAgente.haRespostaRetidaAntes({ conversationId: c.id, messageId: message.id }))
+        )
+          throw new SaidaAtrasDeRespostaRetidaError();
         // A hora da vaga da campanha, por último (F4t do cxj, T01 a T03): as conferências de cima esperam o banco, e
         // nessa espera a janela da campanha pode fechar e a vaga, envelhecer. É a conta mais perto do provedor, sem
         // espera nenhuma entre ela e ele.
@@ -1449,14 +1466,25 @@ export async function sendMessageHandler(
       if (updated) message = updated as unknown as Message;
       }
     } catch (err) {
-      if (err instanceof SaidaDoAgenteVencidaError) {
+      if (err instanceof SaidaDoAgenteVencidaError || err instanceof SaidaAtrasDeRespostaRetidaError) {
         // A saída do agente envelheceu no caminho até o provedor (versão 17, F4v do cxj, V01): a conferência do último
         // passo lançou antes de chamá-lo, e nada saiu. A linha fica em `queued`, com o motivo, como no canal fora do
-        // ar: a nova tentativa do job e o resgate do watchdog a mandam, cada um com o próprio registro no limite do
-        // número. Não é falha de entrega: nada de `emitirFalhaDeEntrega`.
+        // ar. Quem a manda depois é o resgate do watchdog, quando o job dela termina (o turno de resposta segue: o
+        // `queued` não reagenda o job); se o job falhar por outra razão e voltar à fila, a nova tentativa a manda pelo
+        // mesmo id. Cada um com o próprio registro no limite do número. Não é falha de entrega: nada de
+        // `emitirFalhaDeEntrega`.
+        //
+        // Ou há na conversa uma resposta retida e mais antiga (versão 18, F4w do cxj, W02): a conferência da ordem
+        // lançou antes do provedor, e a linha fica em `queued` do mesmo jeito, com o motivo dela, para sair depois da
+        // mais antiga. Nos dois casos, a mensagem que responde a quem escreveu leva a marca de resposta: é a resposta
+        // retida que segura as seguintes da conversa (`lib/agent-engine/pacing/resposta-retida.ts`).
+        const motivoDaRetencao =
+          err instanceof SaidaDoAgenteVencidaError ? MOTIVO_DA_SAIDA_VENCIDA : MOTIVO_DA_SAIDA_ATRAS_DE_RETIDA;
+        const marcaDeResposta =
+          saidaDoAgenteNoEscopo()?.ordem?.resposta === true ? { [MARCA_DE_RESPOSTA_RETIDA]: true } : {};
         const { data: emFila } = await supabase
           .from("messages")
-          .update({ metadata: { ...(message.metadata ?? {}), queued_reason: MOTIVO_DA_SAIDA_VENCIDA } })
+          .update({ metadata: { ...(message.metadata ?? {}), queued_reason: motivoDaRetencao, ...marcaDeResposta } })
           .eq("id", message.id)
           .eq("organization_id", ctx.organization_id)
           .select(MSG_COLS)
