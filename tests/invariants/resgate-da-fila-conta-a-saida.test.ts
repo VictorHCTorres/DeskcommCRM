@@ -948,3 +948,242 @@ describe('F4r no Postgres real · o resgate respeita a janela do número (R07)',
     }
   });
 });
+
+/**
+ * F4s do cxj (12/11/2026), S01 e S09: o que decide se a mensagem presa sai é conferido no último
+ * instante antes do envio, numa leitura só, e com o relógio de agora.
+ *
+ * S09. Até a versão 13, a conferência de depois da vaga lia a sessão, o canal e o contato e, só
+ * depois, esperava a leitura da parada (`readStopFlags`) e, na mensagem de campanha, a da campanha;
+ * o que mudava nessas esperas (o canal pausado) não impedia o envio. Agora ela é uma leitura só,
+ * com a régua da parada dentro, e a da campanha, que não muda com a mensagem na fila, vem antes.
+ *
+ * S01. O instante da vaga era medido antes da espera pela conexão e pela trava do número, e a
+ * janela, o intervalo e o registro usavam esse instante já passado: a resposta presa saía às
+ * 22h00min01s com a janela até as 22h. Agora o instante é lido sob a trava, e a janela é conferida
+ * de novo com o relógio de agora, logo antes do envio.
+ */
+describe('F4s no Postgres real · o resgate confere no instante do envio (S01 e S09)', () => {
+  /**
+   * O pool de verdade, com a `vez`-ésima consulta que casa com `marca` presa numa porta que o teste
+   * abre. A conexão da reserva passa direto.
+   */
+  function poolComEsperaNaLeitura(marca: RegExp, vez: number) {
+    const chegou = porta();
+    const soltar = porta();
+    let leituras = 0;
+    const fachada = {
+      query: async (...args: unknown[]) => {
+        if (marca.test(String(args[0])) && ++leituras === vez) {
+          chegou.abrir();
+          await soltar.aberta;
+        }
+        return Reflect.apply(pool.query, pool, args) as unknown;
+      },
+      connect: pool.connect.bind(pool),
+    } as unknown as pg.Pool;
+    return { fachada, chegou, soltar };
+  }
+
+  /** O resgate preso na `vez`-ésima consulta que casa com `marca`, com `mudar` aplicado durante a espera. */
+  async function resgatarMudandoNaLeitura(
+    marca: RegExp,
+    vez: number,
+    mudar: () => Promise<unknown> | void,
+    relogio: () => Date = () => AGORA,
+  ): Promise<number> {
+    const { fachada, chegou, soltar } = poolComEsperaNaLeitura(marca, vez);
+    const resgate = redriveQueued(fachada, CONFIG, log(), undefined, relogio);
+    try {
+      await chegou.aberta;
+      await mudar();
+    } finally {
+      soltar.abrir();
+    }
+    return resgate;
+  }
+
+  // A conferência roda antes e depois da vaga; a 2ª leitura da organização é a de depois.
+  const RELEITURA = /fn_org_operante/;
+
+  it('a mensagem de campanha de consentimento: o canal é pausado durante a leitura da campanha, depois da vaga, e nada sai', async () => {
+    const f = await numeroComFila({ sentVia: 'automation' });
+    const campanha = randomUUID();
+    await pool.query(
+      `insert into campaigns (id, organization_id, name, channel_session_id, base_legal, status)
+       values ($1, $2, 'Campanha fictícia', $3, 'consent', 'running')`,
+      [campanha, f.org, f.numero],
+    );
+    await pool.query(`update messages set metadata = $2::jsonb where id = $1`, [
+      f.mensagem,
+      JSON.stringify({ source: 'campaign', campaign_id: campanha }),
+    ]);
+    const waha = wahaResponde(200);
+
+    const n = await resgatarMudandoNaLeitura(/from campaigns/, 2, () =>
+      pool.query(`update channel_sessions set metadata = '{"disabled":true}'::jsonb where id = $1`, [f.numero]),
+    );
+
+    expect(n).toBe(0);
+    expect(waha).not.toHaveBeenCalled();
+    expect(await falhaDa(f)).toEqual({ status: 'failed', error_code: 'channel_disabled' });
+    expect((await estado(f)).sentToday).toBe(59);
+  });
+
+  it('controle: a mensagem de campanha de consentimento sai pelo resgate, com a vaga gravada', async () => {
+    const f = await numeroComFila({ sentVia: 'automation' });
+    const campanha = randomUUID();
+    await pool.query(
+      `insert into campaigns (id, organization_id, name, channel_session_id, base_legal, status)
+       values ($1, $2, 'Campanha fictícia', $3, 'consent', 'running')`,
+      [campanha, f.org, f.numero],
+    );
+    await pool.query(`update messages set metadata = $2::jsonb where id = $1`, [
+      f.mensagem,
+      JSON.stringify({ source: 'campaign', campaign_id: campanha }),
+    ]);
+    const waha = wahaResponde(200);
+
+    expect(await resgatar()).toBe(1);
+
+    expect(waha).toHaveBeenCalledTimes(1);
+    expect(await statusDa(f)).toBe('sent');
+    expect((await estado(f)).sentToday).toBe(60);
+  });
+
+  it.each([
+    ['o canal é pausado', `update channel_sessions set metadata = '{"disabled":true}'::jsonb where id = $1`, 'numero', 'channel_disabled'],
+    ['a conversa passa para a equipe', `update contacts set force_human = true where id = $1`, 'contato', 'atendimento_com_humano'],
+  ] as const)(
+    '%s durante a última leitura antes do envio: nada sai, a vaga volta, e a resposta vira falha',
+    async (_caso, sql, alvo, motivo) => {
+      const f = await numeroComFila({ origem: 'inbound_turn' });
+      const waha = wahaResponde(200);
+
+      const n = await resgatarMudandoNaLeitura(RELEITURA, 2, () => pool.query(sql, [f[alvo]]));
+
+      expect(n).toBe(0);
+      expect(waha).not.toHaveBeenCalled();
+      expect(await falhaDa(f)).toEqual({ status: 'failed', error_code: motivo });
+      expect(await vagasEm(f, AGORA)).toBe(0);
+    },
+  );
+
+  it('a janela de resposta fecha (22h) durante a última leitura antes do envio: nada sai, a vaga volta, e a resposta fica na fila', async () => {
+    const f = await numeroComFila({ disparos: 0, origem: 'inbound_turn', janela: { disparo: [9, 18], resposta: [7, 22] } });
+    const waha = wahaResponde(200);
+    let relogio = new Date('2026-11-19T00:59:59Z'); // 21h59min59s em São Paulo
+
+    const n = await resgatarMudandoNaLeitura(
+      RELEITURA,
+      2,
+      () => {
+        relogio = new Date('2026-11-19T01:00:01Z'); // 22h00min01s
+      },
+      () => relogio,
+    );
+
+    expect(n).toBe(0);
+    expect(waha).not.toHaveBeenCalled();
+    expect(await statusDa(f)).toBe('queued');
+    const { rows } = await pool.query<{ n: string }>(
+      'select count(*)::text as n from pacing_ledger where organization_id = $1 and channel_session_id = $2',
+      [f.org, f.numero],
+    );
+    expect(Number(rows[0]!.n), 'a vaga da resposta que não saiu tem de voltar').toBe(0);
+  });
+
+  // A janela conferida de novo antes do envio não dispensa a da reserva: fora da janela, o resgate
+  // nem grava a vaga (senão gravaria e devolveria uma vaga por mensagem presa, a cada tique, a
+  // noite inteira).
+  it.each([
+    ['a resposta presa às 3h (janela de resposta das 7h às 22h)', 'inbound_turn', new Date('2026-11-19T06:00:00Z'), 59],
+    ['o follow-up preso às 8h (janela de disparo das 9h às 18h)', 'followup_turn', new Date('2026-11-18T11:00:00Z'), 0],
+  ] as const)('%s: o resgate nem grava a vaga, e a mensagem fica na fila', async (_caso, origem, quando, disparos) => {
+    const f = await numeroComFila({ disparos, origem, janela: { disparo: [9, 18], resposta: [7, 22] } });
+    const waha = wahaResponde(200);
+    let gravacoes = 0;
+    const fachada = {
+      query: pool.query.bind(pool),
+      connect: async () => {
+        const conexao = await pool.connect();
+        const consulta = conexao.query.bind(conexao);
+        conexao.query = (async (...args: unknown[]) => {
+          if (/insert into pacing_ledger/i.test(String(args[0]))) gravacoes += 1;
+          return Reflect.apply(consulta, conexao, args) as unknown;
+        }) as typeof conexao.query;
+        return conexao;
+      },
+    } as unknown as pg.Pool;
+
+    expect(await redriveQueued(fachada, CONFIG, log(), undefined, () => quando)).toBe(0);
+
+    expect(waha).not.toHaveBeenCalled();
+    expect(await statusDa(f)).toBe('queued');
+    expect(gravacoes, 'fora da janela, nenhuma vaga é gravada, nem por um instante').toBe(0);
+  });
+
+  it('a vaga é gravada no instante lido sob a trava: a espera pela conexão durou 30 s, e o registro tem o instante de depois dela', async () => {
+    const f = await numeroComFila();
+    const waha = wahaResponde(200);
+    const depois = new Date(+AGORA + 30_000);
+    let relogio = AGORA;
+    const { fachada, chegou, soltar } = poolComEspera();
+
+    const resgate = redriveQueued(fachada, CONFIG, log(), undefined, () => relogio);
+    try {
+      await chegou.aberta;
+      relogio = depois;
+    } finally {
+      soltar.abrir();
+    }
+
+    expect(await resgate).toBe(1);
+    expect(waha).toHaveBeenCalledTimes(1);
+    expect(await vagasEm(f, depois), 'a vaga leva o instante em que a trava foi obtida').toBe(1);
+    expect(await vagasEm(f, AGORA), 'o instante de antes da espera já tinha passado').toBe(0);
+  });
+
+  it('a vaga é gravada no instante lido depois da trava: outro envio do número segurou a trava por 30 s, e o registro tem o instante de depois dela', async () => {
+    const f = await numeroComFila();
+    const waha = wahaResponde(200);
+    const depois = new Date(+AGORA + 30_000);
+    let relogio = AGORA;
+    // A reserva pede a trava do número e fica presa nela; a porta só avisa que o pedido saiu.
+    const pediuATrava = porta();
+    const fachada = {
+      query: pool.query.bind(pool),
+      connect: async () => {
+        const client = await pool.connect();
+        return new Proxy(client, {
+          get(alvo, nome) {
+            if (nome === 'query') {
+              return (...args: unknown[]) => {
+                if (/pg_advisory_xact_lock/.test(String(args[0]))) pediuATrava.abrir();
+                return Reflect.apply(alvo.query, alvo, args) as unknown;
+              };
+            }
+            const valor = Reflect.get(alvo, nome, alvo) as unknown;
+            return typeof valor === 'function' ? (valor as (...a: unknown[]) => unknown).bind(alvo) : valor;
+          },
+        });
+      },
+    } as unknown as pg.Pool;
+    // O outro envio do mesmo número: a mesma chave da reserva (store.ts, hashtext do número).
+    const outro = await pool.connect();
+    try {
+      await outro.query('begin');
+      await outro.query('select pg_advisory_xact_lock(hashtext($1))', [f.numero]);
+      const resgate = redriveQueued(fachada, CONFIG, log(), undefined, () => relogio);
+      await pediuATrava.aberta;
+      relogio = depois;
+      await outro.query('rollback');
+      expect(await resgate).toBe(1);
+    } finally {
+      outro.release();
+    }
+    expect(waha).toHaveBeenCalledTimes(1);
+    expect(await vagasEm(f, depois), 'a vaga leva o instante em que a trava foi obtida').toBe(1);
+    expect(await vagasEm(f, AGORA), 'o instante de antes da trava já tinha passado').toBe(0);
+  });
+});

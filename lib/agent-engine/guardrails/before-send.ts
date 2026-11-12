@@ -2117,6 +2117,10 @@ async function loadCrmDailyLimit(
  * Exportada para a suíte de invariantes poder medir o predicado REAL contra
  * Postgres de verdade (`tests/invariants/contato-interno-barra-o-envio.test.ts`):
  * SQL transcrito dentro do teste mediria o teste contra ele mesmo.
+ *
+ * A régua mora em `regraDoStop` e o veredito em `vereditoDoStop`: o resgate da
+ * fila (`session-reconciler.ts`) lê a mesma régua dentro da consulta que confere
+ * a sessão, o canal e a organização (F4s do cxj, S09). A régua é uma só.
  */
 export async function readStopFlags(
   db: Queryable,
@@ -2124,37 +2128,67 @@ export async function readStopFlags(
   contactId: string,
   humanMeetingCommand = false,
 ): Promise<{ stopped: boolean; motivo: MotivoDoStop | null }> {
+  const regra = regraDoStop('contacts', humanMeetingCommand);
+  const { rows } = await db.query<LinhaDoStop>(
+    `select ${regra.colunas} from contacts${regra.juncao} where organization_id = $1 and id = $2`,
+    [organizationId, contactId],
+  );
+  return vereditoDoStop(rows[0]);
+}
+
+/** As colunas da régua do STOP, como `regraDoStop` as escreve e `vereditoDoStop` as lê. */
+export interface LinhaDoStop {
+  stopped: boolean | null;
+  contato_interno: boolean | null;
+  stop_por_handoff: boolean | null;
+}
+
+/**
+ * A régua do STOP em SQL, sobre a linha de `contacts` chamada `contato` na consulta: as colunas
+ * (`stopped`, `contato_interno` e `stop_por_handoff`) e a junção de que elas precisam (o `cross
+ * join lateral` da etiqueta interna; vazia no ramo do encontro). `juncao`, quando existe, começa
+ * com espaço, para entrar logo depois do `from`.
+ *
+ * Os dois leitores: `readStopFlags`, sozinha, na cadeia do agente; e o resgate da fila
+ * (`session-reconciler.ts`), dentro da consulta que confere a sessão, o canal e a organização, para
+ * tudo ser lido no mesmo instante, logo antes do envio (F4s do cxj, S09).
+ */
+export function regraDoStop(contato: string, humanMeetingCommand: boolean): { colunas: string; juncao: string } {
   // Pessoal não recebe nem via encontro (spec 21, etapa 11): o `or is_personal`
   // vale nos DOIS ramos — o veto segue o bloqueio até aqui.
+  if (humanMeetingCommand) {
+    return {
+      colunas: `(${contato}.is_blocked or ${contato}.is_personal) as stopped, false as contato_interno, false as stop_por_handoff`,
+      juncao: '',
+    };
+  }
+  // `ai_opt_out` (issue 2379): a marca permanente "sempre atendimento
+  // humano" entra no MESMO stop, e não numa nova consulta — o custo é
+  // nulo e a garantia é que nenhum escritor futuro de `force_human` consegue
+  // devolver a IA para um contato que a operação trancou.
+  //
+  // `stop_por_handoff` (#3310): `force_human` SOZINHO é a conversa passada
+  // para a EQUIPE, não um pedido do contato para sair. `is_blocked`,
+  // `is_personal` e `ai_opt_out` ficam fora dele: sobrevivem a "Devolver ao
+  // automático" e, quando valem junto, vence o opt-out (a mesma ordem de
+  // `lib/inbox/comando-da-conversa.ts`).
   //
   // O `cross join lateral` avalia a régua da etiqueta UMA vez por linha e a
   // entrega nos dois lugares em que ela decide: o `stopped` e o motivo do veto.
-  const { rows } = await db.query<{
-    stopped: boolean;
-    contato_interno: boolean;
-    stop_por_handoff: boolean;
-  }>(
-    humanMeetingCommand
-      ? 'select (is_blocked or is_personal) as stopped, false as contato_interno, false as stop_por_handoff from contacts where organization_id = $1 and id = $2'
-      // `ai_opt_out` (issue 2379): a marca permanente "sempre atendimento
-      // humano" entra no MESMO stop, e não numa nova consulta — o custo é
-      // nulo e a garantia é que nenhum escritor futuro de `force_human` consegue
-      // devolver a IA para um contato que a operação trancou.
-      //
-      // `stop_por_handoff` (#3310): `force_human` SOZINHO é a conversa passada
-      // para a EQUIPE, não um pedido do contato para sair. `is_blocked`,
-      // `is_personal` e `ai_opt_out` ficam fora dele: sobrevivem a "Devolver ao
-      // automático" e, quando valem junto, vence o opt-out (a mesma ordem de
-      // `lib/inbox/comando-da-conversa.ts`).
-      : `select (is_blocked or force_human or is_personal or ai_opt_out or i.contato_interno) as stopped,
-                i.contato_interno,
-                (force_human and not (is_blocked or is_personal or ai_opt_out)) as stop_por_handoff
-           from contacts
-           cross join lateral (select (${sqlContatoInterno('contacts')}) as contato_interno) i
-          where organization_id = $1 and id = $2`,
-    [organizationId, contactId],
-  );
-  const linha = rows[0];
+  return {
+    colunas: `(${contato}.is_blocked or ${contato}.force_human or ${contato}.is_personal or ${contato}.ai_opt_out
+               or stop_interno.contato_interno) as stopped,
+              stop_interno.contato_interno,
+              (${contato}.force_human and not (${contato}.is_blocked or ${contato}.is_personal or ${contato}.ai_opt_out))
+                as stop_por_handoff`,
+    juncao: ` cross join lateral (select (${sqlContatoInterno(contato)}) as contato_interno) stop_interno`,
+  };
+}
+
+/** O veredito da régua do STOP, na linha com as colunas de `regraDoStop`. */
+export function vereditoDoStop(
+  linha: Partial<LinhaDoStop> | undefined,
+): { stopped: boolean; motivo: MotivoDoStop | null } {
   if (linha?.stopped !== true) return { stopped: false, motivo: null };
   return {
     stopped: true,

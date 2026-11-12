@@ -315,14 +315,20 @@ export type RegraRelida = Pick<RegraDaVaga, 'limite' | 'desde' | 'intervaloMs'>;
  * esperava a trava (o limite diário do CRM, o aquecimento, o intervalo, a janela) vale; lida
  * antes, a regra conferia a vaga com o que já tinha mudado. A falha de `reler` lança, como a de
  * qualquer leitura da reserva, e nada é gravado.
+ *
+ * `sentAt` pode ser o relógio, e não o instante (F4s do cxj, S01): então o instante da vaga é lido
+ * SOB a trava, e é ele que `reler` recebe e que o intervalo e o registro usam. Medido antes, o
+ * instante não contava a espera pela conexão e pela trava: a janela conferia uma hora que já tinha
+ * passado, e a vaga ficava gravada antes da saída de verdade, o que encurtava o intervalo do envio
+ * seguinte.
  */
 export async function reservarVagaRelida<Motivo extends string>(
   pool: Pick<pg.Pool, 'connect'>,
   tenantId: string,
   channelSessionId: string,
-  sentAt: Date,
+  sentAt: Date | (() => Date),
   base: Pick<RegraDaVaga, 'vagas' | 'resposta' | 'esperaMs'>,
-  reler: (db: Queryable) => Promise<RegraRelida | Motivo>,
+  reler: (db: Queryable, instante: Date) => Promise<RegraRelida | Motivo>,
 ): Promise<ReservaDaVaga | Motivo> {
   return reservarSobATrava(pool, tenantId, channelSessionId, sentAt, base, reler);
 }
@@ -331,9 +337,9 @@ async function reservarSobATrava<Motivo extends string>(
   pool: Pick<pg.Pool, 'connect'>,
   tenantId: string,
   channelSessionId: string,
-  sentAt: Date,
+  sentAt: Date | (() => Date),
   base: Pick<RegraDaVaga, 'vagas' | 'resposta' | 'esperaMs'>,
-  reler: (db: Queryable) => Promise<RegraRelida | Motivo>,
+  reler: (db: Queryable, instante: Date) => Promise<RegraRelida | Motivo>,
 ): Promise<ReservaDaVaga | Motivo> {
   const client = await pool.connect();
   let erro: Error | undefined;
@@ -343,7 +349,9 @@ async function reservarSobATrava<Motivo extends string>(
       `${base.esperaMs ?? ESPERA_PELA_TRAVA_MS}ms`,
     ]);
     await client.query('select pg_advisory_xact_lock(hashtext($1))', [channelSessionId]);
-    const regra = await reler(client);
+    // Com o relógio, o instante é o de agora, já com a trava na mão (F4s do cxj, S01).
+    const instante = typeof sentAt === 'function' ? sentAt() : sentAt;
+    const regra = await reler(client, instante);
     if (typeof regra === 'string') {
       await client.query('rollback');
       return regra;
@@ -365,7 +373,7 @@ async function reservarSobATrava<Motivo extends string>(
         ? 'teto_cheio'
         : regra.intervaloMs > 0 &&
             ultimo !== null &&
-            sentAt.getTime() - new Date(ultimo).getTime() < regra.intervaloMs
+            instante.getTime() - new Date(ultimo).getTime() < regra.intervaloMs
           ? 'intervalo'
           : null;
     if (semVaga) {
@@ -375,7 +383,7 @@ async function reservarSobATrava<Motivo extends string>(
     await client.query(
       `insert into pacing_ledger (organization_id, channel_session_id, sent_at, resposta)
        values ($1, $2, $3, $4)`,
-      [tenantId, channelSessionId, sentAt, resposta],
+      [tenantId, channelSessionId, instante, resposta],
     );
     await client.query('commit');
     return 'reservada';

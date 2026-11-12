@@ -268,10 +268,14 @@ describe("comando da conversa: o banco espelha o TypeScript", () => {
       join(RAIZ, "lib/agent-engine/guardrails/before-send.ts"),
       "utf8",
     );
+    // Revisto em 12/11/2026 (F4s do cxj, S09): a régua do STOP mudou para `regraDoStop`,
+    // que qualifica cada coluna com a linha do contato (o resgate da fila a usa numa consulta
+    // com junções). A régua é a mesma de antes — `is_blocked or force_human or is_personal or
+    // ai_opt_out or contato_interno` —, e a parada dura que este bloco espelha segue nela.
     expect(
       antesDoSend,
       "o stopGate mudou de forma — reveja este bloco antes de confiar nele",
-    ).toContain("is_blocked or force_human");
+    ).toContain("${contato}.is_blocked or ${contato}.force_human");
 
     // Para cada conversa com `comando_da_conversa = 'automatico'`, o motor tem de
     // concordar: sem handoff no lead E sem parada dura no contato.

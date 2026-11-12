@@ -113,7 +113,10 @@ describe("cartão e encontro também vetam", () => {
     const src = semComentarios(
       fonte("lib", "agent-engine", "guardrails", "before-send.ts"),
     );
-    expect(src).toMatch(/is_blocked or is_personal/);
-    expect(src).toMatch(/is_blocked or force_human or is_personal/);
+    // Revisto em 12/11/2026 (F4s do cxj, S09): a régua passou para `regraDoStop`, que
+    // qualifica cada coluna com a linha do contato (`${contato}.`). Os dois ramos são os de
+    // antes: o do encontro (bloqueio ou pessoal) e o comum (com a trava e o pessoal).
+    expect(src).toMatch(/\(\$\{contato\}\.is_blocked or \$\{contato\}\.is_personal\) as stopped/);
+    expect(src).toMatch(/\$\{contato\}\.is_blocked or \$\{contato\}\.force_human or \$\{contato\}\.is_personal/);
   });
 });

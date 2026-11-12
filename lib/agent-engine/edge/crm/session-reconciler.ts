@@ -33,8 +33,9 @@ import { lerNumerosDeTeste, numeroPodeTestar, preGoLiveAtivo } from '@/lib/ai/el
 import { canalDesativado } from '@/lib/channels/desativado';
 import { canalTemRiscoDeBanimento } from '@/lib/channels/capabilities';
 
-import { readStopFlags, type MotivoDoStop } from '../../guardrails/before-send';
+import { regraDoStop, vereditoDoStop, type LinhaDoStop, type MotivoDoStop } from '../../guardrails/before-send';
 import type { Logger } from '../../obs/logger';
+import type { PacingKnobs } from '../../pacing/defaults';
 import { dayStartInTz, janelaDeEnvioAberta, tetoDoDia } from '../../pacing/engine';
 import { loadChannelKnobs, reservarVagaRelida, undoSend, type ReservaDaVaga } from '../../pacing/store';
 import { KINDS_DE_RESPOSTA } from '../../queue/queue';
@@ -437,41 +438,59 @@ async function stampExternalIdAfterEcho(
  * tipo da mensagem (a de resposta ou a de disparo, `janelaDeEnvioAberta`, a mesma conta da cadeia)
  * tem de estar aberta: fechada, nada é reservado (`fora_da_janela`), e a mensagem espera na fila
  * o tique que a encontrar aberta. Antes, a resposta presa saía às 3h.
+ *
+ * O instante da vaga é o do relógio lido SOB a trava (F4s do cxj, S01): é com ele que a janela, o
+ * teto, o intervalo e o registro contam. A reserva devolve esse instante, que é o da linha gravada
+ * (a devolução da vaga a procura por ele), e os knobs lidos, com que quem chama confere a janela
+ * de novo logo antes do envio.
  */
 async function reservarVagaDoResgate(
   pool: pg.Pool,
   m: QueuedRow,
-  quando: Date,
+  relogio: () => Date,
   log: Logger,
-): Promise<ReservaDaVaga | 'fora_da_janela'> {
+): Promise<VagaDoResgate> {
   const banRisk = canalTemRiscoDeBanimento(m.provider);
-  return reservarVagaRelida(
+  // `reler` roda sob a trava antes de qualquer gravação: a vaga reservada sempre passou por ele.
+  let lido!: { instante: Date; knobs: PacingKnobs };
+  const desfecho = await reservarVagaRelida(
     pool,
     m.organization_id,
     m.channel_session_id,
-    quando,
+    relogio,
     { vagas: 1, resposta: m.resposta },
-    async (db) => {
+    async (db, instante) => {
       const { knobs, numberActivatedAt } = await loadChannelKnobs(db, m.organization_id, m.channel_session_id, log);
-      if (!janelaDeEnvioAberta(quando, knobs, m.resposta)) return 'fora_da_janela';
+      lido = { instante, knobs };
+      if (!janelaDeEnvioAberta(instante, knobs, m.resposta)) return 'fora_da_janela';
       const { rows } = await db.query<{ daily_message_limit: number | null }>(
         'select daily_message_limit from channel_sessions where organization_id = $1 and id = $2',
         [m.organization_id, m.channel_session_id],
       );
       return {
         limite: tetoDoDia({
-          now: quando,
+          now: instante,
           knobs,
           numberActivatedAt,
           crmDailyLimit: rows[0]?.daily_message_limit ?? null,
           banRisk,
         }),
-        desde: dayStartInTz(quando, knobs.timezone),
+        desde: dayStartInTz(instante, knobs.timezone),
         intervaloMs: banRisk ? knobs.throttleMs : 0,
       };
     },
   );
+  if (desfecho !== 'reservada') return { desfecho };
+  return { desfecho, instante: lido.instante, knobs: lido.knobs };
 }
+
+/**
+ * O desfecho da reserva da vaga do resgate: reservada, com o instante da linha gravada e os knobs
+ * lidos sob a trava; ou o motivo de não reservar.
+ */
+type VagaDoResgate =
+  | { desfecho: 'reservada'; instante: Date; knobs: PacingKnobs }
+  | { desfecho: Exclude<ReservaDaVaga, 'reservada'> | 'fora_da_janela' };
 
 /**
  * Devolve a vaga de uma saída do resgate que certamente não aconteceu: o WAHA recusou com 4xx, ou
@@ -505,9 +524,15 @@ type Elegibilidade = 'pode_sair' | 'desligando' | 'nao_sai';
  * prospecção. Quando não pode, grava o desfecho na mensagem e diz `nao_sai` (a que deixou a fila,
  * a da sessão fora do ar, a do contato bloqueado e a do job vivo não são tocadas: ficam como a
  * consulta do resgate as deixa). Roda ANTES da reserva da vaga e de novo DEPOIS dela (F4q do cxj,
- * Q03): a reserva espera a conexão e a trava do número, e o que muda nessa espera vale. O
- * desligamento é conferido depois de cada leitura (`desligando`); depois da última, nada mais
- * espera até o `fetch`. Falha de leitura lança, e quem chama não envia.
+ * Q03): a reserva espera a conexão e a trava do número, e o que muda nessa espera vale.
+ *
+ * O que muda com a mensagem na fila é lido numa consulta só, no mesmo instante, e ela é a última
+ * leitura antes do envio (F4s do cxj, S09): até a versão 13, a régua do envio original e a
+ * campanha eram lidas DEPOIS da sessão e do canal, e o canal pausado durante essas leituras não
+ * impedia o envio. A régua do envio original entra na mesma consulta (`regraDoStop`, a mesma da
+ * cadeia); a base legal da campanha, que não muda com a mensagem na fila, é lida antes dela. O
+ * desligamento é conferido depois da consulta que decide (`desligando`), antes de qualquer
+ * gravação. Falha de leitura lança, e quem chama não envia.
  */
 async function conferirElegibilidade(
   pool: pg.Pool,
@@ -515,11 +540,34 @@ async function conferirElegibilidade(
   signal: AbortSignal | undefined,
   log: Logger,
 ): Promise<Elegibilidade> {
-  const { rows: acesso } = await pool.query<{ metadata: unknown; phone_number: string | null; operante: boolean }>(
-    `select s.metadata, c.phone_number, public.fn_org_operante(m.organization_id) as operante
+  // A base legal da campanha da mensagem (o veto da prospecção, lá embaixo), lida antes da
+  // consulta que decide: ela não muda enquanto a mensagem espera. O desligamento durante esta
+  // leitura para logo depois da consulta de baixo, antes de qualquer gravação.
+  const campanhaId = campanhaDaMensagem(m.metadata);
+  let baseLegal: string | null = null;
+  if (campanhaId !== null) {
+    const { rows: campanha } = await pool.query<{ base_legal: string | null }>(
+      `select k.base_legal from campaigns k where k.organization_id = $1 and k.id::text = $2`,
+      [m.organization_id, campanhaId],
+    );
+    baseLegal = campanha[0]?.base_legal ?? null;
+  }
+  // O resgate para onde o envio original pararia (F4r do cxj, R06). A mensagem da IA para onde
+  // a CADEIA para: a conversa passada para a equipe, o "sempre atendimento humano", o contato
+  // pessoal e o interno (a régua de `readStopFlags`, a primeira regra dura de `before-send.ts`);
+  // na fila, ela sairia quando a conversa voltasse ao automático, já fora de contexto. A de
+  // automação e a de sistema param onde o envio pela API para: o contato pessoal não recebe nada,
+  // manual ou automático (spec 21, etapa 11; o ramo do encontro humano da régua, que lê só o
+  // bloqueio e o pessoal). A passagem para a equipe cala a IA, não a automação.
+  const parada = regraDoStop('c', m.sent_via !== 'ai');
+  const { rows: acesso } = await pool.query<
+    { metadata: unknown; phone_number: string | null; operante: boolean } & LinhaDoStop
+  >(
+    `select s.metadata, c.phone_number, public.fn_org_operante(m.organization_id) as operante,
+            ${parada.colunas}
      from messages m
      join channel_sessions s on s.id = m.channel_session_id and s.organization_id = m.organization_id
-     join contacts c on c.id = m.contact_id and c.organization_id = m.organization_id
+     join contacts c on c.id = m.contact_id and c.organization_id = m.organization_id${parada.juncao}
      where m.id = $1 and m.organization_id = $2 and m.status = 'queued'
        and s.status = 'WORKING' and c.is_blocked = false
        and ${SEM_JOB_VIVO}`,
@@ -569,27 +617,18 @@ async function conferirElegibilidade(
     log.info('watchdog: reenvio bloqueado pelo modo de teste', { message_id: m.id });
     return 'nao_sai';
   }
-  // O resgate para onde o envio original pararia (F4r do cxj, R06). A mensagem da IA para onde
-  // a CADEIA para: a conversa passada para a equipe, o "sempre atendimento humano", o contato
-  // pessoal e o interno (`readStopFlags`, a primeira regra dura de `before-send.ts`); na fila,
-  // ela sairia quando a conversa voltasse ao automático, já fora de contexto. A de automação e a
-  // de sistema param onde o envio pela API para: o contato pessoal não recebe nada, manual ou
-  // automático (spec 21, etapa 11; `readStopFlags` com o quarto argumento lê só o bloqueio e o
-  // pessoal, a mesma régua do encontro humano). A passagem para a equipe cala a IA, não a
-  // automação. A que não sai vira falha com o motivo.
-  // O join da consulta do resgate garante o contato; sem ele, a leitura falha, e nada sai.
-  const parada = await readStopFlags(pool, m.organization_id, m.contact_id ?? '', m.sent_via !== 'ai');
-  if (signal?.aborted) return 'desligando';
-  if (parada.stopped && parada.motivo !== null) {
+  // A que o envio original não mandaria vira falha com o motivo.
+  const veredito = vereditoDoStop(atual);
+  if (veredito.stopped && veredito.motivo !== null) {
     await pool.query(
       `update messages set status = 'failed', error_code = $3, error_message = $4
        where id = $1 and organization_id = $2 and status = 'queued'`,
-      [m.id, m.organization_id, parada.motivo, ERRO_DA_PARADA[parada.motivo]],
+      [m.id, m.organization_id, veredito.motivo, ERRO_DA_PARADA[veredito.motivo]],
     );
     log.info('watchdog: reenvio bloqueado — o envio original não iria a este contato', {
       message_id: m.id,
       sent_via: m.sent_via,
-      motivo: parada.motivo,
+      motivo: veredito.motivo,
     });
     return 'nao_sai';
   }
@@ -601,25 +640,15 @@ async function conferirElegibilidade(
   // campanha; o que sobrar aqui (o veto que não gravou, a linha de antes
   // desta versão) vira `failed`. Só a campanha de consentimento segue como
   // antes; campanha que não se acha conta como prospecção.
-  const campanhaId = campanhaDaMensagem(m.metadata);
-  if (campanhaId !== null) {
-    const { rows: campanha } = await pool.query<{ base_legal: string | null }>(
-      `select k.base_legal from campaigns k where k.organization_id = $1 and k.id::text = $2`,
-      [m.organization_id, campanhaId],
+  if (campanhaId !== null && baseLegal !== 'consent') {
+    await pool.query(
+      `update messages set status = 'failed', error_code = 'campanha_sem_reenvio',
+         error_message = 'Não reenviada: a campanha de prospecção só manda pela rodada, que confere a pessoa de novo.'
+       where id = $1 and organization_id = $2 and status = 'queued'`,
+      [m.id, m.organization_id],
     );
-    // O desligamento que começou durante esta leitura também para aqui, antes de qualquer envio
-    // (F4q do cxj, Q03): a releitura de cima já passou pela sua guarda.
-    if (signal?.aborted) return 'desligando';
-    if (campanha[0]?.base_legal !== 'consent') {
-      await pool.query(
-        `update messages set status = 'failed', error_code = 'campanha_sem_reenvio',
-           error_message = 'Não reenviada: a campanha de prospecção só manda pela rodada, que confere a pessoa de novo.'
-         where id = $1 and organization_id = $2 and status = 'queued'`,
-        [m.id, m.organization_id],
-      );
-      log.info('watchdog: reenvio bloqueado — mensagem de campanha de prospecção', { message_id: m.id });
-      return 'nao_sai';
-    }
+    log.info('watchdog: reenvio bloqueado — mensagem de campanha de prospecção', { message_id: m.id });
+    return 'nao_sai';
   }
   return 'pode_sair';
 }
@@ -742,17 +771,18 @@ export async function redriveQueued(
       // dos `KINDS_DE_RESPOSTA`) reserva como resposta, como a cadeia a contaria: conta no
       // intervalo e não gasta o teto do dia, e não espera o dia seguinte com o teto batido (F4q
       // do cxj, Q08). Sem o job, ela conta como disparo: a mais, o lado seguro. Erro na reserva
-      // cai no `catch` de baixo, antes de qualquer envio.
-      const quando = agora();
-      const vaga = await reservarVagaDoResgate(pool, m, quando, log);
-      if (vaga !== 'reservada') {
+      // cai no `catch` de baixo, antes de qualquer envio. O instante da vaga é o do relógio sob a
+      // trava (F4s do cxj, S01), e é por ele que a devolução acha a linha gravada.
+      const vaga = await reservarVagaDoResgate(pool, m, agora, log);
+      if (vaga.desfecho !== 'reservada') {
         log.info('watchdog: reenvio adiado — o número está sem vaga agora, ou fora da janela', {
           message_id: m.id,
-          motivo: vaga,
+          motivo: vaga.desfecho,
           resposta: m.resposta,
         });
         continue;
       }
+      const quando = vaga.instante;
       // ─── O QUE MUDOU NA ESPERA DA VAGA VALE (F4q do cxj, Q03) ───
       //
       // A reserva espera a conexão e a trava do número; nesse tempo o operador pode pausar o
@@ -760,7 +790,7 @@ export async function redriveQueued(
       // organização pode parar, o modo de teste pode voltar, outro caminho pode mandar a
       // mensagem, e o processo pode começar a desligar. A mesma conferência roda de novo, e o que
       // ela barrar devolve a vaga: nada saiu. Falha de leitura também devolve, e não envia. Entre
-      // ela e o `fetch` não há espera nenhuma.
+      // a leitura dela e o `fetch` não há espera nenhuma (F4s do cxj, S09).
       let depois: Elegibilidade;
       try {
         depois = await conferirElegibilidade(pool, m, signal, log);
@@ -775,6 +805,20 @@ export async function redriveQueued(
           motivo: depois,
         });
         if (depois === 'desligando') break;
+        continue;
+      }
+      // ─── A JANELA, NO RELÓGIO DE AGORA (F4s do cxj, S01) ───
+      //
+      // A conferência de cima também espera (a conexão, a leitura), e o relógio anda nessa
+      // espera: a janela conferida na reserva pode ter fechado. Conferida de novo aqui, com os
+      // knobs da reserva; fechada, a vaga volta e a mensagem fica na fila para o tique que a
+      // encontrar aberta. Entre esta conta e o `fetch` não há espera nenhuma.
+      if (!janelaDeEnvioAberta(agora(), vaga.knobs, m.resposta)) {
+        await devolverVagaDoResgate(pool, m, quando, log);
+        log.info('watchdog: reenvio desfeito — a janela do número fechou antes do envio, e a vaga voltou', {
+          message_id: m.id,
+          resposta: m.resposta,
+        });
         continue;
       }
       const res = await fetch(`${cfg.wahaBaseUrl}/api/sendText`, {

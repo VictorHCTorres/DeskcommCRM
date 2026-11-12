@@ -96,14 +96,14 @@ function poolDoResgate(query: unknown): pg.Pool {
 }
 
 /**
- * Banco falso que DESCOBRE cada consulta pelo vocabulário, como o teste #652. `aoLerParada` roda
- * na leitura da régua do envio original (`readStopFlags`, F4r do cxj, R06), que não para ninguém.
- * `metadata` é a do canal na releitura (`{ disabled: true }`, o canal pausado).
+ * Banco falso que DESCOBRE cada consulta pelo vocabulário, como o teste #652. `aoLerElegibilidade`
+ * roda em cada releitura da mensagem, que traz junto a régua do envio original (F4s do cxj, S09;
+ * aqui ela não para ninguém). `metadata` é a do canal na releitura (`{ disabled: true }`, o canal
+ * pausado).
  */
 function bancoComFila(
   fila: Msg[],
   aoLerElegibilidade: () => void = () => undefined,
-  aoLerParada: () => void = () => undefined,
   metadata: object = {},
 ) {
   const consultas: string[] = [];
@@ -114,10 +114,6 @@ function bancoComFila(
     if (/select\s+s\.metadata/i.test(sql)) {
       aoLerElegibilidade();
       return { rows: [{ metadata, phone_number: "+5531999990000", operante: true }] };
-    }
-    if (/as stopped/i.test(sql)) {
-      aoLerParada();
-      return { rows: [] };
     }
     return { rows: [] };
   });
@@ -196,7 +192,7 @@ describe("redrive: para entre itens, não cancela o envio em voo (#2823)", () =>
     const send = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ id: { id: "3EB0ABCDEF" } }), { status: 200 }),
     );
-    const { query, consultas } = bancoComFila([msg("m-1")], () => controller.abort(), undefined, { disabled: true });
+    const { query, consultas } = bancoComFila([msg("m-1")], () => controller.abort(), { disabled: true });
 
     const reenviadas = await redriveQueued(
       poolDoResgate(query),
@@ -214,16 +210,17 @@ describe("redrive: para entre itens, não cancela o envio em voo (#2823)", () =>
     ).toHaveLength(0);
   });
 
-  it("abort DURANTE a leitura da parada, depois da vaga: nenhum envio nasce depois do sinal, e a vaga volta", async () => {
+  it("abort DURANTE a releitura de depois da vaga, a última antes do envio: nenhum envio nasce depois do sinal, e a vaga volta", async () => {
     const controller = new AbortController();
     const send = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ id: { id: "3EB0ABCDEF" } }), { status: 200 }),
     );
-    let leiturasDaParada = 0;
-    // A 2ª leitura da parada é a da conferência de DEPOIS da vaga, a última antes do `fetch`.
-    const { query, consultas } = bancoComFila([msg("m-1")], undefined, () => {
-      leiturasDaParada += 1;
-      if (leiturasDaParada === 2) controller.abort();
+    let releituras = 0;
+    // A 2ª releitura é a da conferência de DEPOIS da vaga, a última leitura antes do `fetch`; ela
+    // traz a régua do envio original na mesma consulta (F4s do cxj, S09).
+    const { query, consultas } = bancoComFila([msg("m-1")], () => {
+      releituras += 1;
+      if (releituras === 2) controller.abort();
     });
 
     const reenviadas = await redriveQueued(
@@ -234,7 +231,7 @@ describe("redrive: para entre itens, não cancela o envio em voo (#2823)", () =>
       NA_JANELA,
     );
 
-    expect(leiturasDaParada).toBe(2);
+    expect(releituras).toBe(2);
     expect(send, "o sinal chegou antes do POST — a mensagem não podia sair").not.toHaveBeenCalled();
     expect(reenviadas).toBe(0);
     expect(
