@@ -46,7 +46,7 @@ import { assertMeetingDeliveryPg, type MeetingDeliveryContext } from '@/lib/agen
  * (`redriveQueued`) reserva a vaga do mesmo jeito antes de mandar.
  */
 import type pg from 'pg';
-import type { ChannelSendResult } from '../channel-adapter';
+import { saiuAlgo, type ChannelSendResult, type MarcaDeSaidaParcial } from '../channel-adapter';
 
 import type { Logger } from '../obs/logger';
 import { emitVetoActivity } from '@/lib/leads/veto-activity';
@@ -1456,9 +1456,11 @@ export interface RunBeforeSendArgs {
   /**
    * Enviado SÓ se TODOS os gates passarem — ChannelAdapter (própria tx/idempotência). Recebe o
    * corpo FINAL (o disclosureGate F4-05 pode emendá-lo via `amendBody`): quem monta o send DEVE
-   * enviar este `body`, não o corpo original capturado antes da cadeia.
+   * enviar este `body`, não o corpo original capturado antes da cadeia. O envio composto (bolhas,
+   * fotos) devolve o desfecho da última mensagem física, com `saiuEmParte` quando uma anterior
+   * saiu e ela não (F4q): a cadeia o trata como saída e mantém o registro no limite do número.
    */
-  send: (body: string) => Promise<ChannelSendResult>;
+  send: (body: string) => Promise<ChannelSendResult & MarcaDeSaidaParcial>;
 }
 
 /** Pure chain shared by real delivery and preview; no locks, writes or transport. */
@@ -1972,7 +1974,7 @@ async function enviarComORegistroConfirmado(
   args: RunBeforeSendArgs,
   decisao: { trace: GateTraceEntry[]; corpo: string; registro: RegistroDaSaida },
 ): Promise<BeforeSendResult> {
-  let outcome: ChannelSendResult;
+  let outcome: ChannelSendResult & MarcaDeSaidaParcial;
   try {
     outcome = await args.send(decisao.corpo);
   } catch (erroDoEnvio) {
@@ -1986,11 +1988,12 @@ async function enviarComORegistroConfirmado(
     await persistTrace(args, decisao.trace, null);
     throw erroDoEnvio;
   }
-  // Só 'sent' saiu agora. 'already_sent' foi contado na tentativa original (o ledger F2-06
+  // Só 'sent' saiu agora — ou, no envio composto (bolhas, fotos), uma mensagem física anterior à
+  // última (`saiuEmParte`, F4q). 'already_sent' foi contado na tentativa original (o ledger F2-06
   // curto-circuita a repetição); 'queued', 'failed', 'blocked' e 'unavailable' não saíram, e quem
   // os manda depois conta a própria saída: o job, que reagenda com a mesma chave e passa por esta
   // cadeia de novo, ou o resgate da fila, que reserva a vaga antes de mandar (`redriveQueued`).
-  if (outcome.kind !== 'sent') await apagarRegistroDaSaida(args, decisao.registro, outcome.kind);
+  if (!saiuAlgo(outcome)) await apagarRegistroDaSaida(args, decisao.registro, outcome.kind);
   // Auditoria DURÁVEL por run (F4-08 acc 3), gravada sem a conexão da cadeia na mão (#2426, P05).
   // Autônoma no pool; falha vira log.error (o logger é o backup).
   await persistTrace(args, decisao.trace, null);

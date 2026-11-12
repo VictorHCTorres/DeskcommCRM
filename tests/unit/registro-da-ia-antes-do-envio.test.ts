@@ -28,6 +28,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { ChannelSendResult } from '@/lib/agent-engine/channel-adapter';
 import { runBeforeSend, type RunBeforeSendArgs } from '@/lib/agent-engine/guardrails/before-send';
+import { sendInBubbles } from '@/lib/agent-engine/agent/split-message';
 import { OrgNaoOperanteError } from '@/lib/organizacao/operante';
 
 const ORG = '00000000-0000-4000-8000-000000000001';
@@ -348,5 +349,77 @@ describe('F4o/F4p · a saída da IA está confirmada no limite do número antes 
 
     expect(banco.linhas('pacing_ledger')).toHaveLength(1);
     expect(banco.linhas('outbound_copies')).toEqual([]);
+  });
+});
+
+/**
+ * F4q · o envio composto (bolhas, fotos) que saiu EM PARTE. O desfecho é o da última mensagem
+ * física: com a 1ª bolha `sent` e a 2ª `failed` ou `queued`, ele não é `sent`, mas a mensagem
+ * saiu. `sendInBubbles` e `enviarComFotos` marcam `saiuEmParte`, e a cadeia mantém o registro
+ * (`tests/unit/envio-composto-saiu-em-parte.test.ts` prova a marca).
+ */
+describe('F4q · envio composto: a mensagem que saiu em parte fica no limite do número', () => {
+  const DESFECHOS: Record<'failed' | 'queued' | 'blocked' | 'unavailable' | 'already_sent', ChannelSendResult> = {
+    failed: { kind: 'failed', idempotencyKey: 'k', messageId: null },
+    queued: { kind: 'queued', idempotencyKey: 'k', messageId: null },
+    blocked: { kind: 'blocked', idempotencyKey: 'k' },
+    unavailable: { kind: 'unavailable', reason: 'sessão caiu entre as bolhas' },
+    already_sent: { kind: 'already_sent', idempotencyKey: 'k', messageId: null },
+  };
+
+  it.each(Object.keys(DESFECHOS) as (keyof typeof DESFECHOS)[])(
+    'desfecho %s com saiuEmParte: a linha e a cópia ficam, e nada é apagado',
+    async (kind) => {
+      const banco = bancoFalso();
+      const desfecho = { ...DESFECHOS[kind], saiuEmParte: true };
+
+      const r = await runBeforeSend(argsDoTurno(banco.pool, async () => desfecho));
+
+      expect(r).toMatchObject({ status: 'sent', outcome: { kind } });
+      expect(banco.eventos.filter((e) => e.startsWith('apagou'))).toEqual([]);
+      expect(banco.linhas('pacing_ledger')).toHaveLength(1);
+      expect(banco.linhas('outbound_copies')).toHaveLength(1);
+    },
+  );
+
+  function bolhasPeloCanal(kinds: ChannelSendResult['kind'][]): RunBeforeSendArgs['send'] {
+    const fila = [...kinds];
+    return (corpo) =>
+      sendInBubbles(corpo, {
+        enabled: true,
+        maxChars: 600,
+        sleep: async () => {},
+        jitter: () => 0,
+        send: async () => {
+          const kind = fila.shift() ?? 'sent';
+          return kind === 'sent' ? ENVIADA : DESFECHOS[kind];
+        },
+      });
+  }
+
+  it.each([
+    [['sent', 'failed']],
+    [['sent', 'queued']],
+  ] as ChannelSendResult['kind'][][][])(
+    'de ponta a ponta, com as bolhas %j: a 1ª saiu, e o registro fica',
+    async (kinds) => {
+      const banco = bancoFalso();
+
+      await runBeforeSend(argsDoTurno(banco.pool, bolhasPeloCanal(kinds), { body: 'Primeira parte.\n\nSegunda parte.' }));
+
+      expect(banco.eventos.filter((e) => e.startsWith('apagou'))).toEqual([]);
+      expect(banco.linhas('pacing_ledger')).toHaveLength(1);
+    },
+  );
+
+  it('controle de ponta a ponta: a 1ª bolha ficou na fila do canal e a 2ª falhou — nada saiu, e o registro é apagado', async () => {
+    const banco = bancoFalso();
+
+    await runBeforeSend(
+      argsDoTurno(banco.pool, bolhasPeloCanal(['queued', 'failed']), { body: 'Primeira parte.\n\nSegunda parte.' }),
+    );
+
+    expect(banco.eventos).toContain('apagou:2');
+    expect(banco.linhas('pacing_ledger')).toEqual([]);
   });
 });

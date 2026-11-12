@@ -1,3 +1,4 @@
+import { comSaidaParcial, saiuAlgo, type MarcaDeSaidaParcial } from "../channel-adapter";
 import { semConteudoVisivel } from "./conteudo-visivel";
 
 /**
@@ -116,7 +117,8 @@ function splitWords(text: string, maxChars: number): string[] {
  * messageId casa com o shape real de ChannelSendResult (string | null | undefined
  * conforme o kind) — não apenas string opcional.
  */
-export interface BubbleOutcome {
+/** O desfecho de uma mensagem física; a marca `saiuEmParte` é a do envio composto (F4q). */
+export interface BubbleOutcome extends MarcaDeSaidaParcial {
   kind: string;
   messageId?: string | null;
 }
@@ -237,13 +239,17 @@ export async function sendInBubbles<T extends BubbleOutcome>(
   const bubbles = splitForSend(body, opts.enabled, opts.maxChars, opts.maxBubbles);
   if (bubbles.length === 0) return opts.send(body); // corpo vazio: deixa o canal decidir
   let last: T | undefined;
+  // Uma bolha anterior saiu: o desfecho final, se não for `sent`, leva a marca (F4q). Sem ela, a
+  // 1ª bolha `sent` e a 2ª `failed` davam `failed`, e quem conta a saída a apagava do limite.
+  let anteriorSaiu = false;
   for (let i = 0; i < bubbles.length; i++) {
     // Antes da 1ª: o atraso humano do turno. Entre as demais: o jitter anti-ban
     // que já existia. Nunca os dois na mesma pausa.
     if (i === 0) await opts.antesDaPrimeira?.(bubbles[0]!);
     else await opts.sleep(opts.jitter());
     last = await opts.send(bubbles[i]!);
-    if (!OK_KINDS.has(last.kind)) return last; // veto/bloqueio/falha: para aqui
+    if (!OK_KINDS.has(last.kind)) return comSaidaParcial(last, anteriorSaiu); // veto/bloqueio/falha: para aqui
+    anteriorSaiu = anteriorSaiu || saiuAlgo(last);
   }
-  return last!;
+  return comSaidaParcial(last!, anteriorSaiu);
 }
