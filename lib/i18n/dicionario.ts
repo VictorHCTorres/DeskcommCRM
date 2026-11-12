@@ -12147,6 +12147,9 @@ export const DICIONARIO: Traducoes = {
     es: "El archivo enviado es demasiado grande (máx. 5 MB por skill).",
   },
   "O evento original deste run foi removido.": { es: "El evento original de esta ejecución fue eliminado." },
+  "O filtro por chave é grande demais para uma consulta só. Subdivida: faça várias consultas com menos chaves, de modo que a soma de len(encodeURIComponent(valor)) fique dentro de limite_get.bytes_lista.": {
+    es: "El filtro por clave es demasiado grande para una sola consulta. Subdivida: haga varias consultas con menos claves, de modo que la suma de len(encodeURIComponent(valor)) quede dentro de limite_get.bytes_lista.",
+  },
   "O fim do período precisa ser depois do começo.": { es: "El fin del período debe ser posterior al inicio." },
   "O logo precisa ser PNG ou JPG.": { es: "El logo debe ser PNG o JPG." },
   "Outro atendente assumiu esta conversa agora.": { es: "Otro asesor acaba de asumir esta conversación." },

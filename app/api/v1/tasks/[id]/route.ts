@@ -24,6 +24,13 @@ import { traduzir } from "@/lib/i18n/dicionario";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { createClient } from "@/lib/supabase/server";
 import { registraAtividadeDaTarefa } from "@/lib/tarefas/atividade";
+import {
+  CHAVE_SO_POR_TOKEN,
+  chaveExternaSchema,
+  comSinalDeCapacidade,
+  ehConflitoDaChave,
+} from "@/lib/tarefas/chave-externa";
+import { buscarDonaDaChave } from "@/lib/tarefas/dona-da-chave";
 import { conferirDemanda } from "@/lib/tarefas/demanda";
 import { conferirResponsavel } from "@/lib/tarefas/responsavel";
 import { COLUNAS_DA_TAREFA } from "@/lib/tarefas/gravar-tarefa";
@@ -47,19 +54,48 @@ const edicaoSchema = z
     /** Vincular (`<uuid>`) e desvincular (`null`) a demanda do atendimento (#2818). */
     demanda_id: z.string().uuid().nullable().optional(),
     assigned_to: z.string().uuid().nullable().optional(),
+    /**
+     * D9 — ADOTAR: preenche a chave de uma tarefa que ainda não tem (gravada antes da D9).
+     * Trocar uma chave existente ou apagá-la (`null`) é recusado: `null` nem passa neste schema.
+     */
+    external_id: chaveExternaSchema.optional(),
   })
   // PATCH vazio gravaria só o `updated_at` e devolveria 200: a tela diria
   // "salvo" sobre uma edição que não existiu.
   .refine((v) => Object.keys(v).length > 0, { message: "Nada para alterar." });
 
+/**
+ * O `update` da edição. Com `somenteSeSemChave`, leva `external_id is null` na própria instrução
+ * (a adoção da D9); sem ela, é a edição comum de sempre.
+ */
+async function gravarEdicao(
+  supabase: Awaited<ReturnType<typeof createClient>>,
+  orgId: string,
+  id: string,
+  campos: Record<string, unknown>,
+  somenteSeSemChave: boolean,
+) {
+  let atualiza = supabase
+    .from("crm_tasks")
+    .update(campos as never)
+    .eq("id", id)
+    .eq("organization_id", orgId);
+  if (somenteSeSemChave) atualiza = atualiza.is("external_id", null);
+  return atualiza.select(COLUNAS).single();
+}
+
 interface Contexto {
   params: Promise<{ id: string }>;
 }
 
+/** O sinal de capacidade (contrato D9 §3) vai em toda resposta do PATCH, inclusive nas recusas. */
 export async function PATCH(req: NextRequest, ctx: Contexto): Promise<Response> {
   const supportDenied = await requireSupportWrite();
-  if (supportDenied) return supportDenied;
+  if (supportDenied) return comSinalDeCapacidade(supportDenied);
+  return comSinalDeCapacidade(await editar(req, ctx));
+}
 
+async function editar(req: NextRequest, ctx: Contexto): Promise<Response> {
   const requestId = randomUUID();
   const { id } = await ctx.params;
 
@@ -84,6 +120,14 @@ export async function PATCH(req: NextRequest, ctx: Contexto): Promise<Response> 
     return fail("validation_failed", t("Dados inválidos."), 422, {
       requestId,
       details: parsed.error.flatten().fieldErrors as Record<string, unknown>,
+    });
+  }
+
+  // D9: adotar chave é coisa do robô (token). Na sessão é 422 explícito; o banco repete a regra.
+  if (parsed.data.external_id !== undefined && authz.via !== "token") {
+    return fail("validation_failed", t("Dados inválidos."), 422, {
+      requestId,
+      details: { external_id: [CHAVE_SO_POR_TOKEN] },
     });
   }
 
@@ -157,13 +201,46 @@ export async function PATCH(req: NextRequest, ctx: Contexto): Promise<Response> 
     .eq("organization_id", orgId)
     .maybeSingle();
 
-  const { data, error } = await supabase
-    .from("crm_tasks")
-    .update(parsed.data)
-    .eq("id", id)
-    .eq("organization_id", orgId)
-    .select(COLUNAS)
-    .single();
+  // Adoção da chave (D9): o `update` leva `external_id is null` NA MESMA instrução, então duas
+  // adoções concorrentes não se atropelam — só uma casa a linha. Não há leitura-depois-escrita.
+  const adota = parsed.data.external_id !== undefined;
+  let campos: Record<string, unknown> = parsed.data;
+  let { data, error } = await gravarEdicao(supabase, orgId, id, campos, adota);
+
+  if (error && (error as { code?: string }).code === "PGRST116" && adota) {
+    // Nenhuma linha casou: a tarefa não existe, ou já tem chave. Só uma leitura diz qual.
+    const { data: atual, error: erroLeitura } = await supabase
+      .from("crm_tasks")
+      .select(COLUNAS)
+      .eq("id", id)
+      .eq("organization_id", orgId)
+      .maybeSingle();
+    if (erroLeitura)
+      return fail("internal_error", t("Erro ao salvar a tarefa."), 500, { requestId });
+    if (!atual) return fail("not_found", t("Tarefa não encontrada."), 404, { requestId });
+    const existente = (atual as unknown as Tarefa).external_id ?? null;
+    if (existente !== parsed.data.external_id) {
+      return fail(
+        "state_conflict",
+        t("Esta tarefa já tem outra chave externa; ela não se troca."),
+        409,
+        {
+          requestId,
+          details: { reason: "external_id_already_set", external_id: existente },
+        },
+      );
+    }
+    // A MESMA chave de novo (o robô repetindo a adoção): não há o que gravar na chave. O resto
+    // do corpo, se houver, segue pelo caminho comum.
+    const { external_id: _ja, ...resto } = parsed.data;
+    if (Object.keys(resto).length === 0) {
+      data = atual;
+      error = null;
+    } else {
+      campos = resto;
+      ({ data, error } = await gravarEdicao(supabase, orgId, id, campos, false));
+    }
+  }
 
   if (error) {
     if (error.code === "PGRST116") {
@@ -179,6 +256,23 @@ export async function PATCH(req: NextRequest, ctx: Contexto): Promise<Response> 
         },
       );
     }
+    if (adota && ehConflitoDaChave(error)) {
+      const dona = await buscarDonaDaChave(supabase, orgId, parsed.data.external_id!);
+      if (dona === "incerto") {
+        return fail(
+          "unavailable",
+          t(
+            "Não foi possível confirmar qual tarefa já tem esta chave. O resultado é incerto: consulte a lista pela chave antes de tentar de novo.",
+          ),
+          503,
+          { requestId, details: { external_id: parsed.data.external_id, outcome: "unknown" } },
+        );
+      }
+      return fail("state_conflict", t("Já existe uma tarefa com esta chave externa."), 409, {
+        requestId,
+        details: { external_id: parsed.data.external_id, task_id: dona },
+      });
+    }
     return fail("internal_error", t("Erro ao salvar a tarefa."), 500, { requestId });
   }
 
@@ -193,7 +287,7 @@ export async function PATCH(req: NextRequest, ctx: Contexto): Promise<Response> 
     resourceType: "crm_tasks",
     resourceId: tarefa.id,
     requestId,
-    metadata: { campos: Object.keys(parsed.data) },
+    metadata: { campos: Object.keys(campos) },
   });
 
   const fechouAgora =

@@ -81,7 +81,12 @@ function fazerSupabase(respostas: Resposta[]) {
     const elo: Record<string, unknown> = {};
     const devolve = () => {
       const r = proxima();
-      return Promise.resolve({ data: r.data ?? null, error: r.error ?? null });
+      // `count` é o total exato que o PostgREST devolve com `count: "exact"` (o GET da D9 o exige).
+      return Promise.resolve({
+        data: r.data ?? null,
+        error: r.error ?? null,
+        count: Array.isArray(r.data) ? r.data.length : null,
+      });
     };
     for (const metodo of ["select", "update", "delete", "order", "limit", "in", "gte", "lte"]) {
       elo[metodo] = () => elo;
@@ -284,7 +289,11 @@ describe("PATCH /api/v1/tasks/[id] — vincular e desvincular (#2818)", () => {
   });
 
   it("⭐ vincular pela edição a demanda de OUTRA organização é 422, e a tarefa não muda", async () => {
-    const espiao = fazerSupabase([{ data: null }, { data: { status: "pending" } }, { data: LINHA }]);
+    const espiao = fazerSupabase([
+      { data: null },
+      { data: { status: "pending" } },
+      { data: LINHA },
+    ]);
     const { PATCH } = await import("@/app/api/v1/tasks/[id]/route");
 
     const res = await PATCH(patch({ demanda_id: DEMANDA }), ctx);
@@ -310,7 +319,10 @@ describe("PATCH /api/v1/tasks/[id] — vincular e desvincular (#2818)", () => {
   });
 
   it("desvincular (null) não consulta demanda nenhuma", async () => {
-    const espiaoNulo = fazerSupabase([{ data: { status: "pending" } }, { data: { ...LINHA, demanda_id: null } }]);
+    const espiaoNulo = fazerSupabase([
+      { data: { status: "pending" } },
+      { data: { ...LINHA, demanda_id: null } },
+    ]);
     const { PATCH } = await import("@/app/api/v1/tasks/[id]/route");
 
     const res = await PATCH(patch({ demanda_id: null }), ctx);
