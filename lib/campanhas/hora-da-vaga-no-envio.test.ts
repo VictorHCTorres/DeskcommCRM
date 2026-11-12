@@ -25,6 +25,9 @@ const mundo = vi.hoisted(() => ({
   aoRegistrar: null as null | (() => void),
   aoEnviar: null as null | (() => Promise<Record<string, unknown> | void>),
   regras: [] as Array<{ limite: number | null; vagas: number; intervaloMs: number }>,
+  // A folga de cada vaga reservada e a de cada devolução (versão 16): a vaga guarda o instante mais a folga.
+  folgas: [] as number[],
+  folgasDevolvidas: [] as number[],
 }));
 
 vi.mock("@/lib/logger", () => ({ logger: { info: () => undefined, warn: vi.fn(), error: vi.fn() } }));
@@ -35,23 +38,25 @@ vi.mock("@/lib/agent-engine/pacing/store", () => ({
     const envios = mundo.ledger.get(sessionId) ?? [];
     return { lastSentAt: envios.at(-1) ?? null, sentToday: envios.length, numberActivatedAt: null };
   },
-  undoSend: async (_pool: unknown, _org: string, sessionId: string, quando: Date) => {
+  undoSend: async (_pool: unknown, _org: string, sessionId: string, quando: Date, opts?: { folgaMs?: number }) => {
     mundo.aoDevolver?.();
+    mundo.folgasDevolvidas.push(opts?.folgaMs ?? 0);
     const linhas = mundo.ledger.get(sessionId) ?? [];
-    const i = linhas.findIndex(d => +d === +quando);
+    const i = linhas.findIndex(d => +d === +quando + (opts?.folgaMs ?? 0));
     if (i >= 0) linhas.splice(i, 1);
   },
   // A rodada manda o relógio (versão 15): o dublê o lê depois da espera, como o store o lê sob a trava. Com um
-  // instante (a versão 14), ele vale como veio.
-  reservarVaga: async (_pool: unknown, _org: string, sessionId: string, relogio: Date | (() => Date), regra: {limite:number|null;desde:Date;vagas:number;intervaloMs:number}) => {
+  // instante (a versão 14), ele vale como veio. A linha leva o instante mais a folga (versão 16), como no store.
+  reservarVaga: async (_pool: unknown, _org: string, sessionId: string, relogio: Date | (() => Date), regra: {limite:number|null;desde:Date;vagas:number;intervaloMs:number;folgaMs?:number}) => {
     mundo.aoRegistrar?.();
     mundo.regras.push({ limite: regra.limite, vagas: regra.vagas, intervaloMs: regra.intervaloMs });
+    mundo.folgas.push(regra.folgaMs ?? 0);
     const quando = typeof relogio === "function" ? relogio() : relogio;
     const linhas = mundo.ledger.get(sessionId) ?? [];
     const ultimo = linhas.length ? Math.max(...linhas.map(Number)) : null;
     if (regra.limite !== null && linhas.filter(d => +d >= +regra.desde).length + regra.vagas > regra.limite) return "teto_cheio";
     if (regra.intervaloMs > 0 && ultimo !== null && +quando - ultimo < regra.intervaloMs) return "intervalo";
-    mundo.ledger.set(sessionId, [...linhas, quando]);
+    mundo.ledger.set(sessionId, [...linhas, new Date(+quando + (regra.folgaMs ?? 0))]);
     return "reservada";
   },
 }));
@@ -238,6 +243,8 @@ beforeEach(() => {
   mundo.aoRegistrar = null;
   mundo.aoDevolver = null;
   mundo.regras.length = 0;
+  mundo.folgas.length = 0;
+  mundo.folgasDevolvidas.length = 0;
   vi.mocked(logger.warn).mockClear();
   vi.mocked(logger.error).mockClear();
   vi.useRealTimers();
@@ -530,6 +537,65 @@ describe("versão 15 — a janela conferida depois da reserva é a mesma que a r
       vi.setSystemTime(umMinutoDepois);
       await rodarUmaRodadaDeCampanha(admin, umMinutoDepois);
       expect(mundo.envios).toEqual(["conv:ana:chip", "conv:bia:chip"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("versão 16 — a vaga da campanha guarda a hora mais tardia do balão (F4u do cxj, U02)", () => {
+  it("⭐ com intervalo no número, cada balão grava a vaga com a folga, e a reserva do 1º segue com o intervalo mais a folga", async () => {
+    const inicio = new Date("2026-11-18T18:00:00Z");
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(inicio);
+    mundo.knobs = { ...mundo.knobs, ...JANELA, throttleMs: PACING_DEFAULTS.throttleMs };
+    const { admin } = cenario(
+      campanha("legitimate_interest", { split_messages: true }),
+      pendente("ana", ["funil-a"], { rendered_body: "Primeiro parágrafo.\n\nSegundo parágrafo." }),
+    );
+    mundo.aoEnviar = async () => {
+      vi.setSystemTime(new Date(Date.now() + 700));
+    };
+    try {
+      await rodarUmaRodadaDeCampanha(admin, inicio);
+      expect(mundo.envios).toHaveLength(2);
+      expect(mundo.folgas).toEqual([FOLGA, FOLGA]);
+      expect(mundo.regras.map((r) => r.intervaloMs)).toEqual([PACING_DEFAULTS.throttleMs + FOLGA, 0]);
+      expect((mundo.ledger.get("chip") ?? []).map(Number)).toEqual([+inicio + FOLGA, +inicio + 700 + FOLGA]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("⭐ a vaga que volta é procurada com a mesma folga: a janela fecha depois da reserva, e a linha sai do ledger", async () => {
+    const inicio = new Date("2026-11-18T20:59:59Z");
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(inicio);
+    mundo.knobs = { ...mundo.knobs, ...JANELA, throttleMs: 5_000 };
+    const { admin } = cenario(campanha("legitimate_interest"), pendente("ana"));
+    mundo.aoRegistrar = () => vi.setSystemTime(new Date("2026-11-18T21:00:01Z"));
+    try {
+      await rodarUmaRodadaDeCampanha(admin, inicio);
+      expect(mundo.envios).toHaveLength(0);
+      expect(mundo.folgasDevolvidas).toEqual([FOLGA]);
+      expect(mundo.ledger.get("chip") ?? []).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("controle: sem intervalo no número, nem a vaga nem a devolução levam folga", async () => {
+    const inicio = new Date("2026-11-18T20:59:59Z");
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(inicio);
+    mundo.knobs = { ...mundo.knobs, ...JANELA, throttleMs: 0 };
+    const { admin } = cenario(campanha("legitimate_interest"), pendente("ana"));
+    mundo.aoRegistrar = () => vi.setSystemTime(new Date("2026-11-18T21:00:01Z"));
+    try {
+      await rodarUmaRodadaDeCampanha(admin, inicio);
+      expect(mundo.folgas).toEqual([0]);
+      expect(mundo.folgasDevolvidas).toEqual([0]);
+      expect(mundo.ledger.get("chip") ?? []).toEqual([]);
     } finally {
       vi.useRealTimers();
     }

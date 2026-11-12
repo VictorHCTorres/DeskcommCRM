@@ -3,7 +3,11 @@ import pg from 'pg';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 
 import { pgSendLedger, sendWithLedger } from '@/lib/agent-engine/edge/crm/send-ledger';
-import { redriveQueued, type WatchdogConfig } from '@/lib/agent-engine/edge/crm/session-reconciler';
+import {
+  ATRASO_MAXIMO_DA_VAGA_DO_RESGATE_MS,
+  redriveQueued,
+  type WatchdogConfig,
+} from '@/lib/agent-engine/edge/crm/session-reconciler';
 import type { Logger } from '@/lib/agent-engine/obs/logger';
 import { loadPacingState, recordSend, reservarVaga, type RegraDaVaga } from '@/lib/agent-engine/pacing/store';
 
@@ -27,6 +31,11 @@ import { loadPacingState, recordSend, reservarVaga, type RegraDaVaga } from '@/l
  * pausado, o modo de teste, a sessão fora do ar, o contato bloqueado) vale: a conferência roda de
  * novo depois da reserva, e a vaga volta.
  *
+ * Versão 16 (F4u do cxj, U02): a linha da vaga do resgate leva o instante mais a folga, a hora mais
+ * tardia do envio, e todo emissor do número mede o intervalo dela. As contagens procuram a linha
+ * nessa hora (`vagaDoResgate`), inclusive as que conferem que a vaga não ficou: no instante exato,
+ * elas passariam sem conferir nada.
+ *
  * O WAHA é um `fetch` em memória; nenhuma requisição sai do processo.
  */
 
@@ -47,6 +56,8 @@ afterEach(async () => {
 });
 
 const AGORA = new Date('2026-11-18T14:00:00Z'); // 11h em São Paulo
+/** Onde fica a linha da vaga que o resgate reserva no instante `quando`: neste número (WAHA, intervalo de 5 s), com a folga. */
+const vagaDoResgate = (quando: Date): Date => new Date(+quando + ATRASO_MAXIMO_DA_VAGA_DO_RESGATE_MS);
 const REGRA: RegraDaVaga = { limite: 60, desde: new Date('2026-11-18T03:00:00Z'), vagas: 1, intervaloMs: 5_000 };
 const CONFIG: WatchdogConfig = {
   wahaBaseUrl: 'http://resgate.invalid',
@@ -302,7 +313,7 @@ describe('F4p no Postgres real · o resgate da fila conta a saída antes de mand
     expect(disparosNoEnvio).toBe(60);
     expect(await statusDa(f)).toBe('sent');
     const e = await estado(f);
-    expect({ hoje: e.sentToday, ultima: e.lastSentAt?.getTime() }).toEqual({ hoje: 60, ultima: AGORA.getTime() });
+    expect({ hoje: e.sentToday, ultima: e.lastSentAt?.getTime() }).toEqual({ hoje: 60, ultima: vagaDoResgate(AGORA).getTime() });
     expect(await reservarVaga(pool, f.org, f.numero, new Date(+AGORA + 1_000), REGRA)).toBe('teto_cheio');
   });
 
@@ -391,7 +402,7 @@ describe('F4q no Postgres real · a resposta presa sai pelo resgate como respost
       expect(waha).toHaveBeenCalledTimes(1);
       expect(await statusDa(f)).toBe('sent');
       expect((await estado(f)).sentToday).toBe(60);
-      expect(await respostasEm(f, AGORA)).toBe(1);
+      expect(await respostasEm(f, vagaDoResgate(AGORA))).toBe(1);
       // A resposta conta no intervalo: a reserva seguinte, 1 s depois, esbarra nele.
       expect(await reservarVaga(pool, f.org, f.numero, new Date(+AGORA + 1_000), { ...REGRA, limite: null })).toBe(
         'intervalo',
@@ -407,7 +418,7 @@ describe('F4q no Postgres real · a resposta presa sai pelo resgate como respost
 
     expect(waha).not.toHaveBeenCalled();
     expect(await statusDa(f)).toBe('queued');
-    expect(await respostasEm(f, AGORA)).toBe(0);
+    expect(await respostasEm(f, vagaDoResgate(AGORA))).toBe(0);
   });
 
   it('controle: a presa sem o job de origem conta como disparo (o lado seguro)', async () => {
@@ -449,7 +460,7 @@ describe('F4q no Postgres real · a resposta presa sai pelo resgate como respost
 
     expect(waha).not.toHaveBeenCalled();
     expect(await statusDa(f)).toBe('queued');
-    expect(await respostasEm(f, AGORA)).toBe(0);
+    expect(await respostasEm(f, vagaDoResgate(AGORA))).toBe(0);
   });
 
   it('a resposta presa respeita o intervalo do número: a última saída foi há 1 s, e ela não sai neste tique', async () => {
@@ -460,7 +471,7 @@ describe('F4q no Postgres real · a resposta presa sai pelo resgate como respost
 
     expect(waha).not.toHaveBeenCalled();
     expect(await statusDa(f)).toBe('queued');
-    expect(await respostasEm(f, AGORA)).toBe(0);
+    expect(await respostasEm(f, vagaDoResgate(AGORA))).toBe(0);
   });
 
   it('o WAHA recusa a resposta presa (422, nada saiu): a vaga de resposta volta, e a mensagem continua na fila', async () => {
@@ -471,7 +482,7 @@ describe('F4q no Postgres real · a resposta presa sai pelo resgate como respost
 
     expect(waha).toHaveBeenCalledTimes(1);
     expect(await statusDa(f)).toBe('queued');
-    expect(await respostasEm(f, AGORA)).toBe(0);
+    expect(await respostasEm(f, vagaDoResgate(AGORA))).toBe(0);
     expect((await estado(f)).sentToday).toBe(60);
   });
 
@@ -482,7 +493,7 @@ describe('F4q no Postgres real · a resposta presa sai pelo resgate como respost
     expect(await resgatar()).toBe(0);
 
     expect(await statusDa(f)).toBe('queued');
-    expect(await respostasEm(f, AGORA)).toBe(1);
+    expect(await respostasEm(f, vagaDoResgate(AGORA))).toBe(1);
   });
 });
 
@@ -650,7 +661,7 @@ describe('F4r no Postgres real · a mensagem presa tem um dono só (R08)', () =>
 
       expect(waha).not.toHaveBeenCalled();
       expect(await statusDa(f)).toBe('queued');
-      expect(await vagasEm(f, AGORA)).toBe(0);
+      expect(await vagasEm(f, vagaDoResgate(AGORA))).toBe(0);
     },
   );
 
@@ -668,7 +679,7 @@ describe('F4r no Postgres real · a mensagem presa tem um dono só (R08)', () =>
     expect(n).toBe(0);
     expect(waha).not.toHaveBeenCalled();
     expect(await statusDa(f)).toBe('queued');
-    expect(await vagasEm(f, AGORA)).toBe(0);
+    expect(await vagasEm(f, vagaDoResgate(AGORA))).toBe(0);
     expect((await estado(f)).sentToday).toBe(59);
   });
 
@@ -839,7 +850,7 @@ describe('F4r no Postgres real · o resgate para onde a cadeia para (R06)', () =
 
       expect(waha).not.toHaveBeenCalled();
       expect(await falhaDa(f)).toEqual({ status: 'failed', error_code: motivo });
-      expect(await vagasEm(f, AGORA)).toBe(0);
+      expect(await vagasEm(f, vagaDoResgate(AGORA))).toBe(0);
     },
   );
 
@@ -854,7 +865,7 @@ describe('F4r no Postgres real · o resgate para onde a cadeia para (R06)', () =
     expect(n).toBe(0);
     expect(waha).not.toHaveBeenCalled();
     expect(await falhaDa(f)).toEqual({ status: 'failed', error_code: 'atendimento_com_humano' });
-    expect(await vagasEm(f, AGORA)).toBe(0);
+    expect(await vagasEm(f, vagaDoResgate(AGORA))).toBe(0);
   });
 
   it.each(['automation', 'system'] as const)(
@@ -869,7 +880,7 @@ describe('F4r no Postgres real · o resgate para onde a cadeia para (R06)', () =
 
       expect(waha).not.toHaveBeenCalled();
       expect(await falhaDa(f)).toEqual({ status: 'failed', error_code: 'contato_bloqueado' });
-      expect(await vagasEm(f, AGORA)).toBe(0);
+      expect(await vagasEm(f, vagaDoResgate(AGORA))).toBe(0);
     },
   );
 
@@ -904,7 +915,7 @@ describe('F4r no Postgres real · o resgate respeita a janela do número (R07)',
 
     expect(waha).not.toHaveBeenCalled();
     expect(await statusDa(f)).toBe('queued');
-    expect(await vagasEm(f, MADRUGADA)).toBe(0);
+    expect(await vagasEm(f, vagaDoResgate(MADRUGADA))).toBe(0);
   });
 
   it('às 8h, o follow-up preso (disparo, janela das 9h às 18h) não sai, e fica na fila', async () => {
@@ -915,7 +926,7 @@ describe('F4r no Postgres real · o resgate respeita a janela do número (R07)',
 
     expect(waha).not.toHaveBeenCalled();
     expect(await statusDa(f)).toBe('queued');
-    expect(await vagasEm(f, OITO_HORAS)).toBe(0);
+    expect(await vagasEm(f, vagaDoResgate(OITO_HORAS))).toBe(0);
   });
 
   it('controle: às 8h, a resposta presa (janela das 7h às 22h) sai', async () => {
@@ -926,7 +937,7 @@ describe('F4r no Postgres real · o resgate respeita a janela do número (R07)',
 
     expect(waha).toHaveBeenCalledTimes(1);
     expect(await statusDa(f)).toBe('sent');
-    expect(await respostasEm(f, OITO_HORAS)).toBe(1);
+    expect(await respostasEm(f, vagaDoResgate(OITO_HORAS))).toBe(1);
   });
 
   it('a janela fechada devolve a trava do número: outra sessão do banco a pega na hora', async () => {
@@ -1065,7 +1076,7 @@ describe('F4s no Postgres real · o resgate confere no instante do envio (S01 e 
       expect(n).toBe(0);
       expect(waha).not.toHaveBeenCalled();
       expect(await falhaDa(f)).toEqual({ status: 'failed', error_code: motivo });
-      expect(await vagasEm(f, AGORA)).toBe(0);
+      expect(await vagasEm(f, vagaDoResgate(AGORA))).toBe(0);
     },
   );
 
@@ -1140,8 +1151,8 @@ describe('F4s no Postgres real · o resgate confere no instante do envio (S01 e 
 
     expect(await resgate).toBe(1);
     expect(waha).toHaveBeenCalledTimes(1);
-    expect(await vagasEm(f, depois), 'a vaga leva o instante em que a trava foi obtida').toBe(1);
-    expect(await vagasEm(f, AGORA), 'o instante de antes da espera já tinha passado').toBe(0);
+    expect(await vagasEm(f, vagaDoResgate(depois)), 'a vaga leva o instante em que a trava foi obtida').toBe(1);
+    expect(await vagasEm(f, vagaDoResgate(AGORA)), 'o instante de antes da espera já tinha passado').toBe(0);
   });
 
   it('a vaga é gravada no instante lido depois da trava: outro envio do número segurou a trava por 30 s, e o registro tem o instante de depois dela', async () => {
@@ -1183,7 +1194,7 @@ describe('F4s no Postgres real · o resgate confere no instante do envio (S01 e 
       outro.release();
     }
     expect(waha).toHaveBeenCalledTimes(1);
-    expect(await vagasEm(f, depois), 'a vaga leva o instante em que a trava foi obtida').toBe(1);
-    expect(await vagasEm(f, AGORA), 'o instante de antes da trava já tinha passado').toBe(0);
+    expect(await vagasEm(f, vagaDoResgate(depois)), 'a vaga leva o instante em que a trava foi obtida').toBe(1);
+    expect(await vagasEm(f, vagaDoResgate(AGORA)), 'o instante de antes da trava já tinha passado').toBe(0);
   });
 });

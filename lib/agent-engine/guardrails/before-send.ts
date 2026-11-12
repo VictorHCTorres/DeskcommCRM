@@ -1363,6 +1363,16 @@ export interface RunBeforeSendArgs {
    */
   resposta?: boolean;
   now: Date;
+  /**
+   * O relógio da saída (versão 16, F4u do cxj, U02): lido SOB a trava, depois da espera do intervalo, dá a hora
+   * gravada no registro da saída (`pacing_ledger`), que é a hora a partir da qual o próximo envio do número mede o
+   * intervalo. `now` é lido pelo chamador antes da pausa humana, da classificação, da espera pela trava e da espera
+   * do intervalo: gravado, ele deixava o registro segundos antes da saída de verdade, e o envio seguinte do número
+   * (o resgate, a campanha, outra resposta) saía a menos do intervalo desta. O registro leva o maior entre o relógio e
+   * `now` mais a espera do intervalo; sem o relógio, `now` mais a espera. A decisão (a janela, o teto, a espera)
+   * segue contada de `now`: lido antes, ele só alonga a espera.
+   */
+  relogio?: () => Date;
   /** injeções de teste (jitter determinístico + espera sem relógio real). */
   rng?: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -1861,7 +1871,15 @@ export async function runBeforeSend(args: RunBeforeSendArgs): Promise<BeforeSend
       // Agora a linha do limite diário e a cópia são confirmadas aqui, sob a trava: recusado o
       // registro ou o commit, nada sai. Quem pega a trava depois já as lê. Só um desfecho que prova
       // que nada saiu as apaga, pelo id (`apagarRegistroDaSaida`).
-      const linha = await recordSend(client, args.tenantId, args.channelSessionId, args.now, {
+      //
+      // O registro leva a hora da saída, depois da espera (versão 16, F4u do cxj, U02): o próximo envio do número, de
+      // qualquer emissor, mede o intervalo a partir dela. Com `args.now`, de antes da pausa humana e da espera, a linha
+      // ficava segundos antes da saída de verdade. O transporte vem depois do commit, e a campanha e o resgate pedem o
+      // intervalo mais a folga deles para cobrir esse tempo.
+      const instanteDaSaida = new Date(
+        Math.max(args.relogio ? args.relogio().getTime() : -Infinity, args.now.getTime() + throttleWaitMs),
+      );
+      const linha = await recordSend(client, args.tenantId, args.channelSessionId, instanteDaSaida, {
         resposta: tipoDeEnvio(args.resposta) === 'resposta',
       });
       // Simetria com o gate desarmado: quem não é julgado pela janela não entra
@@ -1872,7 +1890,7 @@ export async function runBeforeSend(args: RunBeforeSendArgs): Promise<BeforeSend
           : null;
       await client.query('commit');
       transacaoFechada = true;
-      decisao = { tipo: 'envio', trace, corpo: ctx.body, registro: { linha, copia } };
+      decisao = { tipo: 'envio', trace, corpo: ctx.body, registro: { linha, copia, instante: instanteDaSaida } };
     }
   } catch (err) {
     erroNaTransacao = err instanceof Error ? err : new Error(String(err));
@@ -1911,6 +1929,8 @@ interface RegistroDaSaida {
   linha: string | null;
   /** O id da cópia em `outbound_copies`; `null` sem a janela de cópias. */
   copia: string | null;
+  /** A hora gravada na linha: a da saída, depois da espera do intervalo (versão 16). */
+  instante: Date;
 }
 
 /** O que a cadeia decidiu sob a trava do número, lido depois de a conexão voltar ao pool. */
@@ -2038,7 +2058,7 @@ async function apagarRegistroDaSaida(
       {
         organization_id: args.tenantId,
         channel_session_id: args.channelSessionId,
-        sent_at: args.now.toISOString(),
+        sent_at: registro.instante.toISOString(),
         resposta: tipoDeEnvio(args.resposta) === 'resposta',
         desfecho,
         error: err instanceof Error ? err.name : 'unknown',

@@ -100,6 +100,8 @@ export interface AvisoDeEscalacaoOpts {
   /** `contacts.is_blocked` lido no contexto deste turno (fonte confiável). */
   optedOutThisTurn: boolean;
   now: Date;
+  /** O relógio da saída (`RunBeforeSendArgs.relogio`): a hora do registro da saída, depois da espera do intervalo. */
+  relogio?: () => Date;
   log: Logger;
   lgpd?: LgpdInput;
   agentId?: string | null;
@@ -186,6 +188,7 @@ export async function avisarLeadDaEscalacao(
       // daily_message_limit do CRM ainda não é lido no runtime.
       crmDailyLimit: null,
       now: opts.now,
+      ...(opts.relogio !== undefined ? { relogio: opts.relogio } : {}),
       ...(opts.sleep !== undefined ? { sleep: opts.sleep } : {}),
       ...(opts.lgpd !== undefined ? { lgpd: opts.lgpd } : {}),
       ...(opts.agentId !== undefined ? { agentId: opts.agentId } : {}),

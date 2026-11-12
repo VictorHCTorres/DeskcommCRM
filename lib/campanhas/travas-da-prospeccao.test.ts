@@ -2580,10 +2580,10 @@ describe("11. o contrato da revisão F4n do cxj (11/11/2026): a vaga só entra s
     const desde = dayStartInTz(QUARTA, mundo.knobs.timezone);
     expect(mundo.envios).toHaveLength(3);
     expect(mundo.reservas.map((r) => r.regra)).toEqual([
-      // Mais a folga da vaga (versão 15, F4t do cxj, T03).
-      { limite: 60, desde, vagas: 3, intervaloMs: 1_500 + FOLGA_DA_VAGA },
-      { limite: 60, desde, vagas: 1, intervaloMs: 0 },
-      { limite: 60, desde, vagas: 1, intervaloMs: 0 },
+      // Mais a folga da vaga (versão 15, F4t do cxj, T03); e a linha de todo balão com a folga (versão 16, F4u, U02).
+      { limite: 60, desde, vagas: 3, intervaloMs: 1_500 + FOLGA_DA_VAGA, folgaMs: FOLGA_DA_VAGA },
+      { limite: 60, desde, vagas: 1, intervaloMs: 0, folgaMs: FOLGA_DA_VAGA },
+      { limite: 60, desde, vagas: 1, intervaloMs: 0, folgaMs: FOLGA_DA_VAGA },
     ]);
   });
 
@@ -2611,7 +2611,8 @@ describe("11. o contrato da revisão F4n do cxj (11/11/2026): a vaga só entra s
     mundo.knobs = { ...mundo.knobs, throttleMs: 1_500 };
     await rodarUmaRodadaDeCampanha(admin, QUARTA);
     expect(mundo.reservas.map((r) => r.regra)).toEqual([
-      { limite: null, desde: dayStartInTz(QUARTA, mundo.knobs.timezone), vagas: 1, intervaloMs: 0 },
+      // Sem intervalo, a linha também não leva folga (versão 16).
+      { limite: null, desde: dayStartInTz(QUARTA, mundo.knobs.timezone), vagas: 1, intervaloMs: 0, folgaMs: 0 },
     ]);
   });
 

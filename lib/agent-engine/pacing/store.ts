@@ -257,6 +257,16 @@ export interface RegraDaVaga {
   vagas: number;
   /** O intervalo mínimo desde o último envio do número (o throttle, sem o jitter); 0 = não confere. */
   intervaloMs: number;
+  /**
+   * Quanto a saída de verdade pode vir depois do instante da vaga (F4u do cxj, U02): a linha é gravada no instante MAIS
+   * esta folga, a hora mais tardia em que a mensagem pode sair. Quem grava a folga tem de garanti-la: a campanha e o
+   * resgate não mandam a vaga mais velha que ela (`ATRASO_MAXIMO_DA_VAGA_DA_CAMPANHA_MS`,
+   * `ATRASO_MAXIMO_DA_VAGA_DO_RESGATE_MS`), e a devolvem. Todo emissor do número mede o intervalo a partir da última
+   * linha: gravada no instante da reserva, a resposta da IA contava o intervalo de uma hora em que a mensagem ainda não
+   * tinha saído, e saía a 3,1 s dela com o intervalo em 5 s. A devolução procura a linha com a mesma folga (`undoSend`).
+   * Omitida, ou não positiva, a linha fica no instante.
+   */
+  folgaMs?: number;
   /** Quanto esperar pela trava do número antes de desistir; o padrão é `ESPERA_PELA_TRAVA_MS`. */
   esperaMs?: number;
   /**
@@ -309,7 +319,7 @@ export async function reservarVaga(
 }
 
 /** A parte da regra da vaga que `reservarVagaRelida` lê sob a trava do número. */
-export type RegraRelida = Pick<RegraDaVaga, 'limite' | 'desde' | 'intervaloMs'>;
+export type RegraRelida = Pick<RegraDaVaga, 'limite' | 'desde' | 'intervaloMs' | 'folgaMs'>;
 
 /**
  * `reservarVaga` com a regra lida SOB a trava do número, dentro da transação da reserva (F4r do
@@ -384,10 +394,11 @@ async function reservarSobATrava<Motivo extends string>(
       await client.query('rollback');
       return semVaga;
     }
+    // O intervalo confere o instante; a linha leva a hora mais tardia da saída (F4u do cxj, U02).
     await client.query(
       `insert into pacing_ledger (organization_id, channel_session_id, sent_at, resposta)
        values ($1, $2, $3, $4)`,
-      [tenantId, channelSessionId, instante, resposta],
+      [tenantId, channelSessionId, comFolga(instante, regra.folgaMs), resposta],
     );
     await client.query('commit');
     return 'reservada';
@@ -411,13 +422,16 @@ async function reservarSobATrava<Motivo extends string>(
  * mensagem sair fora do teto do número (revisão F4m do cxj, M01), e a devolve
  * quando o balão certamente não saiu: o handler vetou, a organização parou, ou o
  * canal segurou a mensagem sem chamar o provedor.
+ *
+ * `sentAt` é o instante da reserva, e `opts.folgaMs` a folga com que ela foi gravada
+ * (`RegraDaVaga.folgaMs`): a linha está no instante mais a folga.
  */
 export async function undoSend(
   db: Queryable,
   tenantId: string,
   channelSessionId: string,
   sentAt: Date,
-  opts: { resposta?: boolean } = {},
+  opts: { resposta?: boolean; folgaMs?: number } = {},
 ): Promise<void> {
   await db.query(
     `delete from pacing_ledger
@@ -425,6 +439,11 @@ export async function undoSend(
                    where organization_id = $1 and channel_session_id = $2
                      and sent_at = $3 and resposta = $4
                    limit 1)`,
-    [tenantId, channelSessionId, sentAt, opts.resposta === true],
+    [tenantId, channelSessionId, comFolga(sentAt, opts.folgaMs), opts.resposta === true],
   );
+}
+
+/** A hora gravada na linha da vaga: o instante mais a folga (`RegraDaVaga.folgaMs`); sem folga positiva, o instante. */
+function comFolga(instante: Date, folgaMs: number | undefined): Date {
+  return folgaMs !== undefined && folgaMs > 0 ? new Date(instante.getTime() + folgaMs) : instante;
 }

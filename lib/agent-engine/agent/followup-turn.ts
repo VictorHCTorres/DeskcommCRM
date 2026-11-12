@@ -1364,6 +1364,7 @@ async function sendFixedOutbound(
     optedOutThisTurn,
     crmDailyLimit: null,
     now: clock(),
+    relogio: clock,
     sleep: deps.sleep,
     lgpd: context.lgpd,
     ...(modelo !== undefined ? { isTemplate: true } : {}),

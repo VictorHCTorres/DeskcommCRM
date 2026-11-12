@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type pg from "pg";
 import { createLogger } from "../../obs/logger";
 
-import { deveRetomarSessao, redriveQueued } from "./session-reconciler";
+import { ATRASO_MAXIMO_DA_VAGA_DO_RESGATE_MS, deveRetomarSessao, redriveQueued } from "./session-reconciler";
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -19,10 +19,20 @@ afterEach(() => vi.restoreAllMocks());
  */
 const NA_JANELA = () => new Date("2026-11-18T14:00:00Z");
 
+/**
+ * A janela da campanha que a reserva lê sob a trava (versão 16, F4u do cxj, U01): sem horas próprias, no principal da
+ * mensagem. A conexão falsa da reserva responde a ela; antes, a reserva não lia a campanha.
+ */
+const CAMPANHA_SEM_JANELA = { rows: [{ janela_inicio_hora: null, janela_fim_hora: null, channel_session_id: null }] };
+
 function poolDoResgate(query: unknown): pg.Pool {
   const conexaoDaVaga = {
     query: vi.fn(async (sql: string) =>
-      /as ultimo/.test(String(sql)) ? { rows: [{ ultimo: null, do_dia: "0" }] } : { rows: [] },
+      /as ultimo/.test(String(sql))
+        ? { rows: [{ ultimo: null, do_dia: "0" }] }
+        : /from campaigns/i.test(String(sql))
+          ? CAMPANHA_SEM_JANELA
+          : { rows: [] },
     ),
     release: vi.fn(),
   };
@@ -521,7 +531,11 @@ function bancoQueMudaNaEspera(opcoes: {
   });
   const conexao = {
     query: vi.fn(async (sql: string, _params: unknown[] = []) =>
-      /as ultimo/.test(String(sql)) ? { rows: [{ ultimo: null, do_dia: opcoes.doDia ?? "0" }] } : { rows: [] },
+      /as ultimo/.test(String(sql))
+        ? { rows: [{ ultimo: null, do_dia: opcoes.doDia ?? "0" }] }
+        : /from campaigns/i.test(String(sql))
+          ? CAMPANHA_SEM_JANELA
+          : { rows: [] },
     ),
     release: vi.fn(),
   };
@@ -553,6 +567,8 @@ describe("F4q do cxj (Q03) · o que muda enquanto o resgate espera a vaga vale",
     redriveSpacingMs: 0,
   };
   const AGORA = new Date("2026-11-18T14:00:00Z");
+  // A linha da vaga leva o instante mais a folga, e a devolução a procura com ela (versão 16, F4u do cxj, U02).
+  const COM_FOLGA = new Date(+AGORA + ATRASO_MAXIMO_DA_VAGA_DO_RESGATE_MS);
   const enviou = () =>
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ id: { id: "3EB0NEW" } }), { status: 200 }));
 
@@ -564,7 +580,7 @@ describe("F4q do cxj (Q03) · o que muda enquanto o resgate espera a vaga vale",
 
     expect(send).not.toHaveBeenCalled();
     expect(b.query).toHaveBeenCalledWith(expect.stringContaining("error_code = 'org_suspensa'"), ["m-vaga-1", "org-1"]);
-    expect(b.devolucoes()).toEqual([["org-1", "numero-1", AGORA, false]]);
+    expect(b.devolucoes()).toEqual([["org-1", "numero-1", COM_FOLGA, false]]);
   });
 
   it("a releitura depois da vaga falha: nada sai, a vaga volta, e a mensagem fica na fila", async () => {
@@ -574,7 +590,7 @@ describe("F4q do cxj (Q03) · o que muda enquanto o resgate espera a vaga vale",
     expect(await redriveQueued(b.pool, CFG, createLogger(), undefined, () => AGORA)).toBe(0);
 
     expect(send).not.toHaveBeenCalled();
-    expect(b.devolucoes()).toEqual([["org-1", "numero-1", AGORA, false]]);
+    expect(b.devolucoes()).toEqual([["org-1", "numero-1", COM_FOLGA, false]]);
     expect(b.query).not.toHaveBeenCalledWith(expect.stringMatching(/update messages/i), expect.anything());
   });
 
@@ -585,7 +601,7 @@ describe("F4q do cxj (Q03) · o que muda enquanto o resgate espera a vaga vale",
     expect(await redriveQueued(b.pool, CFG, createLogger(), undefined, () => AGORA)).toBe(0);
 
     expect(send).not.toHaveBeenCalled();
-    expect(b.devolucoes()).toEqual([["org-1", "numero-1", AGORA, false]]);
+    expect(b.devolucoes()).toEqual([["org-1", "numero-1", COM_FOLGA, false]]);
   });
 
   it("o processo começa a desligar durante a espera: nada sai, a vaga volta, e o lote para ali", async () => {
@@ -596,7 +612,7 @@ describe("F4q do cxj (Q03) · o que muda enquanto o resgate espera a vaga vale",
     expect(await redriveQueued(b.pool, CFG, createLogger(), desligar.signal, () => AGORA)).toBe(0);
 
     expect(send).not.toHaveBeenCalled();
-    expect(b.devolucoes()).toEqual([["org-1", "numero-1", AGORA, false]]);
+    expect(b.devolucoes()).toEqual([["org-1", "numero-1", COM_FOLGA, false]]);
     expect(b.connect).toHaveBeenCalledTimes(1);
     expect(b.releituras()).toEqual(["m-vaga-1", "m-vaga-1"]); // a segunda presa nem é relida
     expect(b.query).not.toHaveBeenCalledWith(expect.stringMatching(/update messages/i), expect.anything());
@@ -610,7 +626,7 @@ describe("F4q do cxj (Q03) · o que muda enquanto o resgate espera a vaga vale",
     expect(await redriveQueued(b.pool, CFG, createLogger(), desligar.signal, () => AGORA)).toBe(0);
 
     expect(send).not.toHaveBeenCalled();
-    expect(b.devolucoes()).toEqual([["org-1", "numero-1", AGORA, false]]);
+    expect(b.devolucoes()).toEqual([["org-1", "numero-1", COM_FOLGA, false]]);
   });
 
   it("controle: a campanha de consentimento sem desligamento sai, relida antes e depois da vaga", async () => {
@@ -632,7 +648,7 @@ describe("F4q do cxj (Q03) · o que muda enquanto o resgate espera a vaga vale",
 
     expect(send).toHaveBeenCalledTimes(1);
     expect(b.devolucoes()).toEqual([]);
-    expect(b.gravacoes()).toEqual([["org-1", "numero-1", AGORA, false]]);
+    expect(b.gravacoes()).toEqual([["org-1", "numero-1", COM_FOLGA, false]]);
   });
 });
 
@@ -646,6 +662,8 @@ describe("F4q do cxj (Q08) · a resposta presa sai pelo resgate como resposta", 
     redriveSpacingMs: 0,
   };
   const AGORA = new Date("2026-11-18T14:00:00Z");
+  // A linha da vaga leva o instante mais a folga, e a devolução a procura com ela (versão 16, F4u do cxj, U02).
+  const COM_FOLGA = new Date(+AGORA + ATRASO_MAXIMO_DA_VAGA_DO_RESGATE_MS);
 
   it("com o teto do dia batido, a resposta sai, e a vaga é gravada como resposta", async () => {
     const send = vi
@@ -656,7 +674,7 @@ describe("F4q do cxj (Q08) · a resposta presa sai pelo resgate como resposta", 
     expect(await redriveQueued(b.pool, CFG, createLogger(), undefined, () => AGORA)).toBe(1);
 
     expect(send).toHaveBeenCalledTimes(1);
-    expect(b.gravacoes()).toEqual([["org-1", "numero-1", AGORA, true]]);
+    expect(b.gravacoes()).toEqual([["org-1", "numero-1", COM_FOLGA, true]]);
   });
 
   it("o WAHA recusa a resposta (4xx): a vaga de RESPOSTA volta", async () => {
@@ -665,7 +683,7 @@ describe("F4q do cxj (Q08) · a resposta presa sai pelo resgate como resposta", 
 
     expect(await redriveQueued(b.pool, CFG, createLogger(), undefined, () => AGORA)).toBe(0);
 
-    expect(b.devolucoes()).toEqual([["org-1", "numero-1", AGORA, true]]);
+    expect(b.devolucoes()).toEqual([["org-1", "numero-1", COM_FOLGA, true]]);
   });
 
   it("controle: o disparo preso, com o teto batido, não sai e não grava nada", async () => {

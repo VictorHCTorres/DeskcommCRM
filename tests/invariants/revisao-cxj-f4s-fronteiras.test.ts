@@ -44,7 +44,10 @@ const cfg={wahaBaseUrl:'http://cxj.invalid',wahaApiKey:'ficticio',intervalMs:100
 // O tique seguinte do resgate (S03, S04 e S10): um segundo depois do intervalo do número (5 s) mais a folga da
 // vaga, que a reserva do resgate pede desde a versão 15 (F4t do cxj, T03). Na versão 14 eram 6 s, o intervalo e um
 // segundo; com a folga, o tique de 6 s não reserva mais, e o que estes casos registram acontece a partir daqui.
-const TIQUE_SEGUINTE=5000+ATRASO_MAXIMO_DA_VAGA_DO_RESGATE_MS+1000;
+// Na versão 16 (F4u do cxj, U02), a linha da vaga anterior também leva a folga (a hora mais tardia do envio): a
+// reserva seguinte conta dela, e o tique passa ao intervalo, às duas folgas e a um segundo (10 s). O que os três
+// casos registram não muda.
+const TIQUE_SEGUINTE=5000+2*ATRASO_MAXIMO_DA_VAGA_DO_RESGATE_MS+1000;
 const log={info:vi.fn(),warn:vi.fn(),error:vi.fn()};
 async function enfileirar(f:Fixture) {
  const conversa=randomUUID(),id=randomUUID();

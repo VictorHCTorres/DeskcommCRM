@@ -32,13 +32,14 @@ import { chatIndividualDaMensagem } from '@/lib/waha/ultima-recebida';
 import { lerNumerosDeTeste, numeroPodeTestar, preGoLiveAtivo } from '@/lib/ai/elegibilidade/pre-go-live';
 import { canalDesativado } from '@/lib/channels/desativado';
 import { canalTemRiscoDeBanimento } from '@/lib/channels/capabilities';
+import { podeMandarAgora, type RitmoDaCampanha } from '@/lib/campanhas/ritmo';
 
 import { regraDoStop, vereditoDoStop, type LinhaDoStop, type MotivoDoStop } from '../../guardrails/before-send';
 import type { Logger } from '../../obs/logger';
 import type { PacingKnobs } from '../../pacing/defaults';
 import { dayStartInTz, janelaDeEnvioAberta, tetoDoDia } from '../../pacing/engine';
 import { loadChannelKnobs, reservarVagaRelida, undoSend, type ReservaDaVaga } from '../../pacing/store';
-import { KINDS_DE_RESPOSTA } from '../../queue/queue';
+import { KINDS_DE_RESPOSTA, type Queryable } from '../../queue/queue';
 
 export interface WatchdogConfig {
   wahaBaseUrl: string;
@@ -435,6 +436,15 @@ async function stampExternalIdAfterEcho(
  * releitura da regra, a gravação e a última conferência, leituras de milissegundos; 2 s é folga
  * para a leitura lenta, e o espaçamento do resgate (4 s a 8 s) segue maior que o intervalo padrão
  * (1,2 s) mais a folga.
+ *
+ * Versão 16 (F4u do cxj, U02): a garantia acima valia entre duas vagas do resgate. A resposta da IA
+ * media o intervalo a partir da hora gravada na vaga, e saía a 3,1 s do envio do resgate, com o
+ * intervalo em 5 s. Agora a vaga grava a hora mais tardia do envio, o instante mais a folga
+ * (`RegraDaVaga.folgaMs`), e todo emissor do número mede o intervalo dela. A reserva segue pedindo o
+ * intervalo mais a folga: a cadeia da IA grava o registro antes do transporte, e a margem cobre o
+ * tempo entre o registro dela e a saída. Entre duas vagas do resgate, o intervalo efetivo passa a ser
+ * o do número mais duas folgas (5,2 s no padrão): com o espaçamento de 4 s a 8 s, a mensagem que
+ * cair antes disso espera o tique seguinte.
  */
 export const ATRASO_MAXIMO_DA_VAGA_DO_RESGATE_MS = 2_000;
 
@@ -454,9 +464,10 @@ export const ATRASO_MAXIMO_DA_VAGA_DO_RESGATE_MS = 2_000;
  * o tique que a encontrar aberta. Antes, a resposta presa saía às 3h.
  *
  * O instante da vaga é o do relógio lido SOB a trava (F4s do cxj, S01): é com ele que a janela, o
- * teto, o intervalo e o registro contam. A reserva devolve esse instante, que é o da linha gravada
- * (a devolução da vaga a procura por ele), e os knobs lidos, com que quem chama confere a janela
- * de novo logo antes do envio.
+ * teto e o intervalo contam. A linha leva o instante mais a folga, a hora mais tardia do envio
+ * (versão 16, F4u do cxj, U02). A reserva devolve o instante e a folga (a devolução da vaga procura
+ * a linha por eles), os knobs lidos e a janela da campanha da mensagem, com que quem chama confere
+ * as janelas de novo logo antes do envio.
  */
 async function reservarVagaDoResgate(
   pool: pg.Pool,
@@ -466,8 +477,8 @@ async function reservarVagaDoResgate(
 ): Promise<VagaDoResgate> {
   const banRisk = canalTemRiscoDeBanimento(m.provider);
   // `reler` roda sob a trava antes de qualquer gravação: a vaga reservada sempre passou por ele.
-  let lido!: { instante: Date; knobs: PacingKnobs };
-  const desfecho = await reservarVagaRelida(
+  let lido!: { instante: Date; knobs: PacingKnobs; folgaMs: number; janelaDaCampanha: JanelaDaCampanha | null };
+  const desfecho = await reservarVagaRelida<'fora_da_janela' | 'fora_da_janela_da_campanha'>(
     pool,
     m.organization_id,
     m.channel_session_id,
@@ -475,12 +486,19 @@ async function reservarVagaDoResgate(
     { vagas: 1, resposta: m.resposta },
     async (db, instante) => {
       const { knobs, numberActivatedAt } = await loadChannelKnobs(db, m.organization_id, m.channel_session_id, log);
-      lido = { instante, knobs };
       if (!janelaDeEnvioAberta(instante, knobs, m.resposta)) return 'fora_da_janela';
+      // A janela da própria campanha, a mesma que a rodada confere (F4u do cxj, U01).
+      const janelaDaCampanha = await lerJanelaDaCampanha(db, m, knobs, log);
+      if (janelaDaCampanha === 'sem_campanha' || (janelaDaCampanha && !janelaDaCampanhaAberta(janelaDaCampanha, instante)))
+        return 'fora_da_janela_da_campanha';
       const { rows } = await db.query<{ daily_message_limit: number | null }>(
         'select daily_message_limit from channel_sessions where organization_id = $1 and id = $2',
         [m.organization_id, m.channel_session_id],
       );
+      const comIntervalo = banRisk && knobs.throttleMs > 0;
+      // A folga vale só com intervalo no número (versão 16, F4u do cxj, U02): ver `ATRASO_MAXIMO_DA_VAGA_DO_RESGATE_MS`.
+      const folgaMs = comIntervalo ? ATRASO_MAXIMO_DA_VAGA_DO_RESGATE_MS : 0;
+      lido = { instante, knobs, folgaMs, janelaDaCampanha };
       return {
         limite: tetoDoDia({
           now: instante,
@@ -491,12 +509,70 @@ async function reservarVagaDoResgate(
         }),
         desde: dayStartInTz(instante, knobs.timezone),
         // Com a folga da vaga (F4t do cxj, T03): ver `ATRASO_MAXIMO_DA_VAGA_DO_RESGATE_MS`.
-        intervaloMs: banRisk && knobs.throttleMs > 0 ? knobs.throttleMs + ATRASO_MAXIMO_DA_VAGA_DO_RESGATE_MS : 0,
+        intervaloMs: comIntervalo ? knobs.throttleMs + ATRASO_MAXIMO_DA_VAGA_DO_RESGATE_MS : 0,
+        // E a linha leva a hora mais tardia do envio: o instante mais a folga.
+        folgaMs,
       };
     },
   );
   if (desfecho !== 'reservada') return { desfecho };
-  return { desfecho, instante: lido.instante, knobs: lido.knobs };
+  return { desfecho, ...lido };
+}
+
+/** A janela própria de uma campanha (as horas dela e o fuso do número principal), como a rodada a confere. */
+interface JanelaDaCampanha {
+  ritmo: RitmoDaCampanha;
+  fuso: string;
+}
+
+/**
+ * A janela própria da campanha da mensagem presa (F4u do cxj, U01), lida sob a trava do número, com o que a rodada
+ * usa: as horas da campanha (`janela_inicio_hora`, `janela_fim_hora`) e o fuso do número PRINCIPAL dela (o relógio
+ * da janela da campanha é um só, ver `rodada.ts`). Só a mensagem de campanha de consentimento chega aqui: a de
+ * prospecção não sai pelo resgate (`conferirElegibilidade`). `null` quando a mensagem não é de campanha;
+ * `'sem_campanha'` quando a campanha não se acha (nada sai; a conferência seguinte a encerra). Até a versão 15, o
+ * resgate conferia só a janela do número, e a mensagem da campanha que encerra às 18h saía às 19h.
+ */
+async function lerJanelaDaCampanha(
+  db: Queryable,
+  m: QueuedRow,
+  knobs: PacingKnobs,
+  log: Logger,
+): Promise<JanelaDaCampanha | null | 'sem_campanha'> {
+  const campanhaId = campanhaDaMensagem(m.metadata);
+  if (campanhaId === null) return null;
+  const { rows } = await db.query<{
+    janela_inicio_hora: number | null;
+    janela_fim_hora: number | null;
+    channel_session_id: string | null;
+  }>(
+    `select k.janela_inicio_hora, k.janela_fim_hora, k.channel_session_id::text as channel_session_id
+     from campaigns k where k.organization_id = $1 and k.id::text = $2`,
+    [m.organization_id, campanhaId],
+  );
+  const campanha = rows[0];
+  if (!campanha) return 'sem_campanha';
+  const principal = campanha.channel_session_id;
+  const fuso =
+    principal === null || principal === m.channel_session_id
+      ? knobs.timezone
+      : (await loadChannelKnobs(db, m.organization_id, principal, log)).knobs.timezone;
+  return {
+    ritmo: {
+      intervaloSegundos: null,
+      janelaInicioHora: campanha.janela_inicio_hora,
+      janelaFimHora: campanha.janela_fim_hora,
+      tetoDiario: null,
+      tetoHorario: null,
+    },
+    fuso,
+  };
+}
+
+/** A janela da campanha aberta no instante: a conta de `podeMandarAgora`, só com as horas, como a rodada faz. */
+function janelaDaCampanhaAberta(janela: JanelaDaCampanha, instante: Date): boolean {
+  return podeMandarAgora(janela.ritmo, { ultimoEnvio: null, enviadasHoje: 0, enviadasNaUltimaHora: 0 }, instante, janela.fuso)
+    .pode;
 }
 
 /**
@@ -504,8 +580,16 @@ async function reservarVagaDoResgate(
  * lidos sob a trava; ou o motivo de não reservar.
  */
 type VagaDoResgate =
-  | { desfecho: 'reservada'; instante: Date; knobs: PacingKnobs }
-  | { desfecho: Exclude<ReservaDaVaga, 'reservada'> | 'fora_da_janela' };
+  | {
+      desfecho: 'reservada';
+      instante: Date;
+      knobs: PacingKnobs;
+      /** A folga com que a linha foi gravada (o instante mais ela); a devolução a procura com a mesma. */
+      folgaMs: number;
+      /** A janela própria da campanha da mensagem, ou `null` (não é de campanha): conferida de novo antes do envio. */
+      janelaDaCampanha: JanelaDaCampanha | null;
+    }
+  | { desfecho: Exclude<ReservaDaVaga, 'reservada'> | 'fora_da_janela' | 'fora_da_janela_da_campanha' };
 
 /**
  * Devolve a vaga de uma saída do resgate que certamente não aconteceu: o WAHA recusou com 4xx, ou
@@ -513,14 +597,23 @@ type VagaDoResgate =
  * tipo reservado (disparo, ou resposta). Se o banco recusar, a vaga fica — o teto conta uma a
  * mais, o lado seguro —, e o log diz.
  */
-async function devolverVagaDoResgate(pool: pg.Pool, m: QueuedRow, quando: Date, log: Logger): Promise<void> {
+async function devolverVagaDoResgate(
+  pool: pg.Pool,
+  m: QueuedRow,
+  vaga: { instante: Date; folgaMs: number },
+  log: Logger,
+): Promise<void> {
   try {
-    await undoSend(pool, m.organization_id, m.channel_session_id, quando, { resposta: m.resposta });
+    await undoSend(pool, m.organization_id, m.channel_session_id, vaga.instante, {
+      resposta: m.resposta,
+      folgaMs: vaga.folgaMs,
+    });
   } catch (err) {
     log.error('watchdog: a vaga de um reenvio que não saiu ficou no limite do número', {
       message_id: m.id,
       channel_session_id: m.channel_session_id,
-      sent_at: quando.toISOString(),
+      sent_at: vaga.instante.toISOString(),
+      folga_ms: vaga.folgaMs,
       resposta: m.resposta,
       error: (err instanceof Error ? err.message : String(err)).slice(0, 120),
     });
@@ -787,7 +880,8 @@ export async function redriveQueued(
       // intervalo e não gasta o teto do dia, e não espera o dia seguinte com o teto batido (F4q
       // do cxj, Q08). Sem o job, ela conta como disparo: a mais, o lado seguro. Erro na reserva
       // cai no `catch` de baixo, antes de qualquer envio. O instante da vaga é o do relógio sob a
-      // trava (F4s do cxj, S01), e é por ele que a devolução acha a linha gravada.
+      // trava (F4s do cxj, S01); a linha leva ele mais a folga (versão 16), e é pelos dois que a
+      // devolução acha a linha gravada.
       const vaga = await reservarVagaDoResgate(pool, m, agora, log);
       if (vaga.desfecho !== 'reservada') {
         log.info('watchdog: reenvio adiado — o número está sem vaga agora, ou fora da janela', {
@@ -810,11 +904,11 @@ export async function redriveQueued(
       try {
         depois = await conferirElegibilidade(pool, m, signal, log);
       } catch (err) {
-        await devolverVagaDoResgate(pool, m, quando, log);
+        await devolverVagaDoResgate(pool, m, vaga, log);
         throw err;
       }
       if (depois !== 'pode_sair') {
-        await devolverVagaDoResgate(pool, m, quando, log);
+        await devolverVagaDoResgate(pool, m, vaga, log);
         log.info('watchdog: reenvio desfeito — a mensagem mudou enquanto esperava a vaga, e a vaga voltou', {
           message_id: m.id,
           motivo: depois,
@@ -834,15 +928,24 @@ export async function redriveQueued(
       // Entre esta conta e o `fetch` não há espera nenhuma.
       const agoraDoEnvio = agora();
       if (!janelaDeEnvioAberta(agoraDoEnvio, vaga.knobs, m.resposta)) {
-        await devolverVagaDoResgate(pool, m, quando, log);
+        await devolverVagaDoResgate(pool, m, vaga, log);
         log.info('watchdog: reenvio desfeito — a janela do número fechou antes do envio, e a vaga voltou', {
           message_id: m.id,
           resposta: m.resposta,
         });
         continue;
       }
+      // A janela da própria campanha, no mesmo relógio (F4u do cxj, U01): a mensagem de consentimento que esperou a
+      // última conferência não sai depois do horário da campanha.
+      if (vaga.janelaDaCampanha && !janelaDaCampanhaAberta(vaga.janelaDaCampanha, agoraDoEnvio)) {
+        await devolverVagaDoResgate(pool, m, vaga, log);
+        log.info('watchdog: reenvio desfeito — a janela da campanha fechou antes do envio, e a vaga voltou', {
+          message_id: m.id,
+        });
+        continue;
+      }
       if (agoraDoEnvio.getTime() - quando.getTime() > ATRASO_MAXIMO_DA_VAGA_DO_RESGATE_MS) {
-        await devolverVagaDoResgate(pool, m, quando, log);
+        await devolverVagaDoResgate(pool, m, vaga, log);
         log.info('watchdog: reenvio desfeito — a vaga envelheceu antes do envio, e voltou', {
           message_id: m.id,
           atraso_ms: agoraDoEnvio.getTime() - quando.getTime(),
@@ -859,7 +962,7 @@ export async function redriveQueued(
         // 4xx: o WAHA recusou o pedido, e nada saiu — a vaga volta. 5xx deixa a saída incerta
         // (o provedor pode ter aceitado antes do erro), e a vaga fica: a mais, nunca a menos.
         // O erro de rede e o tempo esgotado também ficam com ela (caem no `catch`).
-        if (res.status >= 400 && res.status < 500) await devolverVagaDoResgate(pool, m, quando, log);
+        if (res.status >= 400 && res.status < 500) await devolverVagaDoResgate(pool, m, vaga, log);
         log.warn('watchdog: redrive falhou no WAHA — mantida queued para o próximo tick', {
           message_id: m.id,
           status_code: res.status,

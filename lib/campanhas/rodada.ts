@@ -388,6 +388,13 @@ function meiaNoiteSeguinte(agora: Date, fuso: string): Date {
  * menos do intervalo. 10 s é folga para o handler lento; no envio gradual, a rodada manda uma pessoa por número a cada
  * minuto, e o intervalo do número (o padrão é 1,2 s) mais a folga segue abaixo disso. Sem intervalo no número (o canal
  * oficial, que não tem risco de banimento), não há folga a somar.
+ *
+ * Versão 16 (F4u do cxj, U02): a garantia acima valia entre duas vagas da campanha. A resposta da IA media o intervalo a
+ * partir da hora gravada na vaga, e saía a menos do intervalo do balão que ainda não tinha saído. Agora cada vaga grava
+ * a hora mais tardia do balão, o instante mais a folga (`RegraDaVaga.folgaMs`), e todo emissor do número mede o
+ * intervalo dela. O 1º balão segue reservando com o intervalo mais a folga: a cadeia da IA grava o registro antes do
+ * transporte, e a margem cobre o tempo entre o registro dela e a saída. Entre duas vagas da campanha, o intervalo
+ * efetivo passa a ser o do número mais duas folgas (21,2 s no padrão), ainda abaixo do minuto do envio gradual.
  */
 export const ATRASO_MAXIMO_DA_VAGA_DA_CAMPANHA_MS = 10_000;
 
@@ -804,9 +811,12 @@ async function rodarUmaCampanha(
     // ninguém, F4j, J05/J09 do cxj). A incerta fica: pode ter saído. Se o banco
     // recusar a devolução, a vaga fica também — o teto conta uma a mais, o lado
     // seguro —, e o erro vai ao log.
+    // A folga da vaga (versão 16, F4u do cxj, U02): com intervalo no número, a linha de cada balão leva o instante mais a
+    // folga, a hora mais tardia em que ele sai (a idade conferida em `foraDaHora`), e a devolução a procura com ela.
+    const folgaDaVaga = regraDoNumero.intervaloMs > 0 ? ATRASO_MAXIMO_DA_VAGA_DA_CAMPANHA_MS : 0;
     const devolverVaga = async (quando: Date) => {
       try {
-        await undoSend(pool, campanha.organization_id, sessionEscolhida, quando);
+        await undoSend(pool, campanha.organization_id, sessionEscolhida, quando, { folgaMs: folgaDaVaga });
       } catch (err) {
         logger.error("[campanha] a vaga de um envio que não saiu ficou no teto do número", {
           ...ondeFoi,
@@ -833,6 +843,8 @@ async function rodarUmaCampanha(
               i === 0 && regraDoNumero.intervaloMs > 0
                 ? regraDoNumero.intervaloMs + ATRASO_MAXIMO_DA_VAGA_DA_CAMPANHA_MS
                 : 0,
+            // E a linha de todo balão leva a hora mais tardia em que ele sai (versão 16, F4u do cxj, U02).
+            folgaMs: folgaDaVaga,
           });
         } catch (err) {
           const motivo = err instanceof Error ? err.message : String(err);
