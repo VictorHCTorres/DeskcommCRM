@@ -18,7 +18,7 @@ import { BUCKET_DAS_FOTOS, fotoPertenceAoProduto, mimeDaFoto } from '@/lib/catal
 import { createAdminClient } from '@/lib/supabase/admin';
 
 import type { Queryable } from '../queue/queue';
-import { comSaidaParcial, saiuAlgo } from '../channel-adapter';
+import { comSaidaParcial, saiuAlgo } from '../saida-parcial';
 import { OK_KINDS, type BubbleOutcome } from './split-message';
 
 /** Teto de legenda de imagem do WhatsApp. Texto maior sai como texto, antes das fotos. */

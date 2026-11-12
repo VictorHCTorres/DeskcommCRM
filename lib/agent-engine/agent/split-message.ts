@@ -1,4 +1,4 @@
-import { comSaidaParcial, saiuAlgo, type MarcaDeSaidaParcial } from "../channel-adapter";
+import { comSaidaParcial, saiuAlgo, type MarcaDeSaidaParcial } from "../saida-parcial";
 import { semConteudoVisivel } from "./conteudo-visivel";
 
 /**
