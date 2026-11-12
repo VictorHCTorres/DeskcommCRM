@@ -4471,7 +4471,7 @@ async function executarTurnoDoAgente(
             conferirAfirmacoes,
             // Pausa humana do turno, paga FORA do lock do número (issue #654). Antes ela
             // era paga dentro do `send` logo abaixo (via `antesDaPrimeira`), e o `send`
-            // só acontece com o `pg_advisory_xact_lock` do canal na mão — cada turno
+            // acontecia com o `pg_advisory_xact_lock` do canal na mão — cada turno
             // segurava a fila do NÚMERO por 1,2s–7,5s além do necessário. Agora o
             // guardrail a paga antes de tomar conexão: sem transação aberta durante a espera.
             //

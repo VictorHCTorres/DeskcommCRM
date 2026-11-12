@@ -1564,7 +1564,7 @@ const realSleep = (ms: number): Promise<void> => new Promise((resolve) => setTim
  *
  * A pausa humana do turno é paga AQUI, ANTES de qualquer contato com o banco (#654).
  * Antes ela era paga dentro do `send` (via `antesDaPrimeira` do `sendInBubbles`), e o
- * `send` só é chamado com o `pg_advisory_xact_lock` do NÚMERO na mão: cada turno
+ * `send` era chamado com o `pg_advisory_xact_lock` do NÚMERO na mão: cada turno
  * segurava a fila do número por 1,2s–7,5s além do necessário (+0–2s do throttle
  * anti-ban, que dorme no mesmo ponto), e o efeito é o de fora — dois atendentes no
  * MESMO WhatsApp entram em fila, e a fila ficou mais longa.
