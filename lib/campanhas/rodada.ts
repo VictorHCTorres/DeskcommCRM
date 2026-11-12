@@ -39,7 +39,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { sendMessageHandler } from "@/app/api/v1/messages/_handler";
 import { getRequestPool } from "@/lib/agent-engine/db/request-pool";
 import { decidePacing, dayStartInTz } from "@/lib/agent-engine/pacing/engine";
-import { loadChannelKnobs, loadPacingState, recordSend } from "@/lib/agent-engine/pacing/store";
+import { loadChannelKnobs, loadPacingState, recordSend, undoSend } from "@/lib/agent-engine/pacing/store";
 import { beginServiceAtOrigin } from "@/lib/atendimento/origem";
 import { canalTemRiscoDeBanimento } from "@/lib/channels/capabilities";
 import {
@@ -668,11 +668,7 @@ async function rodarUmaCampanha(
   // congelados na preparação, e é ele que fica na conversa para o agente ler.
   const valoresDoModelo = comModelo ? valoresCongelados(alvo.variables) : null;
   if (comModelo && valoresDoModelo === null) {
-    await admin
-      .from("campaign_recipients")
-      .update({ status: "failed", last_error_code: "modelo_sem_valores", sending_at: null })
-      .eq("id", alvo.id)
-      .eq("status", "sending");
+    await gravarDesfecho(admin, alvo.id, { status: "failed", last_error_code: "modelo_sem_valores", sending_at: null });
     return { enviadas: 0, pulados: 0, concluidas: 0, detalhe: "falha:modelo_sem_valores" };
   }
   const corpo = comModelo
@@ -710,16 +706,63 @@ async function rodarUmaCampanha(
     // `maxBaloes = baloesPrevistos`: o teto foi conferido para esse número.
     const baloes = comModelo ? [corpo] : baloesDaCampanha(corpo, dividir, baloesPrevistos);
     const relogioDosBaloes = Date.now();
-    // O registro no ledger que o banco recusou depois de o balão sair (F4l, L03/L06
-    // do cxj). Uma lista, e não um `let`: preenchida só dentro do `registrar`, o
-    // compilador a daria como sempre vazia aqui fora.
-    const registrosRecusados: unknown[] = [];
-    // O tipo vai explícito: com o `registrar` e o `parar` lendo o desfecho, o
-    // compilador não o tira mais do retorno do `enviar`.
+    // A vaga de cada balão entra no ledger do número ANTES de ele sair (F4m, M01
+    // do cxj). Registrada depois, a recusa do banco deixava uma mensagem fora do
+    // teto do dia, e segurar o número dependia de uma pausa que o mesmo banco
+    // podia recusar: com 59 de 60, saíam mais duas, e com a recusa persistente,
+    // uma por rodada. Agora, sem a vaga registrada, o balão não sai.
+    // Cada vaga leva o instante em que o balão sai: o throttle do próximo envio
+    // do número conta a partir do último registro, e gravar todos com o `agora`
+    // da rodada deixava o destinatário seguinte sair a menos de `throttleMs` do
+    // último balão (medido na prova de tela: 941 ms). O 1º leva `agora`, como o
+    // envio único de antes.
+    const vagaDoBalao = (i: number) => (i === 0 ? agora : new Date(agora.getTime() + (Date.now() - relogioDosBaloes)));
+    const ondeFoi = { campanha: campanha.id, destinatario: alvo.id, numero: sessionEscolhida };
+    // A vaga do balão que certamente não saiu volta ao ledger: o handler vetou, a
+    // organização parou, ou o canal segurou a prospecção sem chamar o provedor
+    // (F4i, A1; contá-la gastava o teto do dia com uma tentativa que não falou com
+    // ninguém, F4j, J05/J09 do cxj). A incerta fica: pode ter saído. Se o banco
+    // recusar a devolução, a vaga fica também — o teto conta uma a mais, o lado
+    // seguro —, e o erro vai ao log.
+    const devolverVaga = async (quando: Date) => {
+      try {
+        await undoSend(pool, campanha.organization_id, sessionEscolhida, quando);
+      } catch (err) {
+        logger.error("[campanha] a vaga de um envio que não saiu ficou no teto do número", {
+          ...ondeFoi,
+          motivo: err instanceof Error ? err.message : String(err),
+        });
+      }
+    };
+    // O tipo vai explícito: com o `parar` lendo o desfecho, o compilador não o
+    // tira mais do retorno do `enviar`.
     const { primeira, desfecho: mensagem, indiceDoDesfecho } = await enviarEmBaloes<Message>(baloes, {
       enviar: async (texto, i) => {
+        const quando = vagaDoBalao(i);
         try {
-          return await sendMessageHandler(
+          await recordSend(pool, campanha.organization_id, sessionEscolhida, quando);
+        } catch (err) {
+          const motivo = err instanceof Error ? err.message : String(err);
+          // No 1º balão nada saiu: a pessoa volta à fila, e a rajada para (`erro_no_teto`).
+          if (i === 0) {
+            logger.error("[campanha] o envio não saiu: o teto do número não registrou a vaga", {
+              ...ondeFoi,
+              motivo,
+            });
+            throw new VagaNaoRegistradaError(motivo);
+          }
+          // Num seguinte, o começo saiu e conta, e o resto não vai — o mesmo
+          // desfecho do veto de um balão seguinte.
+          logger.error("[campanha] o balão seguinte não saiu: o teto do número não registrou a vaga", {
+            ...ondeFoi,
+            balao: i,
+            motivo,
+          });
+          return null;
+        }
+        let resultado: Message;
+        try {
+          resultado = await sendMessageHandler(
             admin,
             {
               organization_id: campanha.organization_id,
@@ -756,6 +799,10 @@ async function rodarUmaCampanha(
             } as Parameters<typeof sendMessageHandler>[2],
           );
         } catch (err) {
+          // O veto da conferência final e a organização parada vêm antes de o
+          // handler chamar o provedor: nada saiu, e a vaga volta. Outra exceção
+          // pode ter vindo depois da saída: a vaga fica.
+          if (err instanceof VetoDaCampanhaError || err instanceof OrgNaoOperanteError) await devolverVaga(quando);
           // O handler vetou um balão SEGUINTE: o começo já saiu e não volta, e o
           // resto não vai — o mesmo desfecho do `continuar` falso. Aplicar o
           // veto aqui devolveria a pessoa à fila, e a rodada seguinte repetiria
@@ -763,32 +810,8 @@ async function rodarUmaCampanha(
           if (i > 0 && err instanceof VetoDaCampanhaError) return null;
           throw err;
         }
-      },
-      // Cada balão entra no ledger no instante em que SAIU: o throttle do próximo
-      // envio do número conta a partir do último registro, e gravar todos com o
-      // `agora` da rodada deixava o destinatário seguinte sair a menos de
-      // `throttleMs` do último balão (medido na prova de tela: 941 ms). O 1º
-      // balão segue com `agora`, como o envio único de antes.
-      // A mensagem da prospecção que o canal segurou com certeza (o handler não
-      // chamou o provedor) não entra: ela não sai nunca (F4i, A1), e contá-la
-      // gastava o teto do dia do número com uma tentativa que não falou com
-      // ninguém (F4j, J05/J09 do cxj). A incerta entra: pode ter saído.
-      // O registro recusado não sobe mais como exceção (F4l, L03/L06 do cxj): ela
-      // dava o envio que saiu como falha (`send_exception`), sem contá-lo, e a
-      // campanha seguia sem o teto do dia ver a mensagem — com 59 de 60, saíam
-      // mais três em três rodadas. Fica guardado, e a campanha pausa abaixo.
-      registrar: async (i, desfecho) => {
-        if (ehProspeccao(campanha) && retidaPeloCanal(desfecho)) return;
-        try {
-          await recordSend(
-            pool,
-            campanha.organization_id,
-            sessionEscolhida,
-            i === 0 ? agora : new Date(agora.getTime() + (Date.now() - relogioDosBaloes)),
-          );
-        } catch (err) {
-          registrosRecusados.push(err);
-        }
+        if (ehProspeccao(campanha) && retidaPeloCanal(resultado)) await devolverVaga(quando);
+        return resultado;
       },
       // Pausa curta e fixa no ritmo anti-ban do número, nunca o intervalo da
       // campanha: este laço é dividido por todas as campanhas da instalação.
@@ -801,33 +824,15 @@ async function rodarUmaCampanha(
       ...(ehProspeccao(campanha)
         ? {
             continuar: async () => (await conferenciaFinal(admin, entrega, agora, ESTADOS_DE_QUEM_RECEBEU)) === null,
+            // O balão que não saiu para os seguintes: o que o canal segurou na
+            // fila física (F4i, A1), porque se o canal voltasse na pausa o
+            // próximo sairia sem ele; e o incerto (`queued` sem o motivo), porque
+            // o seguinte que saísse viraria o desfecho e esconderia a incerteza
+            // (F4j, J04 do cxj).
+            parar: (desfecho) => !SAIU.has(desfecho.status ?? ""),
           }
         : {}),
-      // Na prospecção, o balão que não saiu para os seguintes: o que o canal
-      // segurou na fila física (F4i, A1), porque se o canal voltasse na pausa o
-      // próximo sairia sem ele; e o incerto (`queued` sem o motivo), porque o
-      // seguinte que saísse viraria o desfecho e esconderia a incerteza (F4j, J04
-      // do cxj). Em toda campanha, o que não entrou no teto do número (F4l): cada
-      // balão seguinte seria mais uma saída fora da conta do dia.
-      parar: (desfecho) =>
-        registrosRecusados.length > 0 || (ehProspeccao(campanha) && !SAIU.has(desfecho.status ?? "")),
     });
-
-    // O ledger recusou o registro (F4l, L03/L06 do cxj): a campanha pausa antes de
-    // qualquer desfecho — inclusive o da fila do canal e o do limite —, junto com
-    // as outras do mesmo número, e nada sai delas até alguém conferir o número e
-    // retomar. O desfecho segue como sempre: o envio que saiu conta, e o
-    // destinatário fica `sent`.
-    if (registrosRecusados.length > 0) {
-      const [recusa] = registrosRecusados;
-      logger.error("[campanha] o envio não entrou no teto do número; a campanha pausou", {
-        campanha: campanha.id,
-        destinatario: alvo.id,
-        numero: sessionEscolhida,
-        motivo: recusa instanceof Error ? recusa.message : String(recusa),
-      });
-      await pausarPeloTetoSemRegistro(admin, campanha, sessionEscolhida, agora);
-    }
 
     // O desfecho vem do ESTADO da mensagem, nunca da ausência de exceção — o
     // handler marca `failed` e devolve normalmente. Com balões, o desfecho é o
@@ -860,39 +865,31 @@ async function rodarUmaCampanha(
     // Só no 1º balão: se um balão seguinte foi o barrado, a pessoa já recebeu o
     // começo, e voltar à fila reenviaria esse começo.
     if (falhou && indiceDoDesfecho === 0 && ehLimiteDeVelocidade(codigoDaFalha, erro.error_message)) {
-      await admin
-        .from("campaign_recipients")
-        .update({
-          status: "pending",
-          sending_at: null,
-          next_attempt_at: new Date(agora.getTime() + 60_000).toISOString(),
-          last_error_code: "limite_de_velocidade",
-          last_error_detail: (erro.error_message ?? "").slice(0, 300) || null,
-        })
-        .eq("id", alvo.id)
-        .eq("status", "sending");
+      await gravarDesfecho(admin, alvo.id, {
+        status: "pending",
+        sending_at: null,
+        next_attempt_at: new Date(agora.getTime() + 60_000).toISOString(),
+        last_error_code: "limite_de_velocidade",
+        last_error_detail: (erro.error_message ?? "").slice(0, 300) || null,
+      });
       return { enviadas: 0, pulados: 0, concluidas: 0, detalhe: `limite:${codigoDaFalha ?? "429"}` };
     }
-    // `.eq("status","sending")` porque o ack pode ter chegado ANTES desta linha:
-    // o trigger já teria avançado o destinatário para `sent`/`delivered`, e
-    // escrever por cima o rebaixaria.
-    await admin
-      .from("campaign_recipients")
-      .update({
-        status: falhou ? "failed" : "sent",
-        sent_at: falhou ? null : agora.toISOString(),
-        // O código da PLATAFORMA quando há (131050, 132015…): é ele que a tela
-        // traduz em motivo e que decide se a campanha para.
-        last_error_code: falhou ? (codigoDaFalha ?? "send_failed") : null,
-        last_error_detail: falhou ? (erro.error_message ?? null) : null,
-        // O `message_id` só pode ser gravado AQUI: a coluna tem FK para
-        // `messages`, e a linha da mensagem só existe depois do envio. Gravá-lo
-        // antes — que era o desenho original, para o trigger de ack sempre achar
-        // o destinatário — viola a FK e a reserva falha inteira.
-        message_id: primeira.id ?? messageId,
-      })
-      .eq("id", alvo.id)
-      .eq("status", "sending");
+    // Só de quem segue `sending` (`gravarDesfecho`): o ack pode ter chegado ANTES
+    // desta linha, o trigger já teria avançado o destinatário para
+    // `sent`/`delivered`, e escrever por cima o rebaixaria.
+    await gravarDesfecho(admin, alvo.id, {
+      status: falhou ? "failed" : "sent",
+      sent_at: falhou ? null : agora.toISOString(),
+      // O código da PLATAFORMA quando há (131050, 132015…): é ele que a tela
+      // traduz em motivo e que decide se a campanha para.
+      last_error_code: falhou ? (codigoDaFalha ?? "send_failed") : null,
+      last_error_detail: falhou ? (erro.error_message ?? null) : null,
+      // O `message_id` só pode ser gravado AQUI: a coluna tem FK para
+      // `messages`, e a linha da mensagem só existe depois do envio. Gravá-lo
+      // antes — que era o desenho original, para o trigger de ack sempre achar
+      // o destinatário — viola a FK e a reserva falha inteira.
+      message_id: primeira.id ?? messageId,
+    });
 
     if (falhou && falhaDoEnvioInteiro(codigoDaFalha)) {
       await pausarPorFalha(
@@ -908,11 +905,7 @@ async function rodarUmaCampanha(
       enviadas: falhou ? 0 : 1,
       pulados: 0,
       concluidas: 0,
-      // A pausa do teto sem registro aparece na rodada e para a rajada (`pausada:`).
-      detalhe:
-        registrosRecusados.length > 0
-          ? `pausada:${TETO_SEM_REGISTRO.codigo}`
-          : `enviado:${status ?? "?"}:${escolha.motivo}`,
+      detalhe: `enviado:${status ?? "?"}:${escolha.motivo}`,
       numero: sessionEscolhida,
     };
   } catch (err) {
@@ -1056,24 +1049,62 @@ export async function registrarExcecaoDoEnvio(
   // `send_exception`, que o tiraria da campanha por um motivo que não é dele.
   if (err instanceof VetoDaCampanhaError) return aplicarVeto(admin, destinatarioId, err.veto, agora);
   if (err instanceof OrgNaoOperanteError) {
-    await admin
-      .from("campaign_recipients")
-      .update({ status: "pending", sending_at: null })
-      .eq("id", destinatarioId)
-      .eq("status", "sending");
+    await gravarDesfecho(admin, destinatarioId, { status: "pending", sending_at: null });
     return "org_nao_operante";
   }
+  // A vaga do 1º balão não entrou no ledger do número (F4m, M01 do cxj): nada
+  // saiu, e a pessoa volta à fila, como na organização parada. A rajada para
+  // (`erro_no_teto`), e a rodada seguinte tenta de novo — sem a vaga, nada sai.
+  if (err instanceof VagaNaoRegistradaError) {
+    await gravarDesfecho(admin, destinatarioId, { status: "pending", sending_at: null });
+    return "erro_no_teto";
+  }
   const motivoErro = err instanceof Error ? err.message : String(err);
-  await admin
+  await gravarDesfecho(admin, destinatarioId, {
+    status: "failed",
+    last_error_code: "send_exception",
+    last_error_detail: motivoErro.slice(0, 300),
+  });
+  return "falhou";
+}
+
+/**
+ * A vaga do 1º balão não entrou no ledger do número (F4m, M01 do cxj): o balão
+ * não sai. Sobe do `enviar` até o `catch` do envio, que devolve a pessoa à fila.
+ */
+class VagaNaoRegistradaError extends Error {
+  constructor(motivo: string) {
+    super(`a vaga no teto do número não foi registrada: ${motivo}`);
+    this.name = "VagaNaoRegistradaError";
+  }
+}
+
+/**
+ * Grava o desfecho do destinatário reservado — só se ele ainda estiver
+ * `sending`: o ack, o resgate ou outra rodada podem ter chegado antes, e
+ * escrever por cima os rebaixaria. A escrita recusada vai ao log (F4m, M02 do
+ * cxj): calada, o destinatário ficava `sending` sem o `message_id` que leva o ack
+ * até ele, e ninguém sabia que a mensagem tinha saído.
+ */
+async function gravarDesfecho(
+  admin: SupabaseClient,
+  destinatarioId: string,
+  campos: { status: string; last_error_code?: string | null; message_id?: string | null } & Record<string, unknown>,
+): Promise<void> {
+  const { error } = await admin
     .from("campaign_recipients")
-    .update({
-      status: "failed",
-      last_error_code: "send_exception",
-      last_error_detail: motivoErro.slice(0, 300),
-    })
+    .update(campos)
     .eq("id", destinatarioId)
     .eq("status", "sending");
-  return "falhou";
+  if (error) {
+    logger.error("[campanha] o desfecho do destinatário não foi gravado", {
+      destinatario: destinatarioId,
+      status: campos.status,
+      codigo: campos.last_error_code ?? null,
+      mensagem: campos.message_id ?? null,
+      motivo: error.message,
+    });
+  }
 }
 
 /**
@@ -1274,51 +1305,6 @@ export async function falhaQueParaACampanha(
     }
   }
   return null;
-}
-
-/**
- * A pausa do envio que não entrou no teto do número (F4l, L03/L06 do cxj). A
- * frase vai à tela em `failure_detail`, traduzida pelo dicionário.
- */
-const TETO_SEM_REGISTRO = {
-  codigo: "teto_sem_registro",
-  detalhe: "Um envio não entrou na contagem do limite diário do número.",
-} as const;
-
-/**
- * Pausa a campanha do envio e as outras em andamento cujo número PRINCIPAL é o do
- * envio: elas leriam o ledger sem a mensagem, e o número passaria do teto do dia
- * (F4l, L06 do cxj; na Linha A, o 1º toque, o 2º e a despedida dividem o chip). A
- * que só usa o número no rodízio segue. A escrita recusada fica no log: sem ela,
- * ninguém saberia que a campanha continuou mandando.
- */
-async function pausarPeloTetoSemRegistro(
-  admin: SupabaseClient,
-  campanha: CampanhaRow,
-  numero: string,
-  agora: Date,
-): Promise<void> {
-  const pausa = {
-    status: "paused",
-    paused_at: agora.toISOString(),
-    failure_code: TETO_SEM_REGISTRO.codigo,
-    failure_detail: TETO_SEM_REGISTRO.detalhe,
-  };
-  const daCampanha = await admin.from("campaigns").update(pausa).eq("id", campanha.id).eq("status", "running");
-  const doNumero = await admin
-    .from("campaigns")
-    .update(pausa)
-    .eq("organization_id", campanha.organization_id)
-    .eq("channel_session_id", numero)
-    .eq("status", "running");
-  const recusa = daCampanha.error ?? doNumero.error;
-  if (recusa) {
-    logger.error("[campanha] a pausa do teto sem registro não foi gravada", {
-      campanha: campanha.id,
-      numero,
-      motivo: recusa.message,
-    });
-  }
 }
 
 /**

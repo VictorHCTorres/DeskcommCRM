@@ -236,3 +236,28 @@ export async function recordSend(
     [tenantId, channelSessionId, sentAt, opts.resposta === true],
   );
 }
+
+/**
+ * Devolve a vaga de um disparo que NÃO saiu: tira UMA linha de disparo (nunca a
+ * de resposta) daquele número, naquele instante. Sem linha, não tira nada.
+ *
+ * A campanha registra a vaga ANTES de o balão sair (`rodada.ts`), para nenhuma
+ * mensagem sair fora do teto do número (revisão F4m do cxj, M01), e a devolve
+ * quando o balão certamente não saiu: o handler vetou, a organização parou, ou o
+ * canal segurou a mensagem sem chamar o provedor.
+ */
+export async function undoSend(
+  db: Queryable,
+  tenantId: string,
+  channelSessionId: string,
+  sentAt: Date,
+): Promise<void> {
+  await db.query(
+    `delete from pacing_ledger
+      where id = (select id from pacing_ledger
+                   where organization_id = $1 and channel_session_id = $2
+                     and sent_at = $3 and not resposta
+                   limit 1)`,
+    [tenantId, channelSessionId, sentAt],
+  );
+}

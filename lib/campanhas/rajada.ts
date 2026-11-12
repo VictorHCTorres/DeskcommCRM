@@ -29,7 +29,8 @@
  * pausou por falha da plataforma (`pausada:`), a janela fechou ou o teto da
  * campanha chegou (`ritmo:`), o número saiu do ar (`canal:`), o provedor pediu
  * para desacelerar (`limite:` — o destinatário volta para a fila) ou a reserva
- * deu erro de banco, ou a organização parou. Insistir nesses casos só repetiria o veto a cada envio.
+ * deu erro de banco, o ledger do número não registrou a vaga (`erro_no_teto`),
+ * ou a organização parou. Insistir nesses casos só repetiria o veto a cada envio.
  * Também para quando alguém pausa ou cancela a campanha pela tela: a pergunta é
  * refeita antes de cada lote.
  *
@@ -82,8 +83,11 @@ export interface DependenciasDaRajada<T> {
 // (`trava:sem_preparacao`): o veto é de todos os envios seguintes. E a campanha
 // que parou no meio (`campanha_parou`, visto na reserva) não manda mais nada.
 // E a mensagem da prospecção que o canal segurou (`fila:`, F4i A1): o próximo
-// envio cairia no mesmo canal fora do ar, e a pessoa só voltaria à fila.
-const PARA_A_RAJADA = /^(pausada:|ritmo:|canal:|fila:|limite:|erro_na_reserva|org_nao_operante|trava:|campanha_parou)/;
+// envio cairia no mesmo canal fora do ar, e a pessoa só voltaria à fila. E a vaga
+// que o ledger do número não registrou (`erro_no_teto`, F4m M01): sem ela nada
+// sai, e o envio seguinte esbarraria na mesma recusa.
+const PARA_A_RAJADA =
+  /^(pausada:|ritmo:|canal:|fila:|limite:|erro_na_reserva|erro_no_teto|org_nao_operante|trava:|campanha_parou)/;
 
 /** O desfecho vale para os envios seguintes também — a rajada não insiste. */
 export function desfechoParaARajada(detalhe: string): boolean {

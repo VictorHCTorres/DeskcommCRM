@@ -106,6 +106,7 @@ vi.mock("@/lib/agent-engine/pacing/store", () => ({
   loadChannelKnobs: mocks.knobs,
   loadPacingState: vi.fn().mockResolvedValue({ sentToday: 0 }),
   recordSend: vi.fn().mockResolvedValue(undefined),
+  undoSend: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock("@/lib/agent-engine/pacing/engine", () => ({
   janelaDeEnvioAberta: mocks.open,

@@ -16546,7 +16546,6 @@ export const DICIONARIO: Traducoes = {
   "Autenticação": { es: "Autenticación" },
   "Campanha com modelo aprovado sai por um número só: cada número tem os próprios modelos na plataforma.": { es: "Una campaña con plantilla aprobada sale por un solo número: cada número tiene sus propias plantillas en la plataforma." },
   "Corrija a causa e use Retomar.": { es: "Corrige la causa y usa Reanudar." },
-  "Um envio não entrou na contagem do limite diário do número.": { es: "Un envío no entró en el conteo del límite diario del número." },
   "Nenhum modelo escolhido ainda.": { es: "Todavía no se eligió ninguna plantilla." },
   "Este modelo não está aprovado na plataforma agora": { es: "Esta plantilla no está aprobada en la plataforma en este momento" },
   "sem origem": { es: "sin origen" },

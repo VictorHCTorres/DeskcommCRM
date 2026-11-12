@@ -30,6 +30,7 @@ vi.mock("@/lib/agent-engine/pacing/store", () => ({
   }),
   loadPacingState: async () => ({ lastSentAt: null, sentToday: 0, numberActivatedAt: null }),
   recordSend: async () => undefined,
+  undoSend: async () => undefined,
 }));
 vi.mock("@/lib/atendimento/origem", () => ({
   beginServiceAtOrigin: async (_admin: unknown, _org: string, contato: string) => ({ conversation_id: `conv:${contato}` }),

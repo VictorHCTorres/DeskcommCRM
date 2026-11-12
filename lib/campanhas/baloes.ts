@@ -42,9 +42,10 @@ export function pausaEntreBaloes(
 
 /**
  * Envia os balões em ordem. Cada balão enviado passa por `registrar`, com o
- * índice e o desfecho dele (o `recordSend` da rodada: cada balão é uma mensagem
- * física, conta no teto do número e é a base do throttle do próximo envio; a
- * rodada não conta o que o canal segurou sem chamar o provedor, F4j). Para no primeiro balão `failed` e o devolve como desfecho: mandar o
+ * índice. A rodada não o usa desde a F4m: ela registra a vaga de cada balão no
+ * teto do número ANTES de enviá-lo, dentro do `enviar`, para nenhuma mensagem
+ * sair fora da conta do dia (`rodada.ts`); registrar aqui, depois do envio,
+ * deixava a mensagem fora do teto quando o banco recusava. Para no primeiro balão `failed` e o devolve como desfecho: mandar o
  * resto depois de uma falha entregaria a mensagem pela metade e fora de ordem.
  *
  * `continuar` (opcional) é perguntado antes de cada balão seguinte, depois da
@@ -66,7 +67,7 @@ export async function enviarEmBaloes<T extends { status?: string }>(
   baloes: readonly string[],
   passos: {
     enviar: (corpo: string, indice: number) => Promise<T | null>;
-    registrar?: (indice: number, desfecho: T) => Promise<void>;
+    registrar?: (indice: number) => Promise<void>;
     esperar: () => Promise<void>;
     continuar?: (indice: number) => Promise<boolean>;
     parar?: (desfecho: T) => boolean;
@@ -88,7 +89,7 @@ export async function enviarEmBaloes<T extends { status?: string }>(
     desfecho = resultado;
     indiceDoDesfecho = indice;
     primeira ??= desfecho;
-    await passos.registrar?.(indice, desfecho);
+    await passos.registrar?.(indice);
     if (desfecho.status === "failed" || passos.parar?.(desfecho)) break;
   }
   return { primeira: primeira!, desfecho: desfecho!, indiceDoDesfecho };

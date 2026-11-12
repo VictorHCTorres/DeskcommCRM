@@ -35,6 +35,11 @@ vi.mock("@/lib/agent-engine/pacing/store", () => ({
   recordSend: async (_pool: unknown, _org: string, sessionId: string, quando: Date) => {
     mundo.ledger.set(sessionId, [...(mundo.ledger.get(sessionId) ?? []), quando]);
   },
+  undoSend: async (_pool: unknown, _org: string, sessionId: string, quando: Date) => {
+    const envios = mundo.ledger.get(sessionId) ?? [];
+    const i = envios.findIndex((d) => d.getTime() === quando.getTime());
+    if (i >= 0) mundo.ledger.set(sessionId, envios.filter((_, j) => j !== i));
+  },
 }));
 // O número oficial do teste: sem risco de banimento (quem limita é a plataforma),
 // como a capability dos canais oficiais declara. Sem nomear provider fora de
