@@ -35,6 +35,12 @@ vi.mock("@/lib/agent-engine/pacing/store", () => ({
   recordSend: async (_pool: unknown, _org: string, sessionId: string, quando: Date) => {
     mundo.ledger.set(sessionId, [...(mundo.ledger.get(sessionId) ?? []), quando]);
   },
+  // A campanha grava a vaga pela reserva (F4n do cxj, N12); o teto e o intervalo dela são provados em
+  // `travas-da-prospeccao.test.ts` e no Postgres. Aqui, o rodízio: a vaga entra no número escolhido.
+  reservarVaga: async (_pool: unknown, _org: string, sessionId: string, quando: Date) => {
+    mundo.ledger.set(sessionId, [...(mundo.ledger.get(sessionId) ?? []), quando]);
+    return "reservada";
+  },
   undoSend: async (_pool: unknown, _org: string, sessionId: string, quando: Date) => {
     const envios = mundo.ledger.get(sessionId) ?? [];
     const i = envios.findIndex((d) => d.getTime() === quando.getTime());

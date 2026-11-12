@@ -133,14 +133,7 @@ export function decidePacing(input: PacingInput): PacingDecision {
   // campo), então um chamador que declare as duas coisas não abre o teto.
   if (!prospeccao && resposta) return { allow: true, waitMs: throttleWaitMs(now, state, knobs, rng) };
 
-  // Clamp em >= 0: number_activated_at no futuro (typo do admin / clock skew
-  // daemon↔DB) cai no degrau MAIS conservador — warm-up falha FECHADO, nunca
-  // vira "número formado" por idade negativa.
-  const ageDays = state.numberActivatedAt
-    ? Math.max(0, Math.floor((now.getTime() - state.numberActivatedAt.getTime()) / DAY_MS))
-    : 0;
-  const wCap = warmupCapFor(ageDays, knobs.warmupDailyCaps);
-  const effectiveCap = Math.min(wCap ?? Infinity, crmDailyLimit ?? Infinity);
+  const { ageDays, wCap, effectiveCap } = tetosDoDia(now, knobs, state.numberActivatedAt, crmDailyLimit);
   if (state.sentToday >= effectiveCap) {
     const nextAllowedAt = addMs(nextDayOpen(now, knobs, diasProspeccao), jitterOf(rng, knobs));
     const isWarmup = wCap !== null && wCap < (crmDailyLimit ?? Infinity);
@@ -169,6 +162,47 @@ function throttleWaitMs(
   if (!state.lastSentAt) return 0;
   const requiredGapMs = knobs.throttleMs + jitterOf(rng, knobs);
   return Math.max(0, requiredGapMs - (now.getTime() - state.lastSentAt.getTime()));
+}
+
+/**
+ * Os tetos do dia do número: o degrau do aquecimento pela idade e o menor entre ele e
+ * o limite do CRM. Uma conta só, para `decidePacing` e `tetoDoDia`.
+ *
+ * Clamp em >= 0: number_activated_at no futuro (typo do admin / clock skew
+ * daemon↔DB) cai no degrau MAIS conservador — warm-up falha FECHADO, nunca
+ * vira "número formado" por idade negativa.
+ */
+function tetosDoDia(
+  now: Date,
+  knobs: PacingKnobs,
+  numberActivatedAt: Date | null,
+  crmDailyLimit: number | null,
+): { ageDays: number; wCap: number | null; effectiveCap: number } {
+  const ageDays = numberActivatedAt
+    ? Math.max(0, Math.floor((now.getTime() - numberActivatedAt.getTime()) / DAY_MS))
+    : 0;
+  const wCap = warmupCapFor(ageDays, knobs.warmupDailyCaps);
+  return { ageDays, wCap, effectiveCap: Math.min(wCap ?? Infinity, crmDailyLimit ?? Infinity) };
+}
+
+/**
+ * O teto de DISPAROS do dia do número, o mesmo que `decidePacing` aplica: o menor
+ * entre o degrau do aquecimento e o limite do CRM, só onde há risco de banimento.
+ * `null` = sem teto (número oficial, ou nenhum dos dois definido).
+ *
+ * É a regra que a campanha leva para a reserva da vaga (`reservarVaga`, store.ts),
+ * conferida de novo sob a trava do número (revisão F4n do cxj, N12).
+ */
+export function tetoDoDia(input: {
+  now: Date;
+  knobs: PacingKnobs;
+  numberActivatedAt: Date | null;
+  crmDailyLimit: number | null;
+  banRisk?: boolean;
+}): number | null {
+  if (input.banRisk === false) return null;
+  const { effectiveCap } = tetosDoDia(input.now, input.knobs, input.numberActivatedAt, input.crmDailyLimit);
+  return Number.isFinite(effectiveCap) ? effectiveCap : null;
 }
 
 /**

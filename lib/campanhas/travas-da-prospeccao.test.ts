@@ -23,6 +23,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { PACING_DEFAULTS, type PacingKnobs } from "@/lib/agent-engine/pacing/defaults";
+import { dayStartInTz } from "@/lib/agent-engine/pacing/engine";
+import type { RegraDaVaga } from "@/lib/agent-engine/pacing/store";
+import { PROVIDERS_DE_MENSAGEM, canalTemRiscoDeBanimento } from "@/lib/channels/capabilities";
 
 const mundo = vi.hoisted(() => ({
   knobs: null as unknown as PacingKnobs,
@@ -33,7 +36,7 @@ const mundo = vi.hoisted(() => ({
   /** Roda dentro do envio; o que devolver vira a resposta do handler (F4f, F10 e F13). */
   aoEnviar: null as null | (() => Promise<Record<string, unknown> | void>),
   /** Roda dentro da abertura da conversa: o meio do caminho entre a reserva e o handler (F4g, A3). */
-  aoAbrir: null as null | (() => void),
+  aoAbrir: null as null | (() => void | Promise<void>),
   /** O contexto que a rodada entregou ao handler, um por balão (F4g, A3 e A5). */
   ctxs: [] as Array<Record<string, unknown>>,
   /** O que foi para `logger.error`: o veto que não se grava tem de deixar rastro (F4i, H08). */
@@ -42,6 +45,8 @@ const mundo = vi.hoisted(() => ({
   avisos: [] as unknown[][],
   /** Roda dentro do registro da vaga no ledger do número; o que lançar é o INSERT recusado (F4l, L03/L06). */
   aoRegistrar: null as null | ((numero: string) => void),
+  /** Cada vaga pedida ao ledger do número (`reservarVaga`), na ordem, com a regra que a rodada mandou (F4n, N12). */
+  reservas: [] as Array<{ numero: string; quando: Date; regra: RegraDaVaga }>,
   /** Roda dentro da devolução da vaga de um envio que não saiu; o que lançar é o DELETE recusado (F4m, M01). */
   aoDesfazer: null as null | ((numero: string) => void),
 }));
@@ -67,6 +72,20 @@ vi.mock("@/lib/agent-engine/pacing/store", () => ({
     mundo.aoRegistrar?.(sessionId);
     mundo.ledger.set(sessionId, [...(mundo.ledger.get(sessionId) ?? []), quando]);
   },
+  // A reserva em RAM, com a regra de `reservarVaga` (store.ts): o teto conta as linhas do número (como o
+  // `loadPacingState` daqui), e o intervalo parte da mais recente. Sem `await` entre a conta e a gravação, o
+  // passo é atômico; a trava de verdade, com conexões disputando a vaga, é provada no Postgres
+  // (`tests/invariants/pacing-ledger-reserva-atomica.test.ts`). O que `aoRegistrar` lançar é o erro do banco.
+  reservarVaga: async (_pool: unknown, _org: string, sessionId: string, quando: Date, regra: RegraDaVaga) => {
+    mundo.aoRegistrar?.(sessionId);
+    mundo.reservas.push({ numero: sessionId, quando, regra });
+    const linhas = mundo.ledger.get(sessionId) ?? [];
+    if (regra.limite !== null && linhas.length + regra.vagas > regra.limite) return "teto_cheio";
+    const ultimo = Math.max(...linhas.map((d) => d.getTime()));
+    if (regra.intervaloMs > 0 && linhas.length > 0 && quando.getTime() - ultimo < regra.intervaloMs) return "intervalo";
+    mundo.ledger.set(sessionId, [...linhas, quando]);
+    return "reservada";
+  },
   undoSend: async (_pool: unknown, _org: string, sessionId: string, quando: Date) => {
     mundo.aoDesfazer?.(sessionId);
     const envios = mundo.ledger.get(sessionId) ?? [];
@@ -76,7 +95,7 @@ vi.mock("@/lib/agent-engine/pacing/store", () => ({
 }));
 vi.mock("@/lib/atendimento/origem", () => ({
   beginServiceAtOrigin: async (_admin: unknown, _org: string, contato: string, sessionId: string) => {
-    mundo.aoAbrir?.();
+    await mundo.aoAbrir?.();
     return { conversation_id: `conv:${contato}:${sessionId}` };
   },
 }));
@@ -310,6 +329,7 @@ beforeEach(() => {
   mundo.avisos.length = 0;
   mundo.aoRegistrar = null;
   mundo.aoDesfazer = null;
+  mundo.reservas.length = 0;
   vi.useRealTimers();
 });
 
@@ -2424,5 +2444,204 @@ describe("10. os contratos da revisão F4m do cxj (11/11/2026): nenhuma mensagem
     await rodarUmaRodadaDeCampanha(admin, QUARTA);
     expect(mundo.envios).toHaveLength(2);
     expect(unica(tabelas, "campaign_recipients")).toMatchObject({ status: "sent", message_id: "msg-1" });
+  });
+});
+
+describe("11. o contrato da revisão F4n do cxj (11/11/2026): a vaga só entra se ainda couber, sob a trava do número", () => {
+  /** A gradual com três pendentes de telefones distintos e uma vaga no dia do chip (o cenário do N12). */
+  const sobrepostas = () => {
+    const { tabelas, admin } = gradualComUmaVaga();
+    tabelas.campaign_recipients!.forEach((d, i) => {
+      const telefone = "+" + "55" + "88" + "9".repeat(5) + String(1000 + i);
+      d.recipient_address = telefone;
+      (d.contacts as Linha).phone_number = telefone;
+    });
+    return { tabelas, admin };
+  };
+  /** A rodada A para na abertura da conversa; a B, um minuto depois, corre inteira nesse meio-tempo; depois a A segue. */
+  const aAtrasada = async (admin: unknown) => {
+    let entrou!: () => void;
+    let soltar!: () => void;
+    const dentro = new Promise<void>((ok) => (entrou = ok));
+    const portao = new Promise<void>((ok) => (soltar = ok));
+    let vezes = 0;
+    mundo.aoAbrir = async () => {
+      if (++vezes === 1) {
+        entrou();
+        await portao;
+      }
+    };
+    const a = rodarUmaRodadaDeCampanha(admin as never, QUARTA);
+    await dentro;
+    let b;
+    try {
+      b = await rodarUmaRodadaDeCampanha(admin as never, new Date(QUARTA.getTime() + 60_000));
+    } finally {
+      soltar();
+    }
+    return { a: await a, b };
+  };
+  const comTetoDoCrm = (tabelas: Tabelas, limite: number | null, aquecimento: number | null = null) => {
+    Object.assign(unica(tabelas, "channel_sessions"), { daily_message_limit: limite });
+    mundo.knobs = { ...mundo.knobs, warmupDailyCaps: [{ minAgeDays: 0, cap: aquecimento }] } as PacingKnobs;
+  };
+
+  it("N12 ⭐ duas rodadas sobrepostas pela última vaga do chip: só uma manda, e o ledger fecha em 60", async () => {
+    const { tabelas, admin } = sobrepostas();
+    const { a, b } = await aAtrasada(admin);
+    expect(b.enviadas).toBe(1);
+    expect(a).toMatchObject({ enviadas: 0 });
+    expect(a.detalhe).toContain("canal:teto_cheio");
+    expect({ saidas: mundo.envios.length + 59, ledger: mundo.ledger.get("chip")!.length }).toEqual({ saidas: 60, ledger: 60 });
+    // A atrasada não mandou: ana volta à fila, sem reserva, e sai num dia com vaga.
+    expect(tabelas.campaign_recipients!.map((d) => [d.id, d.status, d.sending_at ?? null])).toEqual([
+      ["r-ana", "pending", null],
+      ["r-bia", "sent", expect.any(String)],
+      ["r-caio", "pending", null],
+    ]);
+    // Não é erro do banco nem falha do envio: um aviso próprio, e nada em `logger.error`.
+    expect(mundo.erros).toEqual([]);
+    expect(mundo.avisos).toContainEqual([
+      "[campanha] o envio não saiu: a vaga do número já foi ocupada",
+      expect.objectContaining({ destinatario: "r-ana", numero: "chip", motivo: "teto_cheio" }),
+    ]);
+    expect(mundo.avisos.map((x) => x[0])).not.toContain("[campanha] envio falhou");
+  });
+
+  it("N12 controle: as mesmas duas rodadas em sequência mandam uma só, e a 2ª nem reserva a pessoa", async () => {
+    const { tabelas, admin } = sobrepostas();
+    await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    const b = await rodarUmaRodadaDeCampanha(admin, new Date(QUARTA.getTime() + 60_000));
+    expect(b.detalhe).toContain("canal:sem_numero_livre");
+    expect(mundo.envios).toHaveLength(1);
+    expect(mundo.ledger.get("chip")).toHaveLength(60);
+    expect(mundo.reservas).toHaveLength(1);
+    expect(tabelas.campaign_recipients!.map((d) => d.status)).toEqual(["sent", "pending", "pending"]);
+  });
+
+  it("N12 com folga no teto, a rodada atrasada esbarra no intervalo do chip e volta à fila", async () => {
+    const { tabelas, admin } = sobrepostas();
+    mundo.ledger.set("chip", []);
+    mundo.knobs = { ...mundo.knobs, throttleMs: 5_000 };
+    const { a, b } = await aAtrasada(admin);
+    expect(b.enviadas).toBe(1);
+    expect(a.detalhe).toContain("canal:intervalo");
+    expect(mundo.envios).toHaveLength(1);
+    expect(mundo.ledger.get("chip")).toEqual([new Date(QUARTA.getTime() + 60_000)]);
+    expect(tabelas.campaign_recipients![0]).toMatchObject({ status: "pending", sending_at: null });
+    expect(mundo.avisos).toContainEqual([
+      "[campanha] o envio não saiu: a vaga do número já foi ocupada",
+      expect.objectContaining({ destinatario: "r-ana", motivo: "intervalo" }),
+    ]);
+  });
+
+  it("N12 a vaga leva a regra do chip: o teto, o dia no fuso do número, todos os balões e o intervalo sem o jitter no 1º; uma vaga e sem intervalo nos seguintes", async () => {
+    const { tabelas, admin } = emBaloes("Um.\n\nDois.\n\nTrês.");
+    comTetoDoCrm(tabelas, 60);
+    mundo.knobs = { ...mundo.knobs, throttleMs: 1_500, jitterMaxMs: 800 };
+    await rodadaNoRelogio(admin);
+    const desde = dayStartInTz(QUARTA, mundo.knobs.timezone);
+    expect(mundo.envios).toHaveLength(3);
+    expect(mundo.reservas.map((r) => r.regra)).toEqual([
+      { limite: 60, desde, vagas: 3, intervaloMs: 1_500 },
+      { limite: 60, desde, vagas: 1, intervaloMs: 0 },
+      { limite: 60, desde, vagas: 1, intervaloMs: 0 },
+    ]);
+  });
+
+  it.each([
+    [60, 10, 10],
+    [8, 10, 8],
+    [null, 25, 25],
+    [null, null, null],
+  ] as const)("N12 o teto da vaga é o menor entre o limite do CRM (%s) e o aquecimento (%s): %s", async (crm, aquecimento, limite) => {
+    const { tabelas, admin } = cenario(campanha("legitimate_interest"), pendente("ana"));
+    comTetoDoCrm(tabelas, crm, aquecimento);
+    await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(mundo.reservas.map((r) => r.regra.limite)).toEqual([limite]);
+  });
+
+  it("N12 número sem risco de banimento: a vaga não tem teto nem intervalo, como no `decidePacing`", async () => {
+    const semRisco = PROVIDERS_DE_MENSAGEM.find((p) => !canalTemRiscoDeBanimento(p));
+    expect(semRisco).toBeDefined();
+    const { tabelas, admin } = cenario(
+      campanha("legitimate_interest", { message_mode: "template" }),
+      pendente("ana", ["funil-a"], { variables: { modelo: {} } }),
+    );
+    comTetoDoCrm(tabelas, 60, 10);
+    Object.assign(unica(tabelas, "channel_sessions"), { provider: semRisco });
+    mundo.knobs = { ...mundo.knobs, throttleMs: 1_500 };
+    await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(mundo.reservas.map((r) => r.regra)).toEqual([
+      { limite: null, desde: dayStartInTz(QUARTA, mundo.knobs.timezone), vagas: 1, intervaloMs: 0 },
+    ]);
+  });
+
+  it("N12 sem vaga para a mensagem inteira, o 1º balão não sai: ninguém recebe meia mensagem", async () => {
+    const { tabelas, admin } = emBaloes("Um.\n\nDois.\n\nTrês.");
+    comTetoDoCrm(tabelas, 60);
+    mundo.ledger.set("chip", Array.from({ length: 57 }, () => new Date(QUARTA.getTime() - 3_600_000)));
+    // Entre a leitura da rodada e a reserva, outro envio do chip leva uma vaga: sobram duas para três balões.
+    mundo.aoAbrir = () => void mundo.ledger.get("chip")!.push(new Date(QUARTA.getTime() - 1_000));
+    const r = await rodadaNoRelogio(admin);
+    expect(r.detalhe).toContain("canal:teto_cheio");
+    expect(mundo.envios).toEqual([]);
+    expect(mundo.ledger.get("chip")).toHaveLength(58);
+    expect(unica(tabelas, "campaign_recipients")).toMatchObject({ status: "pending", sending_at: null });
+  });
+
+  it("N12 balão seguinte sem vaga: o começo conta, o resto não vai, e a pessoa fica com o 1º", async () => {
+    const { tabelas, admin } = emBaloes("Um.\n\nDois.\n\nTrês.");
+    comTetoDoCrm(tabelas, 60);
+    mundo.ledger.set("chip", Array.from({ length: 57 }, () => new Date(QUARTA.getTime() - 3_600_000)));
+    // Enquanto o 1º balão sai, outros envios do chip levam as duas últimas vagas.
+    mundo.aoEnviar = async () => {
+      if (mundo.envios.length === 1) {
+        mundo.ledger.get("chip")!.push(new Date(QUARTA.getTime() - 2_000), new Date(QUARTA.getTime() - 1_000));
+      }
+    };
+    const r = await rodadaNoRelogio(admin);
+    expect(r.enviadas).toBe(1);
+    expect(mundo.envios).toHaveLength(1);
+    expect(unica(tabelas, "campaign_recipients")).toMatchObject({ status: "sent", message_id: "msg-1" });
+    expect(mundo.avisos).toContainEqual([
+      "[campanha] o balão seguinte não saiu: a vaga do número já foi ocupada",
+      expect.objectContaining({ balao: 1, motivo: "teto_cheio" }),
+    ]);
+    expect(mundo.erros).toEqual([]);
+  });
+
+  it("N12 na rajada, a vaga ocupada para a rajada, e a pessoa volta à fila", async () => {
+    expect(desfechoParaARajada("canal:teto_cheio")).toBe(true);
+    expect(desfechoParaARajada("canal:intervalo")).toBe(true);
+    const tabelas = rajadaSozinha("ana", "bia");
+    Object.assign(tabelas.channel_sessions!.find((s) => s.id === "vinculado")!, { daily_message_limit: 2 });
+    mundo.knobs = { ...mundo.knobs, warmupDailyCaps: [{ minAgeDays: 0, cap: null }] } as PacingKnobs;
+    // Entre a leitura e a reserva, outros envios do número levam as duas vagas do dia.
+    mundo.aoAbrir = () => {
+      if (!mundo.ledger.has("vinculado")) {
+        mundo.ledger.set("vinculado", [new Date(QUARTA.getTime() - 2_000), new Date(QUARTA.getTime() - 1_000)]);
+      }
+    };
+    const r = await rodadaNoRelogio(fakeAdmin(tabelas));
+    expect(r.detalhe).toContain("canal:teto_cheio");
+    expect(mundo.envios).toEqual([]);
+    expect(mundo.reservas).toHaveLength(1);
+    expect(tabelas.campaign_recipients!.map((d) => d.status)).toEqual(["pending", "pending"]);
+  });
+
+  it("N12 controle: o erro da reserva (o banco, ou a trava que não veio no prazo) segue o caminho da 8", async () => {
+    const { tabelas, admin } = cenario(campanha("legitimate_interest"), pendente("ana"));
+    mundo.aoRegistrar = () => {
+      throw new Error("canceling statement due to lock timeout");
+    };
+    const r = await rodarUmaRodadaDeCampanha(admin, QUARTA);
+    expect(r.detalhe).toContain("erro_no_teto");
+    expect(mundo.envios).toEqual([]);
+    expect(unica(tabelas, "campaign_recipients")).toMatchObject({ status: "pending", sending_at: null });
+    expect(mundo.erros).toContainEqual([
+      "[campanha] o envio não saiu: o teto do número não registrou a vaga",
+      expect.objectContaining({ motivo: "canceling statement due to lock timeout" }),
+    ]);
   });
 });

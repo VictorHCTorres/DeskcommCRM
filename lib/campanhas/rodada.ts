@@ -38,8 +38,14 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 
 import { sendMessageHandler } from "@/app/api/v1/messages/_handler";
 import { getRequestPool } from "@/lib/agent-engine/db/request-pool";
-import { decidePacing, dayStartInTz } from "@/lib/agent-engine/pacing/engine";
-import { loadChannelKnobs, loadPacingState, recordSend, undoSend } from "@/lib/agent-engine/pacing/store";
+import { decidePacing, dayStartInTz, tetoDoDia } from "@/lib/agent-engine/pacing/engine";
+import {
+  loadChannelKnobs,
+  loadPacingState,
+  reservarVaga,
+  undoSend,
+  type ReservaDaVaga,
+} from "@/lib/agent-engine/pacing/store";
 import { beginServiceAtOrigin } from "@/lib/atendimento/origem";
 import { canalTemRiscoDeBanimento } from "@/lib/channels/capabilities";
 import {
@@ -564,6 +570,9 @@ async function rodarUmaCampanha(
   // ─── O RODÍZIO: qual número fala com esta pessoa ───
   const disponiveis: NumeroDisponivel[] = [];
   const knobsPorNumero = new Map<string, Awaited<ReturnType<typeof loadChannelKnobs>>>();
+  // A regra da vaga de cada número, a mesma do `decidePacing` abaixo: o teto do dia
+  // e o intervalo. A reserva a confere de novo, sob a trava do número (F4n, N12).
+  const regraPorNumero = new Map<string, { limite: number | null; intervaloMs: number }>();
   for (const sessionId of numeros) {
     const k =
       sessionId === campanha.channel_session_id
@@ -587,6 +596,20 @@ async function rodarUmaCampanha(
       timezone: k.knobs.timezone,
       numberActivatedAt: k.numberActivatedAt,
     });
+    // Aquecimento, teto e intervalo anti-ban são do número por QR. O oficial não é banido
+    // por volume — quem limita ali é a plataforma (nível de mensagens) —, e o ritmo
+    // próprio da campanha (intervalo, janela, tetos) continua valendo.
+    const banRisk = canalTemRiscoDeBanimento(linha.provider);
+    regraPorNumero.set(sessionId, {
+      limite: tetoDoDia({
+        now: agora,
+        knobs: k.knobs,
+        numberActivatedAt: k.numberActivatedAt,
+        crmDailyLimit: linha.daily_message_limit ?? null,
+        banRisk,
+      }),
+      intervaloMs: banRisk ? k.knobs.throttleMs : 0,
+    });
     const decisao = decidePacing({
       now: agora,
       knobs: k.knobs,
@@ -594,10 +617,7 @@ async function rodarUmaCampanha(
       // tivessem saído. Com um balão só, é o estado de sempre.
       state: { ...estadoDoNumero, sentToday: estadoDoNumero.sentToday + baloesPrevistos - 1 },
       crmDailyLimit: linha.daily_message_limit ?? null,
-      // Aquecimento e teto anti-ban são do número por QR. O oficial não é banido
-      // por volume — quem limita ali é a plataforma (nível de mensagens) —, e o
-      // ritmo próprio da campanha (intervalo, janela, tetos) continua valendo.
-      banRisk: canalTemRiscoDeBanimento(linha.provider),
+      banRisk,
       // Prospecção lê os dias próprios do número (`prospeccaoDias`, 0642), como
       // o worker de prospecção já faz. Sem isto a campanha fria saía no sábado.
       prospeccao: ehProspeccao(campanha),
@@ -625,6 +645,7 @@ async function rodarUmaCampanha(
   }
   const sessionEscolhida = escolha.sessionId;
   const knobs = knobsPorNumero.get(sessionEscolhida)!.knobs;
+  const regraDoNumero = regraPorNumero.get(sessionEscolhida)!;
 
   // ─── O envio ───
   // O id da mensagem nasce AQUI, e não do insert: com ele, o destinatário já
@@ -711,6 +732,14 @@ async function rodarUmaCampanha(
     // teto do dia, e segurar o número dependia de uma pausa que o mesmo banco
     // podia recusar: com 59 de 60, saíam mais duas, e com a recusa persistente,
     // uma por rodada. Agora, sem a vaga registrada, o balão não sai.
+    // E a vaga só entra se ainda couber (F4n, N12 do cxj): o saldo lido no rodízio
+    // pode estar velho. Duas rodadas sobrepostas (o agendador chama a cada minuto, e
+    // nada impede uma de começar com a outra no meio) liam o mesmo 59 de 60 e
+    // mandavam as duas. `reservarVaga` confere o teto do dia e o intervalo de novo e
+    // grava, numa transação só, sob a trava do número que a cadeia do agente também
+    // usa. No 1º balão, têm de caber todos os balões da mensagem, e o intervalo vale;
+    // nos seguintes, só a vaga de cada um.
+    const desde = dayStartInTz(agora, knobs.timezone);
     // Cada vaga leva o instante em que o balão sai: o throttle do próximo envio
     // do número conta a partir do último registro, e gravar todos com o `agora`
     // da rodada deixava o destinatário seguinte sair a menos de `throttleMs` do
@@ -739,8 +768,14 @@ async function rodarUmaCampanha(
     const { primeira, desfecho: mensagem, indiceDoDesfecho } = await enviarEmBaloes<Message>(baloes, {
       enviar: async (texto, i) => {
         const quando = vagaDoBalao(i);
+        let reserva: ReservaDaVaga;
         try {
-          await recordSend(pool, campanha.organization_id, sessionEscolhida, quando);
+          reserva = await reservarVaga(pool, campanha.organization_id, sessionEscolhida, quando, {
+            limite: regraDoNumero.limite,
+            desde,
+            vagas: i === 0 ? baloes.length : 1,
+            intervaloMs: i === 0 ? regraDoNumero.intervaloMs : 0,
+          });
         } catch (err) {
           const motivo = err instanceof Error ? err.message : String(err);
           // No 1º balão nada saiu: a pessoa volta à fila, e a rajada para (`erro_no_teto`).
@@ -757,6 +792,25 @@ async function rodarUmaCampanha(
             ...ondeFoi,
             balao: i,
             motivo,
+          });
+          return null;
+        }
+        // Sem vaga: outro envio do número a levou depois da leitura do rodízio (outra
+        // rodada, a rajada, o agente). Não é erro do banco: nada saiu, e é só a vez.
+        if (reserva !== "reservada") {
+          // No 1º balão, a pessoa volta à fila, e a rajada para (`canal:`).
+          if (i === 0) {
+            logger.warn("[campanha] o envio não saiu: a vaga do número já foi ocupada", {
+              ...ondeFoi,
+              motivo: reserva,
+            });
+            throw new VagaOcupadaError(reserva);
+          }
+          // Num seguinte, o começo saiu e conta, e o resto não vai.
+          logger.warn("[campanha] o balão seguinte não saiu: a vaga do número já foi ocupada", {
+            ...ondeFoi,
+            balao: i,
+            motivo: reserva,
           });
           return null;
         }
@@ -909,7 +963,10 @@ async function rodarUmaCampanha(
       numero: sessionEscolhida,
     };
   } catch (err) {
-    logger.warn("[campanha] envio falhou", { campanha: campanha.id, destinatario: alvo.id });
+    // A vaga ocupada já deixou o aviso dela: não é falha do envio.
+    if (!(err instanceof VagaOcupadaError)) {
+      logger.warn("[campanha] envio falhou", { campanha: campanha.id, destinatario: alvo.id });
+    }
     // A exceção pode ter vindo depois de a mensagem sair: o número conta como usado.
     // O veto da PESSOA no handler (F4g, A3) tira o destinatário da fila: conta
     // como pulado, como nas conferências da rodada.
@@ -1059,6 +1116,13 @@ export async function registrarExcecaoDoEnvio(
     await gravarDesfecho(admin, destinatarioId, { status: "pending", sending_at: null });
     return "erro_no_teto";
   }
+  // A vaga do 1º balão já tinha sido ocupada por outro envio do número (F4n, N12 do
+  // cxj): nada saiu, e a pessoa volta à fila e sai quando o número tiver vaga. O
+  // `canal:` para a rajada, como o número sem vaga do rodízio (`canal:sem_numero_livre`).
+  if (err instanceof VagaOcupadaError) {
+    await gravarDesfecho(admin, destinatarioId, { status: "pending", sending_at: null });
+    return `canal:${err.motivo}`;
+  }
   const motivoErro = err instanceof Error ? err.message : String(err);
   await gravarDesfecho(admin, destinatarioId, {
     status: "failed",
@@ -1076,6 +1140,20 @@ class VagaNaoRegistradaError extends Error {
   constructor(motivo: string) {
     super(`a vaga no teto do número não foi registrada: ${motivo}`);
     this.name = "VagaNaoRegistradaError";
+  }
+}
+
+/**
+ * A vaga do 1º balão já não cabia no teto do dia ou no intervalo do número quando a
+ * reserva a conferiu, sob a trava (F4n, N12 do cxj): o balão não sai. Sobe do
+ * `enviar` até o `catch` do envio, que devolve a pessoa à fila.
+ */
+class VagaOcupadaError extends Error {
+  readonly motivo: Exclude<ReservaDaVaga, "reservada">;
+  constructor(motivo: Exclude<ReservaDaVaga, "reservada">) {
+    super(`a vaga do número já foi ocupada: ${motivo}`);
+    this.name = "VagaOcupadaError";
+    this.motivo = motivo;
   }
 }
 

@@ -30,6 +30,7 @@ vi.mock("@/lib/agent-engine/pacing/store", () => ({
   }),
   loadPacingState: async () => ({ lastSentAt: null, sentToday: 0, numberActivatedAt: null }),
   recordSend: async () => undefined,
+  reservarVaga: async () => "reservada",
   undoSend: async () => undefined,
 }));
 vi.mock("@/lib/atendimento/origem", () => ({

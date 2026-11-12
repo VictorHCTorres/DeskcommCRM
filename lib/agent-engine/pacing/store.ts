@@ -3,8 +3,12 @@
  * knobs por número/sessão (`channel_knobs`, 0010; coluna NULL = default de
  * defaults.ts) e ledger de envios (`pacing_ledger`) de onde saem lastSentAt e
  * sentToday (contado desde a meia-noite LOCAL do tenant). Quem grava no ledger
- * é a cadeia de envio (F2-13) via `recordSend` — este módulo é o seam.
+ * é a cadeia de envio (F2-13) via `recordSend`, e a campanha via `reservarVaga`
+ * (a conferência e a gravação da vaga, juntas, sob a trava do número) — este
+ * módulo é o seam.
  */
+import type pg from 'pg';
+
 import { fusoValido } from '@/lib/tempo/fusos';
 
 import type { Logger } from '../obs/logger';
@@ -235,6 +239,100 @@ export async function recordSend(
      values ($1, $2, $3, $4)`,
     [tenantId, channelSessionId, sentAt, opts.resposta === true],
   );
+}
+
+/** A regra que a vaga de um disparo tem de cumprir na hora de ser gravada (`reservarVaga`). */
+export interface RegraDaVaga {
+  /** O teto de DISPAROS do dia do número (`tetoDoDia`, engine.ts); `null` = sem teto. */
+  limite: number | null;
+  /** O início do dia do número (`dayStartInTz`): a contagem do teto parte daqui. */
+  desde: Date;
+  /** Quantas vagas têm de caber: todos os balões da mensagem, no 1º; uma, nos seguintes. */
+  vagas: number;
+  /** O intervalo mínimo desde o último envio do número (o throttle, sem o jitter); 0 = não confere. */
+  intervaloMs: number;
+  /** Quanto esperar pela trava do número antes de desistir; o padrão é `ESPERA_PELA_TRAVA_MS`. */
+  esperaMs?: number;
+}
+
+/** O que a reserva fez: gravou a vaga, ou não havia vaga (o teto do dia, ou o intervalo do número). */
+export type ReservaDaVaga = 'reservada' | 'teto_cheio' | 'intervalo';
+
+/**
+ * Até quanto a reserva espera a trava do número. A cadeia do agente a segura durante
+ * o próprio envio (até o POST ao CRM voltar); passado isto, a reserva lança, e o
+ * balão não sai.
+ */
+export const ESPERA_PELA_TRAVA_MS = 15_000;
+
+/**
+ * Reserva a vaga de um DISPARO do número: confere o teto do dia e o intervalo e grava
+ * a linha no ledger numa transação só, sob o `pg_advisory_xact_lock(hashtext(número))`
+ * da cadeia do agente (`before-send.ts`, INBOX-008). Quem chega depois espera a vez e
+ * relê o ledger já com a vaga de quem passou.
+ *
+ * É a vaga da campanha (revisão F4n do cxj, N12): a rodada lia o saldo do número
+ * (`loadPacingState`) e gravava a vaga (`recordSend`) em dois passos, e duas rodadas
+ * sobrepostas liam o mesmo 59 de 60 e mandavam as duas. A leitura da rodada continua
+ * escolhendo o número; esta, sob a trava, é a que decide. As contas são as de
+ * `loadPacingState`: a resposta não gasta o teto, mas conta no intervalo.
+ *
+ * Sem vaga, não grava nada e devolve o motivo. O erro do banco (inclusive a trava que
+ * não veio no prazo) lança sem gravar nada; a conexão do erro é descartada e nunca
+ * volta ao pool no meio de uma transação (#2506).
+ */
+export async function reservarVaga(
+  pool: Pick<pg.Pool, 'connect'>,
+  tenantId: string,
+  channelSessionId: string,
+  sentAt: Date,
+  regra: RegraDaVaga,
+): Promise<ReservaDaVaga> {
+  const client = await pool.connect();
+  let erro: Error | undefined;
+  try {
+    await client.query('begin');
+    await client.query("select set_config('lock_timeout', $1, true)", [
+      `${regra.esperaMs ?? ESPERA_PELA_TRAVA_MS}ms`,
+    ]);
+    await client.query('select pg_advisory_xact_lock(hashtext($1))', [channelSessionId]);
+    const { rows } = await client.query<{ ultimo: Date | null; do_dia: string }>(
+      `select (select sent_at from pacing_ledger
+                where organization_id = $1 and channel_session_id = $2
+                order by sent_at desc limit 1) as ultimo,
+              (select count(*) from pacing_ledger
+                where organization_id = $1 and channel_session_id = $2
+                  and sent_at >= $3 and not resposta) as do_dia`,
+      [tenantId, channelSessionId, regra.desde],
+    );
+    const doDia = Number(rows[0]?.do_dia ?? 0);
+    const ultimo = rows[0]?.ultimo ?? null;
+    const semVaga: ReservaDaVaga | null =
+      regra.limite !== null && doDia + regra.vagas > regra.limite
+        ? 'teto_cheio'
+        : regra.intervaloMs > 0 &&
+            ultimo !== null &&
+            sentAt.getTime() - new Date(ultimo).getTime() < regra.intervaloMs
+          ? 'intervalo'
+          : null;
+    if (semVaga) {
+      await client.query('rollback');
+      return semVaga;
+    }
+    await client.query(
+      `insert into pacing_ledger (organization_id, channel_session_id, sent_at, resposta)
+       values ($1, $2, $3, false)`,
+      [tenantId, channelSessionId, sentAt],
+    );
+    await client.query('commit');
+    return 'reservada';
+  } catch (err) {
+    erro = err instanceof Error ? err : new Error(String(err));
+    await client.query('rollback').catch(() => undefined);
+    throw err;
+  } finally {
+    client.release(erro);
+  }
 }
 
 /**
