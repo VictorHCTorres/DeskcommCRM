@@ -29,14 +29,30 @@ export interface CampaignDelivery {
 }
 
 /**
+ * Por que a hora da vaga não vale mais (versão 15, F4t do cxj): a janela da campanha fechou desde a reserva
+ * (`janela_fechou`), ou a vaga passou da folga, e o envio sairia muito depois da hora gravada nela (`vaga_vencida`).
+ */
+export type MotivoDaHora = "janela_fechou" | "vaga_vencida";
+
+/**
+ * A vaga que a rodada da campanha reservou no limite do número, conferida no último passo antes do provedor
+ * (versão 15, F4t do cxj: T01 a T03). A rodada reserva a vaga e só depois chama o handler, que ainda confere a pessoa
+ * antes do provedor; nessa espera a janela pode fechar, e a vaga, envelhecer. `conferir()` relê o relógio e devolve o
+ * motivo para não sair, ou `null`. Vem do runtime, nunca do corpo de uma requisição; vale para toda campanha.
+ */
+export interface CampaignSlot {
+  conferir: () => MotivoDaHora | null;
+}
+
+/**
  * Por que a conferência final não deixou sair:
  * - `pular`: um veto da PESSOA (sai da fila com o motivo);
- * - `esperar`: não deu para conferir (volta à fila, falha fechada);
+ * - `esperar`: não deu para conferir, ou a hora da vaga não vale mais (volta à fila, falha fechada);
  * - `parou`: a campanha não está mais rodando (o status lido) ou o destinatário saiu da reserva (`destinatario`).
  */
 export type VetoDaCampanha =
   | { pular: MotivoDeExclusao }
-  | { esperar: "sem_leitura" | "sem_preparacao" }
+  | { esperar: "sem_leitura" | "sem_preparacao" | MotivoDaHora }
   | { parou: string };
 
 export class VetoDaCampanhaError extends Error {
@@ -54,6 +70,12 @@ export async function assertCampaignDelivery(
 ): Promise<void> {
   const veto = await conferenciaFinal(db, ctx, agora, ctx.estadosAceitos ?? ["sending"]);
   if (veto) throw new VetoDaCampanhaError(veto);
+}
+
+/** Lança `VetoDaCampanhaError` (`{ esperar: motivo }`) quando a hora da vaga não vale mais; senão, passa. */
+export function assertCampaignSlot(slot: CampaignSlot): void {
+  const motivo = slot.conferir();
+  if (motivo) throw new VetoDaCampanhaError({ esperar: motivo });
 }
 
 /** O ator que a rodada dá ao envio de campanha. O envio de teste da tela usa `campaign-test:` e não é envio a lead. */

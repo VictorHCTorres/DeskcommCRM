@@ -293,12 +293,16 @@ export const ESPERA_PELA_TRAVA_MS = 15_000;
  * Sem vaga, não grava nada e devolve o motivo. O erro do banco (inclusive a trava que
  * não veio no prazo) lança sem gravar nada; a conexão do erro é descartada e nunca
  * volta ao pool no meio de uma transação (#2506).
+ *
+ * `sentAt` pode ser o relógio (F4t do cxj, T02): o instante é lido SOB a trava, como na
+ * `reservarVagaRelida`, e é ele que o intervalo e o registro usam. A rodada da campanha manda o
+ * relógio: com o instante de antes da espera, a vaga ficava gravada antes da saída de verdade.
  */
 export async function reservarVaga(
   pool: Pick<pg.Pool, 'connect'>,
   tenantId: string,
   channelSessionId: string,
-  sentAt: Date,
+  sentAt: Date | (() => Date),
   regra: RegraDaVaga,
 ): Promise<ReservaDaVaga> {
   return reservarSobATrava<never>(pool, tenantId, channelSessionId, sentAt, regra, async () => regra);

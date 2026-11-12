@@ -38,7 +38,13 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 
 import { sendMessageHandler } from "@/app/api/v1/messages/_handler";
 import { getRequestPool } from "@/lib/agent-engine/db/request-pool";
-import { decidePacing, dayStartInTz, tetoDoDia } from "@/lib/agent-engine/pacing/engine";
+import {
+  decidePacing,
+  dayStartInTz,
+  janelaDeEnvioAberta,
+  janelaDeProspeccaoAberta,
+  tetoDoDia,
+} from "@/lib/agent-engine/pacing/engine";
 import {
   loadChannelKnobs,
   loadPacingState,
@@ -71,7 +77,7 @@ import {
   type DestinatarioRow,
 } from "./conferencia";
 import { statusDaSaida } from "./elegibilidade";
-import { VetoDaCampanhaError, type VetoDaCampanha } from "./entrega";
+import { VetoDaCampanhaError, type MotivoDaHora, type VetoDaCampanha } from "./entrega";
 import type { ConteudoDoEnvio } from "./modelo";
 import { renderizar } from "./renderizador";
 import { RAJADA, RajadaInterrompida, rodarEmRajada } from "./rajada";
@@ -157,6 +163,9 @@ export async function rodarUmaRodadaDeCampanha(
   admin: SupabaseClient,
   agora: Date = new Date(),
 ): Promise<ResultadoDaRodada> {
+  // O relógio da rodada (F4t do cxj, T02): o `agora` dela andando com o relógio do processo. As campanhas da rodada
+  // recebem o mesmo `agora`, a anterior pode ter levado segundos, e a vaga de cada uma leva a hora de verdade.
+  const relogio = relogioDesde(agora);
   // Organização que não OPERA (suspensa, redigida ou arquivada) não dispara
   // campanha: disparo em massa custa ao dono da instalação e sai para fora. A
   // régua é a única do produto, `lib/organizacao/operante.ts`. O comentário que
@@ -218,7 +227,7 @@ export async function rodarUmaRodadaDeCampanha(
     try {
       const r = emRajada(campanha)
         ? await rodarCampanhaEmRajada(admin, campanha, numerosQueFalaram)
-        : await rodarUmaCampanha(admin, campanha, agora, numerosQueFalaram);
+        : await rodarUmaCampanha(admin, campanha, agora, numerosQueFalaram, undefined, relogio);
       somarAoTotal(r);
       detalhes.push(`${campanha.id.slice(0, 8)}:${r.detalhe}`);
       if (ocupaONumero(r)) principaisOcupados.add(campanha.channel_session_id);
@@ -370,6 +379,28 @@ function meiaNoiteSeguinte(agora: Date, fuso: string): Date {
 }
 
 /**
+ * A folga da vaga da campanha (F4t do cxj, T03): quanto o balão pode sair depois da hora gravada na vaga. A vaga leva
+ * a hora lida sob a trava do número, e o balão sai depois da espera do handler, que confere a pessoa no banco antes
+ * do provedor (várias leituras, pela REST). Com o handler lento, a vaga ficava mais velha que o envio, e a reserva
+ * seguinte do número, conferida contra ela, passava no intervalo com o envio de verdade mais perto do anterior. Agora a
+ * vaga mais velha que a folga não sai (volta, e a pessoa espera a rodada seguinte), e o 1º balão reserva com o
+ * intervalo do número mais a folga: com cada balão saindo até a folga depois da vaga dele, o envio seguinte nunca sai a
+ * menos do intervalo. 10 s é folga para o handler lento; no envio gradual, a rodada manda uma pessoa por número a cada
+ * minuto, e o intervalo do número (o padrão é 1,2 s) mais a folga segue abaixo disso. Sem intervalo no número (o canal
+ * oficial, que não tem risco de banimento), não há folga a somar.
+ */
+export const ATRASO_MAXIMO_DA_VAGA_DA_CAMPANHA_MS = 10_000;
+
+/**
+ * O relógio de quem recebeu `agora`: `agora` andando com o relógio do processo. Em produção, `agora` é a hora em que a
+ * rodada começou, e o relógio dá a hora de agora; nos testes, segue o `agora` que o teste deu.
+ */
+function relogioDesde(agora: Date): () => Date {
+  const base = Date.now();
+  return () => new Date(agora.getTime() + (Date.now() - base));
+}
+
+/**
  * A rodada de uma campanha RÁPIDA: o envio de sempre, repetido em rajada no
  * prazo da rodada. As regras (ritmo, lotes, quando parar) estão em `rajada.ts`.
  *
@@ -410,6 +441,8 @@ async function rodarUmaCampanha(
   numerosJaUsados: ReadonlySet<string>,
   /** A rajada escolhe o destinatário do lote; sem ele, o primeiro da fila. */
   escolhido?: DestinatarioRow,
+  /** O relógio da rodada; sem ele, o de `agora`, que a rajada pega na hora de cada envio. */
+  relogio: () => Date = relogioDesde(agora),
 ): Promise<{ enviadas: number; pulados: number; concluidas: number; detalhe: string; numero?: string }> {
   // Campanha com modelo: uma falha que vale para o ENVIO INTEIRO (modelo
   // pausado, número restringido, pagamento) chega pelo webhook, depois do envio.
@@ -726,7 +759,6 @@ async function rodarUmaCampanha(
     // Os seguintes ganham o índice nas chaves, para uma repetição não os fundir.
     // `maxBaloes = baloesPrevistos`: o teto foi conferido para esse número.
     const baloes = comModelo ? [corpo] : baloesDaCampanha(corpo, dividir, baloesPrevistos);
-    const relogioDosBaloes = Date.now();
     // A vaga de cada balão entra no ledger do número ANTES de ele sair (F4m, M01
     // do cxj). Registrada depois, a recusa do banco deixava uma mensagem fora do
     // teto do dia, e segurar o número dependia de uma pausa que o mesmo banco
@@ -740,12 +772,31 @@ async function rodarUmaCampanha(
     // usa. No 1º balão, têm de caber todos os balões da mensagem, e o intervalo vale;
     // nos seguintes, só a vaga de cada um.
     const desde = dayStartInTz(agora, knobs.timezone);
-    // Cada vaga leva o instante em que o balão sai: o throttle do próximo envio
-    // do número conta a partir do último registro, e gravar todos com o `agora`
-    // da rodada deixava o destinatário seguinte sair a menos de `throttleMs` do
-    // último balão (medido na prova de tela: 941 ms). O 1º leva `agora`, como o
-    // envio único de antes.
-    const vagaDoBalao = (i: number) => (i === 0 ? agora : new Date(agora.getTime() + (Date.now() - relogioDosBaloes)));
+    // Cada vaga leva o instante em que o balão sai, lido pela reserva SOB a trava do
+    // número (F4t do cxj, T02): o throttle do próximo envio do número conta a partir
+    // do último registro, e gravar todos com o `agora` da rodada deixava o
+    // destinatário seguinte sair a menos de `throttleMs` do último balão (medido na
+    // prova de tela: 941 ms). Lido antes da espera pela trava, o instante também
+    // ficava para trás, e a vaga, gravada antes da saída de verdade.
+    //
+    // A hora do envio, conferida logo depois da reserva e de novo no último passo do
+    // handler (`campaignSlot`; F4t do cxj, T01 a T03): a janela que a rodada conferiu
+    // antes de reservar (a do número, com os dias da prospecção, o feriado e a da
+    // campanha) e a idade da vaga. A reserva espera a trava, e o handler espera o
+    // banco: com a espera atravessando as 18h, a mensagem saía fora da janela. A
+    // janela vale só para o 1º balão: a mensagem que começou dentro dela vai inteira.
+    const fuso = knobsDoPrincipal.knobs.timezone;
+    const soAJanela: RitmoDaCampanha = { ...ritmo, intervaloSegundos: null, tetoDiario: null, tetoHorario: null };
+    const aindaNaJanela = (t: Date) =>
+      (ehProspeccao(campanha)
+        ? janelaDeProspeccaoAberta(t, knobs) && !ehFeriadoNacional(t, fuso)
+        : janelaDeEnvioAberta(t, knobs, false)) &&
+      podeMandarAgora(soAJanela, { ultimoEnvio: null, enviadasHoje: 0, enviadasNaUltimaHora: 0 }, t, fuso).pode;
+    const foraDaHora = (vaga: Date, i: number): MotivoDaHora | null => {
+      const t = relogio();
+      if (i === 0 && !aindaNaJanela(t)) return "janela_fechou";
+      return t.getTime() - vaga.getTime() > ATRASO_MAXIMO_DA_VAGA_DA_CAMPANHA_MS ? "vaga_vencida" : null;
+    };
     const ondeFoi = { campanha: campanha.id, destinatario: alvo.id, numero: sessionEscolhida };
     // A vaga do balão que certamente não saiu volta ao ledger: o handler vetou, a
     // organização parou, ou o canal segurou a prospecção sem chamar o provedor
@@ -767,14 +818,21 @@ async function rodarUmaCampanha(
     // tira mais do retorno do `enviar`.
     const { primeira, desfecho: mensagem, indiceDoDesfecho } = await enviarEmBaloes<Message>(baloes, {
       enviar: async (texto, i) => {
-        const quando = vagaDoBalao(i);
+        // O instante da vaga é lido pela reserva, sob a trava, e guardado: é por ele que a
+        // hora do envio é conferida, e que a devolução acha a linha gravada.
+        let lido: Date | undefined;
+        const instanteDaVaga = () => (lido ??= relogio());
         let reserva: ReservaDaVaga;
         try {
-          reserva = await reservarVaga(pool, campanha.organization_id, sessionEscolhida, quando, {
+          reserva = await reservarVaga(pool, campanha.organization_id, sessionEscolhida, instanteDaVaga, {
             limite: regraDoNumero.limite,
             desde,
             vagas: i === 0 ? baloes.length : 1,
-            intervaloMs: i === 0 ? regraDoNumero.intervaloMs : 0,
+            // Com a folga da vaga (F4t do cxj, T03): ver `ATRASO_MAXIMO_DA_VAGA_DA_CAMPANHA_MS`.
+            intervaloMs:
+              i === 0 && regraDoNumero.intervaloMs > 0
+                ? regraDoNumero.intervaloMs + ATRASO_MAXIMO_DA_VAGA_DA_CAMPANHA_MS
+                : 0,
           });
         } catch (err) {
           const motivo = err instanceof Error ? err.message : String(err);
@@ -814,6 +872,22 @@ async function rodarUmaCampanha(
           });
           return null;
         }
+        const quando = instanteDaVaga();
+        // A hora do envio, logo depois da reserva (F4t do cxj, T01): a espera pela trava
+        // pode ter atravessado o fim da janela. A vaga volta, e nada sai: no 1º balão, a
+        // pessoa volta à fila pelo veto (`trava:`), como no da conferência final; num
+        // seguinte, o começo saiu e conta, e o resto não vai.
+        const motivoDaHora = foraDaHora(quando, i);
+        if (motivoDaHora) {
+          await devolverVaga(quando);
+          if (i === 0) throw new VetoDaCampanhaError({ esperar: motivoDaHora });
+          logger.warn("[campanha] o balão seguinte não saiu: a vaga envelheceu antes do envio", {
+            ...ondeFoi,
+            balao: i,
+            motivo: motivoDaHora,
+          });
+          return null;
+        }
         let resultado: Message;
         try {
           resultado = await sendMessageHandler(
@@ -823,6 +897,9 @@ async function rodarUmaCampanha(
               serviceBoundary: boundary,
               proactiveContext: { organizationId: campanha.organization_id, contactId: alvo.contact_id },
               actor: { type: "webhook_source", id: `campaign:${campanha.id}` },
+              // A hora da vaga, conferida de novo no último passo antes do provedor
+              // (`checkBoundary`), depois de toda a espera do handler.
+              campaignSlot: { conferir: () => foraDaHora(quando, i) },
               requestId: i === 0 ? `campaign:${campanha.id}:${alvo.id}` : `campaign:${campanha.id}:${alvo.id}:${i}`,
               internalMessageId: i === 0 ? messageId : randomUUID(),
               // Na prospecção, TODO balão leva a entrega (F4i, I01): a conferência

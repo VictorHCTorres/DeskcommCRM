@@ -425,6 +425,20 @@ async function stampExternalIdAfterEcho(
 }
 
 /**
+ * A folga da vaga do resgate (F4t do cxj, T03): quanto o envio pode sair depois da hora gravada na
+ * vaga. A vaga leva a hora lida sob a trava, e o envio sai depois da última conferência; com a
+ * conferência lenta (30 s, no teste do cxj), a vaga ficava 30 s mais velha que o envio, e a reserva
+ * seguinte, conferida contra ela, passava no intervalo do número com o envio de verdade a 4 s do
+ * anterior. Agora a vaga mais velha que a folga não sai (volta, e a mensagem espera o tique
+ * seguinte), e a reserva do resgate pede o intervalo do número mais a folga: com o envio até a folga
+ * depois da vaga, o seguinte nunca sai a menos do intervalo. Entre a hora da vaga e o envio há só a
+ * releitura da regra, a gravação e a última conferência, leituras de milissegundos; 2 s é folga
+ * para a leitura lenta, e o espaçamento do resgate (4 s a 8 s) segue maior que o intervalo padrão
+ * (1,2 s) mais a folga.
+ */
+export const ATRASO_MAXIMO_DA_VAGA_DO_RESGATE_MS = 2_000;
+
+/**
  * Reserva a vaga de uma saída do resgate no limite diário do número (F4p do cxj, P07), com a
  * mesma regra da campanha (`rodada.ts`): o teto do dia (`tetoDoDia`: o aquecimento e o teto do
  * CRM) e o intervalo do número (o throttle, sem o jitter), conferidos e gravados por
@@ -476,7 +490,8 @@ async function reservarVagaDoResgate(
           banRisk,
         }),
         desde: dayStartInTz(instante, knobs.timezone),
-        intervaloMs: banRisk ? knobs.throttleMs : 0,
+        // Com a folga da vaga (F4t do cxj, T03): ver `ATRASO_MAXIMO_DA_VAGA_DO_RESGATE_MS`.
+        intervaloMs: banRisk && knobs.throttleMs > 0 ? knobs.throttleMs + ATRASO_MAXIMO_DA_VAGA_DO_RESGATE_MS : 0,
       };
     },
   );
@@ -807,17 +822,30 @@ export async function redriveQueued(
         if (depois === 'desligando') break;
         continue;
       }
-      // ─── A JANELA, NO RELÓGIO DE AGORA (F4s do cxj, S01) ───
+      // ─── A JANELA E A IDADE DA VAGA, NO RELÓGIO DE AGORA (F4s do cxj, S01; F4t, T03) ───
       //
       // A conferência de cima também espera (a conexão, a leitura), e o relógio anda nessa
       // espera: a janela conferida na reserva pode ter fechado. Conferida de novo aqui, com os
       // knobs da reserva; fechada, a vaga volta e a mensagem fica na fila para o tique que a
-      // encontrar aberta. Entre esta conta e o `fetch` não há espera nenhuma.
-      if (!janelaDeEnvioAberta(agora(), vaga.knobs, m.resposta)) {
+      // encontrar aberta. E a vaga leva a hora da reserva: com a espera, o envio sairia depois
+      // dela, e o seguinte, conferido contra essa hora, a menos do intervalo deste. Mais velha que
+      // a folga, a vaga volta e a mensagem espera o tique seguinte; até a folga, a reserva seguinte
+      // pede o intervalo mais a folga, e o envio seguinte nunca sai a menos do intervalo deste.
+      // Entre esta conta e o `fetch` não há espera nenhuma.
+      const agoraDoEnvio = agora();
+      if (!janelaDeEnvioAberta(agoraDoEnvio, vaga.knobs, m.resposta)) {
         await devolverVagaDoResgate(pool, m, quando, log);
         log.info('watchdog: reenvio desfeito — a janela do número fechou antes do envio, e a vaga voltou', {
           message_id: m.id,
           resposta: m.resposta,
+        });
+        continue;
+      }
+      if (agoraDoEnvio.getTime() - quando.getTime() > ATRASO_MAXIMO_DA_VAGA_DO_RESGATE_MS) {
+        await devolverVagaDoResgate(pool, m, quando, log);
+        log.info('watchdog: reenvio desfeito — a vaga envelheceu antes do envio, e voltou', {
+          message_id: m.id,
+          atraso_ms: agoraDoEnvio.getTime() - quando.getTime(),
         });
         continue;
       }

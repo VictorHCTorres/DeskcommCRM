@@ -1,5 +1,5 @@
 import { assertProspectingDelivery } from "@/lib/prospecting/guard";
-import { assertCampaignDelivery, entregaPeloAtor, VetoDaCampanhaError } from "@/lib/campanhas/entrega";
+import { assertCampaignDelivery, assertCampaignSlot, entregaPeloAtor, VetoDaCampanhaError } from "@/lib/campanhas/entrega";
 import { assertAgentOperationSupabase, mesmaOperacao } from "@/lib/ai/agents/operation";
 import {
   assertApprovedReplySupabase,
@@ -1198,6 +1198,10 @@ export async function sendMessageHandler(
         if (ctx.approvedReply) await prepareApprovedReplySupabase(supabase, ctx.approvedReply);
         if (ctx.agentOperation && !operacaoJaConferida)
           await assertAgentOperationSupabase(supabase, ctx.agentOperation);
+        // A hora da vaga da campanha, por último (F4t do cxj, T01 a T03): as conferências de cima esperam o banco, e
+        // nessa espera a janela da campanha pode fechar e a vaga, envelhecer. É a conta mais perto do provedor, sem
+        // espera nenhuma entre ela e ele.
+        if (ctx.campaignSlot) assertCampaignSlot(ctx.campaignSlot);
       };
       // O que separa mídia de texto é a presença de `media` no envelope — o
       // adapter preserva o mesmo branch (e a mesma mensagem de erro de cada

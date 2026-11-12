@@ -362,3 +362,66 @@ describe("sendMessageHandler × envio de campanha sem a entrega no contexto (F4i
     expect(destinos).toEqual([]);
   });
 });
+
+/**
+ * Versão 15 (F4t do cxj, 12/11/2026: T01 a T03): a hora da vaga, no último passo antes do provedor.
+ *
+ * A rodada da campanha reserva a vaga do número e só depois chama o handler; o handler ainda confere a pessoa (no
+ * começo e a cada corte) antes do provedor, e essa espera é a que deixava a mensagem sair depois das 18h, ou com a
+ * vaga gravada muito antes do envio. Com `campaignSlot` no contexto, o `checkBoundary` (o último passo antes do
+ * provedor) pergunta à rodada se a hora ainda vale: a janela da campanha e a idade da vaga. O motivo vira o veto
+ * `esperar`, com o mesmo desfecho da conferência final: nada sai, a linha deixa a fila física, e o erro sobe.
+ */
+describe("sendMessageHandler × a hora da vaga da campanha (versão 15)", () => {
+  const comSlot = (base: HandlerCtx, conferir: () => string | null): HandlerCtx =>
+    ({ ...base, campaignSlot: { conferir } }) as HandlerCtx;
+
+  it("⭐ a janela que fechou no instante do efeito: nada sai, a linha fica `failed` com `campanha_vetada`, e o motivo sobe", async () => {
+    const { supabase, destinos, mensagens } = montar();
+    const erro = await sendMessageHandler(supabase, comSlot(ctx(true), () => "janela_fechou"), texto).catch(
+      (e: unknown) => e,
+    );
+    expect(erro).toBeInstanceOf(VetoDaCampanhaError);
+    expect((erro as VetoDaCampanhaError).veto).toEqual({ esperar: "janela_fechou" });
+    expect(destinos).toEqual([]);
+    expect(mensagens[0]).toMatchObject({ status: "failed", error_code: "campanha_vetada" });
+  });
+
+  it("⭐ conferida no último passo: a vaga envelhece entre a 1ª conferência do efeito e o provedor, e nada sai", async () => {
+    const { supabase, destinos } = montar();
+    let chamadas = 0;
+    const conferir = () => (++chamadas >= 2 ? "vaga_vencida" : null);
+    const erro = await sendMessageHandler(supabase, comSlot(ctx(true), conferir), texto).catch((e: unknown) => e);
+    expect(erro).toBeInstanceOf(VetoDaCampanhaError);
+    expect((erro as VetoDaCampanhaError).veto).toEqual({ esperar: "vaga_vencida" });
+    expect(chamadas).toBeGreaterThanOrEqual(2);
+    expect(destinos).toEqual([]);
+  });
+
+  it("⭐ consentimento (sem a entrega da prospecção): a hora da vaga também barra", async () => {
+    const { supabase, destinos } = montar();
+    const original = (supabase as unknown as { from: (t: string) => unknown }).from.bind(supabase);
+    (supabase as unknown as { from: (t: string) => unknown }).from = (tabela: string) => {
+      if (tabela !== "campaigns") return original(tabela);
+      const cadeia: Record<string, unknown> = {
+        select: () => cadeia,
+        eq: () => cadeia,
+        maybeSingle: async () => ({ data: { id: "camp", organization_id: ORG, base_legal: "consent" }, error: null }),
+      };
+      return cadeia;
+    };
+    const erro = await sendMessageHandler(supabase, comSlot(ctx(false), () => "janela_fechou"), texto).catch(
+      (e: unknown) => e,
+    );
+    expect(erro).toBeInstanceOf(VetoDaCampanhaError);
+    expect(destinos).toEqual([]);
+  });
+
+  it("controle: com a hora valendo até o provedor, sai uma vez, e a hora foi conferida no efeito", async () => {
+    const { supabase, destinos } = montar();
+    let chamadas = 0;
+    await sendMessageHandler(supabase, comSlot(ctx(true), () => (chamadas++, null)), texto);
+    expect(destinos).toHaveLength(1);
+    expect(chamadas).toBeGreaterThanOrEqual(2);
+  });
+});

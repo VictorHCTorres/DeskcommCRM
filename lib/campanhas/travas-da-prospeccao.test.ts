@@ -88,8 +88,11 @@ vi.mock("@/lib/agent-engine/pacing/store", () => ({
   // `loadPacingState` daqui), e o intervalo parte da mais recente. Sem `await` entre a conta e a gravação, o
   // passo é atômico; a trava de verdade, com conexões disputando a vaga, é provada no Postgres
   // (`tests/invariants/pacing-ledger-reserva-atomica.test.ts`). O que `aoRegistrar` lançar é o erro do banco.
-  reservarVaga: async (_pool: unknown, _org: string, sessionId: string, quando: Date, regra: RegraDaVaga) => {
+  // A rodada manda o relógio (versão 15, F4t do cxj, T02): o dublê o lê depois de `aoRegistrar`, como o store o lê
+  // sob a trava, depois da espera.
+  reservarVaga: async (_pool: unknown, _org: string, sessionId: string, relogio: Date | (() => Date), regra: RegraDaVaga) => {
     mundo.aoRegistrar?.(sessionId);
+    const quando = typeof relogio === "function" ? relogio() : relogio;
     mundo.reservas.push({ numero: sessionId, quando, regra });
     const linhas = mundo.ledger.get(sessionId) ?? [];
     if (regra.limite !== null && linhas.length + regra.vagas > regra.limite) return "teto_cheio";
@@ -125,7 +128,12 @@ import { COLUNAS_DO_DESTINATARIO, ESTADOS_DE_QUEM_RECEBEU, aplicarVeto } from "@
 import { VetoDaCampanhaError, assertCampaignDelivery, entregaPeloAtor } from "@/lib/campanhas/entrega";
 import { hashDoEndereco } from "@/lib/campanhas/exclusoes";
 import { desfechoParaARajada } from "@/lib/campanhas/rajada";
-import { reservarDestinatario, retidaPeloCanal, rodarUmaRodadaDeCampanha } from "@/lib/campanhas/rodada";
+import {
+  ATRASO_MAXIMO_DA_VAGA_DA_CAMPANHA_MS as FOLGA_DA_VAGA,
+  reservarDestinatario,
+  retidaPeloCanal,
+  rodarUmaRodadaDeCampanha,
+} from "@/lib/campanhas/rodada";
 import { OrgNaoOperanteError } from "@/lib/organizacao/operante";
 
 type Linha = Record<string, unknown>;
@@ -1549,7 +1557,9 @@ describe("6. os contratos da revisão F4i do cxj (11/11/2026): a fila do canal, 
     const consentimento = cenario(campanha("consent"), pendente("ana"), [], {
       conversas: [passagem("ana", "2026-11-18T13:00:00.000Z")],
     });
-    await rodarUmaRodadaDeCampanha(consentimento.admin, QUARTA);
+    // A rodada seguinte, um minuto depois (versão 15): a vaga da 1ª leva a hora lida na reserva, um pouco depois de
+    // QUARTA, e outra rodada com o mesmo QUARTA a veria no futuro, dentro do intervalo do número.
+    await rodarUmaRodadaDeCampanha(consentimento.admin, new Date(QUARTA.getTime() + 60_000));
     expect(mundo.envios).toEqual(["conv:ana:chip", "conv:ana:chip"]);
   });
 
@@ -2328,7 +2338,9 @@ describe("10. os contratos da revisão F4m do cxj (11/11/2026): nenhuma mensagem
     };
     await rodarUmaRodadaDeCampanha(admin, QUARTA);
     expect(mundo.envios).toHaveLength(2);
-    expect(mundo.ledger.get("chip")).toEqual([QUARTA]);
+    // O instante do 1º é o que a reserva dele leu sob a trava (versão 15, F4t do cxj, T02), não o `agora` exato.
+    expect(mundo.ledger.get("chip")).toEqual([mundo.reservas[0]!.quando]);
+    expect(mundo.reservas[1]!.quando.getTime() - mundo.reservas[0]!.quando.getTime()).toBeGreaterThanOrEqual(30);
   });
 
   it("M01 balões: o canal segura o 2º: volta a vaga dele, e fica a do 1º, no instante do 1º", async () => {
@@ -2337,18 +2349,22 @@ describe("10. os contratos da revisão F4m do cxj (11/11/2026): nenhuma mensagem
     mundo.aoEnviar = async () => (mundo.envios.length === 2 ? naFila(tabelas, "m-retida") : undefined);
     await rodarUmaRodadaDeCampanha(admin, QUARTA);
     expect(mundo.envios).toHaveLength(2);
-    expect(mundo.ledger.get("chip")).toEqual([QUARTA]);
+    expect(mundo.ledger.get("chip")).toEqual([mundo.reservas[0]!.quando]);
+    expect(mundo.reservas[1]!.quando.getTime() - mundo.reservas[0]!.quando.getTime()).toBeGreaterThanOrEqual(30);
   });
 
-  it("M01 ⭐ cada balão entra no teto no instante em que sai: o 1º no `agora` da rodada, os seguintes depois da pausa", async () => {
+  it("M01 ⭐ cada balão entra no teto no instante em que sai: o 1º no relógio da rodada lido na reserva, os seguintes depois da pausa", async () => {
     // O throttle do próximo envio do número conta a partir da última vaga: com todas no `agora`, o destinatário
-    // seguinte sairia a menos de `throttleMs` do último balão (a prova de tela da v5 mediu 941 ms).
+    // seguinte sairia a menos de `throttleMs` do último balão (a prova de tela da v5 mediu 941 ms). Desde a versão 15
+    // (F4t do cxj, T02), o 1º também leva a hora que a reserva leu, e não o `agora` da rodada.
     mundo.knobs = { ...mundo.knobs, throttleMs: 40 };
     const { admin } = emBaloes("Um.\n\nDois.\n\nTrês.");
     await rodarUmaRodadaDeCampanha(admin, QUARTA);
     const depoisDoAgora = (mundo.ledger.get("chip") ?? []).map((d) => d.getTime() - QUARTA.getTime());
     expect(depoisDoAgora).toHaveLength(3);
-    expect(depoisDoAgora[0]).toBe(0);
+    expect(mundo.ledger.get("chip")).toEqual(mundo.reservas.map((r) => r.quando));
+    expect(depoisDoAgora[0]).toBeGreaterThanOrEqual(0);
+    expect(depoisDoAgora[1]! - depoisDoAgora[0]!).toBeGreaterThanOrEqual(30);
     expect(depoisDoAgora[1]).toBeGreaterThanOrEqual(30);
     expect(depoisDoAgora[2]! - depoisDoAgora[1]!).toBeGreaterThanOrEqual(30);
   });
@@ -2546,7 +2562,9 @@ describe("11. o contrato da revisão F4n do cxj (11/11/2026): a vaga só entra s
     expect(b.enviadas).toBe(1);
     expect(a.detalhe).toContain("canal:intervalo");
     expect(mundo.envios).toHaveLength(1);
-    expect(mundo.ledger.get("chip")).toEqual([new Date(QUARTA.getTime() + 60_000)]);
+    // A vaga da B, a 1ª reserva, no instante que a reserva dela leu (versão 15, F4t do cxj, T02).
+    expect(mundo.ledger.get("chip")).toEqual([mundo.reservas[0]!.quando]);
+    expect(mundo.reservas[0]!.quando.getTime()).toBeGreaterThanOrEqual(QUARTA.getTime() + 60_000);
     expect(tabelas.campaign_recipients![0]).toMatchObject({ status: "pending", sending_at: null });
     expect(mundo.avisos).toContainEqual([
       "[campanha] o envio não saiu: a vaga do número já foi ocupada",
@@ -2554,7 +2572,7 @@ describe("11. o contrato da revisão F4n do cxj (11/11/2026): a vaga só entra s
     ]);
   });
 
-  it("N12 a vaga leva a regra do chip: o teto, o dia no fuso do número, todos os balões e o intervalo sem o jitter no 1º; uma vaga e sem intervalo nos seguintes", async () => {
+  it("N12 a vaga leva a regra do chip: o teto, o dia no fuso do número, todos os balões e o intervalo sem o jitter (mais a folga da vaga) no 1º; uma vaga e sem intervalo nos seguintes", async () => {
     const { tabelas, admin } = emBaloes("Um.\n\nDois.\n\nTrês.");
     comTetoDoCrm(tabelas, 60);
     mundo.knobs = { ...mundo.knobs, throttleMs: 1_500, jitterMaxMs: 800 };
@@ -2562,7 +2580,8 @@ describe("11. o contrato da revisão F4n do cxj (11/11/2026): a vaga só entra s
     const desde = dayStartInTz(QUARTA, mundo.knobs.timezone);
     expect(mundo.envios).toHaveLength(3);
     expect(mundo.reservas.map((r) => r.regra)).toEqual([
-      { limite: 60, desde, vagas: 3, intervaloMs: 1_500 },
+      // Mais a folga da vaga (versão 15, F4t do cxj, T03).
+      { limite: 60, desde, vagas: 3, intervaloMs: 1_500 + FOLGA_DA_VAGA },
       { limite: 60, desde, vagas: 1, intervaloMs: 0 },
       { limite: 60, desde, vagas: 1, intervaloMs: 0 },
     ]);
@@ -2638,7 +2657,9 @@ describe("11. o contrato da revisão F4n do cxj (11/11/2026): a vaga só entra s
     mundo.ledger.set("chip", [new Date(QUARTA.getTime() - 1_000)]);
     const r = await rodarUmaRodadaDeCampanha(admin, QUARTA);
     expect(r.enviadas).toBe(1);
-    expect(mundo.reservas.map((x) => [x.numero, x.regra.limite, x.regra.intervaloMs])).toEqual([["vinculado", 10, 5_000]]);
+    expect(mundo.reservas.map((x) => [x.numero, x.regra.limite, x.regra.intervaloMs])).toEqual([
+      ["vinculado", 10, 5_000 + FOLGA_DA_VAGA],
+    ]);
   });
 
   it("N12 sem vaga para a mensagem inteira, o 1º balão não sai: ninguém recebe meia mensagem", async () => {

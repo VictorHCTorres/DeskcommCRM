@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import pg from 'pg';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { runBeforeSend, pacingGate } from '@/lib/agent-engine/guardrails/before-send';
-import { redriveQueued } from '@/lib/agent-engine/edge/crm/session-reconciler';
+import { ATRASO_MAXIMO_DA_VAGA_DO_RESGATE_MS, redriveQueued } from '@/lib/agent-engine/edge/crm/session-reconciler';
 import { recordSend, reservarVaga, reservarVagaRelida, loadPacingState } from '@/lib/agent-engine/pacing/store';
 
 // Só PostgreSQL descartável do runner autorizado. O transporte do agente é uma função em RAM.
@@ -41,6 +41,10 @@ function iniciar(f:Fixture, extras:Partial<Parameters<typeof runBeforeSend>[0]>=
 
 import { sendWithLedger, pgSendLedger } from '@/lib/agent-engine/edge/crm/send-ledger';
 const cfg={wahaBaseUrl:'http://cxj.invalid',wahaApiKey:'ficticio',intervalMs:1000,redriveMinAgeMs:0,redriveBatchSize:10,redriveSpacingMs:0};
+// O tique seguinte do resgate (S03, S04 e S10): um segundo depois do intervalo do número (5 s) mais a folga da
+// vaga, que a reserva do resgate pede desde a versão 15 (F4t do cxj, T03). Na versão 14 eram 6 s, o intervalo e um
+// segundo; com a folga, o tique de 6 s não reserva mais, e o que estes casos registram acontece a partir daqui.
+const TIQUE_SEGUINTE=5000+ATRASO_MAXIMO_DA_VAGA_DO_RESGATE_MS+1000;
 const log={info:vi.fn(),warn:vi.fn(),error:vi.fn()};
 async function enfileirar(f:Fixture) {
  const conversa=randomUUID(),id=randomUUID();
@@ -95,7 +99,7 @@ describe('F4s — revisão independente da v13',()=>{
   const entrou=portao(),soltar=portao();let chamadas=0;
   vi.spyOn(globalThis,'fetch').mockImplementation(async()=>{chamadas++;if(chamadas===1){entrou.abrir();await soltar.espera}return new Response('{}',{status:200})});
   const a=redriveQueued(pool,cfg,log,undefined,()=>agora);
-  try {await entrou.espera;await redriveQueued(pool,cfg,log,undefined,()=>new Date(+agora+6000))}finally{soltar.abrir();await a}
+  try {await entrou.espera;await redriveQueued(pool,cfg,log,undefined,()=>new Date(+agora+TIQUE_SEGUINTE))}finally{soltar.abrir();await a}
   expect(chamadas).toBe(1);
  });
  it('S04 falha no recibo após saída mantém queued e entrega outra vez no próximo tique',async()=>{
@@ -106,7 +110,7 @@ describe('F4s — revisão independente da v13',()=>{
   await redriveQueued(fachada,cfg,log,undefined,()=>agora);
   expect(transporte).toHaveBeenCalledTimes(1);
   expect((await pool.query('select status from messages where id=$1',[id])).rows[0].status).toBe('queued');
-  recusar=false;await redriveQueued(fachada,cfg,log,undefined,()=>new Date(+agora+6000));
+  recusar=false;await redriveQueued(fachada,cfg,log,undefined,()=>new Date(+agora+TIQUE_SEGUINTE));
   expect(transporte).toHaveBeenCalledTimes(2);
  });
  it.each(['motivo','exceção'])('S05 %s na releitura libera trava e não grava débito',async(modo)=>{
@@ -159,7 +163,7 @@ describe('F4s — revisão independente da v13',()=>{
   try {
    await entrou.espera;expect((await reapExpiredJobs(pool,{visibilityTimeoutMs:1000})).dead).toBe(1);
    vi.spyOn(globalThis,'fetch').mockImplementation(async()=>{saidas++;return new Response('{}',{status:200})});
-   expect(await redriveQueued(pool,cfg,log,undefined,()=>new Date(+agora+6000))).toBe(1);
+   expect(await redriveQueued(pool,cfg,log,undefined,()=>new Date(+agora+TIQUE_SEGUINTE))).toBe(1);
   }finally{soltar.abrir();await tentativa.fim}
   expect((await tentativa.fim).erro).toBeNull();expect(saidas).toBe(2);
  });

@@ -13,7 +13,7 @@ import type { ServiceBoundary } from "@/lib/atendimento/fronteira";
  * humano (cookie session) ou agente de IA (Bearer token com actor_type='ai_agent').
  */
 import type { Idioma } from "@/lib/i18n/idiomas";
-import type { CampaignDelivery } from "@/lib/campanhas/entrega";
+import type { CampaignDelivery, CampaignSlot } from "@/lib/campanhas/entrega";
 
 export type Actor =
   | { type: "user"; id: string; role?: string }
@@ -87,6 +87,13 @@ export interface HandlerCtx {
    * Nunca vem do corpo de uma requisição.
    */
   campaignDelivery?: CampaignDelivery;
+  /**
+   * A vaga que a rodada da campanha reservou no limite do número (`lib/campanhas/entrega.ts`), que só a rodada põe, em
+   * todo balão de toda campanha. O `checkBoundary` a confere por último, logo antes do provedor: a janela da campanha
+   * que fechou, ou a vaga que envelheceu na espera do handler, viram o veto `esperar`, e nada sai (F4t do cxj, T01 a
+   * T03). Nunca vem do corpo de uma requisição.
+   */
+  campaignSlot?: CampaignSlot;
   agentOperation?: AgentOperationContext;
   meetingDelivery?: MeetingDeliveryContext;
   approvedReply?: ApprovedReplyContext;

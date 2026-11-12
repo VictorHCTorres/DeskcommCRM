@@ -37,7 +37,9 @@ vi.mock("@/lib/agent-engine/pacing/store", () => ({
   },
   // A campanha grava a vaga pela reserva (F4n do cxj, N12); o teto e o intervalo dela são provados em
   // `travas-da-prospeccao.test.ts` e no Postgres. Aqui, o rodízio: a vaga entra no número escolhido.
-  reservarVaga: async (_pool: unknown, _org: string, sessionId: string, quando: Date) => {
+  // A rodada manda o relógio (versão 15, F4t do cxj, T02), que o store lê sob a trava.
+  reservarVaga: async (_pool: unknown, _org: string, sessionId: string, relogio: Date | (() => Date)) => {
+    const quando = typeof relogio === "function" ? relogio() : relogio;
     mundo.ledger.set(sessionId, [...(mundo.ledger.get(sessionId) ?? []), quando]);
     return "reservada";
   },
