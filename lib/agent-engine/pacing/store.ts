@@ -301,14 +301,53 @@ export async function reservarVaga(
   sentAt: Date,
   regra: RegraDaVaga,
 ): Promise<ReservaDaVaga> {
+  return reservarSobATrava<never>(pool, tenantId, channelSessionId, sentAt, regra, async () => regra);
+}
+
+/** A parte da regra da vaga que `reservarVagaRelida` lê sob a trava do número. */
+export type RegraRelida = Pick<RegraDaVaga, 'limite' | 'desde' | 'intervaloMs'>;
+
+/**
+ * `reservarVaga` com a regra lida SOB a trava do número, dentro da transação da reserva (F4r do
+ * cxj, R05 e R07). `reler` recebe a conexão da reserva e devolve o teto, o início do dia e o
+ * intervalo que valem agora, ou um motivo para não reservar (o resgate da fila devolve a janela
+ * fechada), que volta como o desfecho, sem gravar nada. O que o operador mudou enquanto a reserva
+ * esperava a trava (o limite diário do CRM, o aquecimento, o intervalo, a janela) vale; lida
+ * antes, a regra conferia a vaga com o que já tinha mudado. A falha de `reler` lança, como a de
+ * qualquer leitura da reserva, e nada é gravado.
+ */
+export async function reservarVagaRelida<Motivo extends string>(
+  pool: Pick<pg.Pool, 'connect'>,
+  tenantId: string,
+  channelSessionId: string,
+  sentAt: Date,
+  base: Pick<RegraDaVaga, 'vagas' | 'resposta' | 'esperaMs'>,
+  reler: (db: Queryable) => Promise<RegraRelida | Motivo>,
+): Promise<ReservaDaVaga | Motivo> {
+  return reservarSobATrava(pool, tenantId, channelSessionId, sentAt, base, reler);
+}
+
+async function reservarSobATrava<Motivo extends string>(
+  pool: Pick<pg.Pool, 'connect'>,
+  tenantId: string,
+  channelSessionId: string,
+  sentAt: Date,
+  base: Pick<RegraDaVaga, 'vagas' | 'resposta' | 'esperaMs'>,
+  reler: (db: Queryable) => Promise<RegraRelida | Motivo>,
+): Promise<ReservaDaVaga | Motivo> {
   const client = await pool.connect();
   let erro: Error | undefined;
   try {
     await client.query('begin');
     await client.query("select set_config('lock_timeout', $1, true)", [
-      `${regra.esperaMs ?? ESPERA_PELA_TRAVA_MS}ms`,
+      `${base.esperaMs ?? ESPERA_PELA_TRAVA_MS}ms`,
     ]);
     await client.query('select pg_advisory_xact_lock(hashtext($1))', [channelSessionId]);
+    const regra = await reler(client);
+    if (typeof regra === 'string') {
+      await client.query('rollback');
+      return regra;
+    }
     const { rows } = await client.query<{ ultimo: Date | null; do_dia: string }>(
       `select (select sent_at from pacing_ledger
                 where organization_id = $1 and channel_session_id = $2
@@ -320,9 +359,9 @@ export async function reservarVaga(
     );
     const doDia = Number(rows[0]?.do_dia ?? 0);
     const ultimo = rows[0]?.ultimo ?? null;
-    const resposta = regra.resposta === true;
+    const resposta = base.resposta === true;
     const semVaga: ReservaDaVaga | null =
-      !resposta && regra.limite !== null && doDia + regra.vagas > regra.limite
+      !resposta && regra.limite !== null && doDia + base.vagas > regra.limite
         ? 'teto_cheio'
         : regra.intervaloMs > 0 &&
             ultimo !== null &&

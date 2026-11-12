@@ -33,9 +33,10 @@ import { lerNumerosDeTeste, numeroPodeTestar, preGoLiveAtivo } from '@/lib/ai/el
 import { canalDesativado } from '@/lib/channels/desativado';
 import { canalTemRiscoDeBanimento } from '@/lib/channels/capabilities';
 
+import { readStopFlags, type MotivoDoStop } from '../../guardrails/before-send';
 import type { Logger } from '../../obs/logger';
-import { dayStartInTz, tetoDoDia } from '../../pacing/engine';
-import { loadChannelKnobs, reservarVaga, undoSend, type ReservaDaVaga } from '../../pacing/store';
+import { dayStartInTz, janelaDeEnvioAberta, tetoDoDia } from '../../pacing/engine';
+import { loadChannelKnobs, reservarVagaRelida, undoSend, type ReservaDaVaga } from '../../pacing/store';
 import { KINDS_DE_RESPOSTA } from '../../queue/queue';
 
 export interface WatchdogConfig {
@@ -189,15 +190,37 @@ interface QueuedRow {
   metadata: unknown;
   /** O número que manda: a vaga no limite diário é dele (F4p do cxj, P07). */
   channel_session_id: string;
-  /** O teto do CRM do número (`null` = sem teto) e o canal, para a regra da vaga. */
-  daily_message_limit: number | null;
+  /**
+   * O canal, para a regra da vaga. O teto do CRM do número não vem daqui: a reserva o lê sob a
+   * trava (F4r do cxj, R05).
+   */
   provider: string | null;
+  /** Quem escreveu: a mensagem da IA (`ai`) passa pela mesma parada da cadeia (F4r do cxj, R06). */
+  sent_via: string;
   /**
    * A mensagem respondia a quem escreveu: o job da chave dela no `send_ledger` é um dos
    * `KINDS_DE_RESPOSTA` (F4q do cxj, Q08). Sem o job (automação, sistema, linha antiga), `false`.
    */
   resposta: boolean;
 }
+
+/**
+ * A mensagem presa sem job vivo (F4r do cxj, R08): nenhum job pendente ou em execução tem a chave
+ * dela no `send_ledger` (`l.id = m.id`, a mesma ligação de `resposta`). Fragmento de SQL sobre o
+ * alias `m` de `messages`, na consulta do resgate e na releitura de `conferirElegibilidade`.
+ */
+const SEM_JOB_VIVO = `not exists (
+         select 1 from send_ledger l
+         join job_queue j on j.id = l.job_id and j.organization_id = l.organization_id
+         where l.organization_id = m.organization_id and l.id = m.id
+           and j.status in ('pending', 'running'))`;
+
+/** O que a mensagem da IA que não sai pela parada da cadeia (F4r do cxj, R06) grava como erro. */
+const ERRO_DA_PARADA: Record<MotivoDoStop, string> = {
+  atendimento_com_humano: 'Não reenviada: a conversa passou para o atendimento humano.',
+  contato_bloqueado: 'Não reenviada: o contato não recebe mensagens automáticas.',
+  contato_interno: 'Não reenviada: o contato é interno.',
+};
 
 /**
  * A campanha da mensagem presa, pelo `metadata` que a rodada grava. `null`
@@ -407,23 +430,47 @@ async function stampExternalIdAfterEcho(
  * `reservarVaga`, sob a trava do número que a cadeia do agente e a campanha também usam. A
  * resposta presa reserva como resposta (F4q do cxj, Q08): conta no intervalo e não confere o teto
  * do dia, como a cadeia faz com a resposta.
+ *
+ * A regra é lida SOB a trava, dentro da transação da reserva (`reservarVagaRelida`; F4r do cxj, R05
+ * e R07): os knobs do número (o aquecimento, o intervalo, o fuso e a janela) e o limite diário do
+ * CRM. Lidos antes da espera pela trava, o limite baixado nessa espera não valia. E a janela do
+ * tipo da mensagem (a de resposta ou a de disparo, `janelaDeEnvioAberta`, a mesma conta da cadeia)
+ * tem de estar aberta: fechada, nada é reservado (`fora_da_janela`), e a mensagem espera na fila
+ * o tique que a encontrar aberta. Antes, a resposta presa saía às 3h.
  */
-async function reservarVagaDoResgate(pool: pg.Pool, m: QueuedRow, quando: Date, log: Logger): Promise<ReservaDaVaga> {
-  const { knobs, numberActivatedAt } = await loadChannelKnobs(pool, m.organization_id, m.channel_session_id, log);
+async function reservarVagaDoResgate(
+  pool: pg.Pool,
+  m: QueuedRow,
+  quando: Date,
+  log: Logger,
+): Promise<ReservaDaVaga | 'fora_da_janela'> {
   const banRisk = canalTemRiscoDeBanimento(m.provider);
-  return reservarVaga(pool, m.organization_id, m.channel_session_id, quando, {
-    limite: tetoDoDia({
-      now: quando,
-      knobs,
-      numberActivatedAt,
-      crmDailyLimit: m.daily_message_limit ?? null,
-      banRisk,
-    }),
-    desde: dayStartInTz(quando, knobs.timezone),
-    vagas: 1,
-    intervaloMs: banRisk ? knobs.throttleMs : 0,
-    resposta: m.resposta,
-  });
+  return reservarVagaRelida(
+    pool,
+    m.organization_id,
+    m.channel_session_id,
+    quando,
+    { vagas: 1, resposta: m.resposta },
+    async (db) => {
+      const { knobs, numberActivatedAt } = await loadChannelKnobs(db, m.organization_id, m.channel_session_id, log);
+      if (!janelaDeEnvioAberta(quando, knobs, m.resposta)) return 'fora_da_janela';
+      const { rows } = await db.query<{ daily_message_limit: number | null }>(
+        'select daily_message_limit from channel_sessions where organization_id = $1 and id = $2',
+        [m.organization_id, m.channel_session_id],
+      );
+      return {
+        limite: tetoDoDia({
+          now: quando,
+          knobs,
+          numberActivatedAt,
+          crmDailyLimit: rows[0]?.daily_message_limit ?? null,
+          banRisk,
+        }),
+        desde: dayStartInTz(quando, knobs.timezone),
+        intervaloMs: banRisk ? knobs.throttleMs : 0,
+      };
+    },
+  );
 }
 
 /**
@@ -451,11 +498,13 @@ type Elegibilidade = 'pode_sair' | 'desligando' | 'nao_sai';
 
 /**
  * Relê o que decide se a mensagem presa ainda pode sair por este resgate: ela segue `queued`, a
- * sessão do número segue no ar (`WORKING`) e o contato não foi bloqueado (as condições da consulta
- * do resgate), a organização opera, o canal não está pausado, o modo de teste deixa o número, e ela
- * não é de campanha de prospecção. Quando não pode, grava o desfecho na mensagem e diz `nao_sai`
- * (a que deixou a fila, a da sessão fora do ar e a do contato bloqueado não são tocadas: ficam como
- * a consulta do resgate as deixa). Roda ANTES da reserva da vaga e de novo DEPOIS dela (F4q do cxj,
+ * sessão do número segue no ar (`WORKING`), o contato não foi bloqueado e nenhum job vivo tem a
+ * chave dela (as condições da consulta do resgate; F4r do cxj, R08), a organização opera, o canal
+ * não está pausado, o modo de teste deixa o número, o envio original iria ao contato (a cadeia,
+ * na mensagem da IA; o contato pessoal, em todas; F4r do cxj, R06), e ela não é de campanha de
+ * prospecção. Quando não pode, grava o desfecho na mensagem e diz `nao_sai` (a que deixou a fila,
+ * a da sessão fora do ar, a do contato bloqueado e a do job vivo não são tocadas: ficam como a
+ * consulta do resgate as deixa). Roda ANTES da reserva da vaga e de novo DEPOIS dela (F4q do cxj,
  * Q03): a reserva espera a conexão e a trava do número, e o que muda nessa espera vale. O
  * desligamento é conferido depois de cada leitura (`desligando`); depois da última, nada mais
  * espera até o `fetch`. Falha de leitura lança, e quem chama não envia.
@@ -472,7 +521,8 @@ async function conferirElegibilidade(
      join channel_sessions s on s.id = m.channel_session_id and s.organization_id = m.organization_id
      join contacts c on c.id = m.contact_id and c.organization_id = m.organization_id
      where m.id = $1 and m.organization_id = $2 and m.status = 'queued'
-       and s.status = 'WORKING' and c.is_blocked = false`,
+       and s.status = 'WORKING' and c.is_blocked = false
+       and ${SEM_JOB_VIVO}`,
     [m.id, m.organization_id],
   );
   // ABORT DURANTE a espera de elegibilidade (#2823): a releitura terminou e
@@ -517,6 +567,30 @@ async function conferirElegibilidade(
       [m.id, m.organization_id],
     );
     log.info('watchdog: reenvio bloqueado pelo modo de teste', { message_id: m.id });
+    return 'nao_sai';
+  }
+  // O resgate para onde o envio original pararia (F4r do cxj, R06). A mensagem da IA para onde
+  // a CADEIA para: a conversa passada para a equipe, o "sempre atendimento humano", o contato
+  // pessoal e o interno (`readStopFlags`, a primeira regra dura de `before-send.ts`); na fila,
+  // ela sairia quando a conversa voltasse ao automático, já fora de contexto. A de automação e a
+  // de sistema param onde o envio pela API para: o contato pessoal não recebe nada, manual ou
+  // automático (spec 21, etapa 11; `readStopFlags` com o quarto argumento lê só o bloqueio e o
+  // pessoal, a mesma régua do encontro humano). A passagem para a equipe cala a IA, não a
+  // automação. A que não sai vira falha com o motivo.
+  // O join da consulta do resgate garante o contato; sem ele, a leitura falha, e nada sai.
+  const parada = await readStopFlags(pool, m.organization_id, m.contact_id ?? '', m.sent_via !== 'ai');
+  if (signal?.aborted) return 'desligando';
+  if (parada.stopped && parada.motivo !== null) {
+    await pool.query(
+      `update messages set status = 'failed', error_code = $3, error_message = $4
+       where id = $1 and organization_id = $2 and status = 'queued'`,
+      [m.id, m.organization_id, parada.motivo, ERRO_DA_PARADA[parada.motivo]],
+    );
+    log.info('watchdog: reenvio bloqueado — o envio original não iria a este contato', {
+      message_id: m.id,
+      sent_via: m.sent_via,
+      motivo: parada.motivo,
+    });
     return 'nao_sai';
   }
   // A campanha de PROSPECÇÃO só sai pela rodada (F4i, A1 do cxj). Este
@@ -570,7 +644,7 @@ export async function redriveQueued(
   const { rows } = await pool.query<QueuedRow>(
     `select m.id, m.organization_id, m.conversation_id, m.contact_id, m.body, s.waha_session_name,
             c.wa_identity, c.wa_lid, c.phone_number, v.is_group, v.group_chat_id, m.metadata,
-            m.channel_session_id, s.daily_message_limit, s.provider,
+            m.channel_session_id, s.provider, m.sent_via,
             -- A resposta presa (F4q do cxj, Q08): a mensagem do agente nasce com o id da chave do
             -- send_ledger (send-message.ts), e o job da chave diz se ela respondia alguém.
             exists (
@@ -586,6 +660,13 @@ export async function redriveQueued(
      where m.sent_via in ('ai', 'automation', 'system') and m.status = 'queued'
        and s.status = 'WORKING'
        and c.is_blocked = false
+       -- ─── A mensagem de job VIVO é do job (F4r do cxj, R08) ──────────────
+       --
+       -- O job que a mandou ainda pendente (o follow-up reagendado, o job que volta à fila
+       -- quando o worker morre) ou em execução vai mandá-la de novo pela cadeia, com a mesma
+       -- chave e todos os portões. Reenviada também daqui, ela saía duas vezes: os dois liam
+       -- 'queued'. O resgate fica com a mensagem sem dono: a do job terminado, e a sem job.
+       and ${SEM_JOB_VIVO}
        -- ─── Só as sessões que ESTE resgate consegue alcançar ───────────────
        --
        -- Este worker fala um transporte só, direto, e não resolve adapter: ele
@@ -665,7 +746,7 @@ export async function redriveQueued(
       const quando = agora();
       const vaga = await reservarVagaDoResgate(pool, m, quando, log);
       if (vaga !== 'reservada') {
-        log.info('watchdog: reenvio adiado — o número está sem vaga agora', {
+        log.info('watchdog: reenvio adiado — o número está sem vaga agora, ou fora da janela', {
           message_id: m.id,
           motivo: vaga,
           resposta: m.resposta,
@@ -675,9 +756,9 @@ export async function redriveQueued(
       // ─── O QUE MUDOU NA ESPERA DA VAGA VALE (F4q do cxj, Q03) ───
       //
       // A reserva espera a conexão e a trava do número; nesse tempo o operador pode pausar o
-      // canal, a sessão pode cair, o contato pode ser bloqueado, a organização pode parar, o modo
-      // de teste pode voltar, outro caminho pode mandar a mensagem, e o processo pode começar a
-      // desligar. A mesma conferência roda de novo, e o que
+      // canal, a sessão pode cair, o contato pode ser bloqueado ou passar para a equipe, a
+      // organização pode parar, o modo de teste pode voltar, outro caminho pode mandar a
+      // mensagem, e o processo pode começar a desligar. A mesma conferência roda de novo, e o que
       // ela barrar devolve a vaga: nada saiu. Falha de leitura também devolve, e não envia. Entre
       // ela e o `fetch` não há espera nenhuma.
       let depois: Elegibilidade;

@@ -25,6 +25,12 @@ import type { Logger } from "@/lib/agent-engine/obs/logger";
 import { redriveQueued, runSessionWatchdogLoop } from "@/lib/agent-engine/edge/crm/session-reconciler";
 
 const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as Logger;
+/**
+ * O relógio do resgate, fixo dentro da janela do número (11h em São Paulo): a reserva confere a
+ * janela do tipo da mensagem (F4r do cxj, R07), e o relógio de verdade fazia o caso depender da
+ * hora em que a suíte roda.
+ */
+const NA_JANELA = () => new Date("2026-11-18T14:00:00Z");
 
 const CFG = {
   wahaBaseUrl: "http://127.0.0.1:9",
@@ -89,8 +95,17 @@ function poolDoResgate(query: unknown): pg.Pool {
   return { query, connect: vi.fn(async () => conexaoDaVaga) } as unknown as pg.Pool;
 }
 
-/** Banco falso que DESCOBRE cada consulta pelo vocabulário, como o teste #652. */
-function bancoComFila(fila: Msg[], aoLerElegibilidade: () => void = () => undefined) {
+/**
+ * Banco falso que DESCOBRE cada consulta pelo vocabulário, como o teste #652. `aoLerParada` roda
+ * na leitura da régua do envio original (`readStopFlags`, F4r do cxj, R06), que não para ninguém.
+ * `metadata` é a do canal na releitura (`{ disabled: true }`, o canal pausado).
+ */
+function bancoComFila(
+  fila: Msg[],
+  aoLerElegibilidade: () => void = () => undefined,
+  aoLerParada: () => void = () => undefined,
+  metadata: object = {},
+) {
   const consultas: string[] = [];
   const query = vi.fn(async (sql: string) => {
     consultas.push(sql);
@@ -98,7 +113,11 @@ function bancoComFila(fila: Msg[], aoLerElegibilidade: () => void = () => undefi
     if (/select\s+m\.id/i.test(sql)) return { rows: fila.map((l) => ({ ...l })) };
     if (/select\s+s\.metadata/i.test(sql)) {
       aoLerElegibilidade();
-      return { rows: [{ metadata: {}, phone_number: "+5531999990000", operante: true }] };
+      return { rows: [{ metadata, phone_number: "+5531999990000", operante: true }] };
+    }
+    if (/as stopped/i.test(sql)) {
+      aoLerParada();
+      return { rows: [] };
     }
     return { rows: [] };
   });
@@ -165,10 +184,63 @@ describe("redrive: para entre itens, não cancela o envio em voo (#2823)", () =>
       CFG,
       log,
       controller.signal,
+      NA_JANELA,
     );
 
     expect(send, "o sinal chegou antes de qualquer POST — o lote não podia continuar").not.toHaveBeenCalled();
     expect(reenviadas).toBe(0);
+  });
+
+  it("abort DURANTE a releitura, com o canal pausado: nada é gravado depois do sinal, e a mensagem fica para o processo seguinte", async () => {
+    const controller = new AbortController();
+    const send = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ id: { id: "3EB0ABCDEF" } }), { status: 200 }),
+    );
+    const { query, consultas } = bancoComFila([msg("m-1")], () => controller.abort(), undefined, { disabled: true });
+
+    const reenviadas = await redriveQueued(
+      poolDoResgate(query),
+      CFG,
+      log,
+      controller.signal,
+      NA_JANELA,
+    );
+
+    expect(send).not.toHaveBeenCalled();
+    expect(reenviadas).toBe(0);
+    expect(
+      consultas.filter((sql) => /update messages/i.test(sql)),
+      "o processo de saída não grava o desfecho: o próximo tique confere a mensagem e grava",
+    ).toHaveLength(0);
+  });
+
+  it("abort DURANTE a leitura da parada, depois da vaga: nenhum envio nasce depois do sinal, e a vaga volta", async () => {
+    const controller = new AbortController();
+    const send = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ id: { id: "3EB0ABCDEF" } }), { status: 200 }),
+    );
+    let leiturasDaParada = 0;
+    // A 2ª leitura da parada é a da conferência de DEPOIS da vaga, a última antes do `fetch`.
+    const { query, consultas } = bancoComFila([msg("m-1")], undefined, () => {
+      leiturasDaParada += 1;
+      if (leiturasDaParada === 2) controller.abort();
+    });
+
+    const reenviadas = await redriveQueued(
+      poolDoResgate(query),
+      CFG,
+      log,
+      controller.signal,
+      NA_JANELA,
+    );
+
+    expect(leiturasDaParada).toBe(2);
+    expect(send, "o sinal chegou antes do POST — a mensagem não podia sair").not.toHaveBeenCalled();
+    expect(reenviadas).toBe(0);
+    expect(
+      consultas.filter((sql) => /delete from pacing_ledger/i.test(sql)),
+      "a vaga reservada para a mensagem que não saiu tem de voltar",
+    ).toHaveLength(1);
   });
 
   it("abort com o envio em voo: POST e recibo são únicos e nenhum segundo item sai", async () => {
@@ -184,6 +256,7 @@ describe("redrive: para entre itens, não cancela o envio em voo (#2823)", () =>
       CFG,
       log,
       controller.signal,
+      NA_JANELA,
     );
 
     expect(reenviadas, "o lote continuou depois do abort e mandou o item seguinte").toBe(1);

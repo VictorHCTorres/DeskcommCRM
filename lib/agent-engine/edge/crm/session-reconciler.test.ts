@@ -12,6 +12,13 @@ afterEach(() => vi.restoreAllMocks());
  * com vaga (nenhuma saída no dia, nenhuma recente). A prova da vaga no Postgres real está em
  * `tests/invariants/resgate-da-fila-conta-a-saida.test.ts`.
  */
+/**
+ * O relógio do resgate, fixo dentro da janela do número (11h em São Paulo). A reserva confere a
+ * janela do tipo da mensagem (F4r do cxj, R07): com o relógio de verdade, estes casos passavam ou
+ * falhavam conforme a hora em que a suíte rodasse.
+ */
+const NA_JANELA = () => new Date("2026-11-18T14:00:00Z");
+
 function poolDoResgate(query: unknown): pg.Pool {
   const conexaoDaVaga = {
     query: vi.fn(async (sql: string) =>
@@ -56,7 +63,7 @@ describe("redrive pré-go-live", () => {
     expect(await redriveQueued(poolDoResgate(query), {
       wahaBaseUrl: "http://127.0.0.1:9999", wahaApiKey: "test-key",
       intervalMs: 1, redriveMinAgeMs: 0, redriveBatchSize: 10, redriveSpacingMs: 0,
-    }, createLogger())).toBe(0);
+    }, createLogger(), undefined, NA_JANELA)).toBe(0);
     expect(send).not.toHaveBeenCalled();
     expect(query).toHaveBeenLastCalledWith(expect.stringContaining("m.organization_id = $2"), ["message-test", "org-test"]);
   });
@@ -143,7 +150,7 @@ describe("resgate da fila — a mensagem da AUTOMAÇÃO é alcançada (#652)", (
       redriveMinAgeMs: 0,
       redriveBatchSize: 10,
       redriveSpacingMs: 0,
-    }, createLogger());
+    }, createLogger(), undefined, NA_JANELA);
 
     expect(
       reenviadas,
@@ -180,7 +187,7 @@ describe("resgate da fila — a mensagem da AUTOMAÇÃO é alcançada (#652)", (
         redriveMinAgeMs: 0,
         redriveBatchSize: 10,
         redriveSpacingMs: 0,
-      }, createLogger()),
+      }, createLogger(), undefined, NA_JANELA),
     ).toBe(0);
     expect(send).not.toHaveBeenCalled();
   });
@@ -203,7 +210,7 @@ describe("redrive × organização parada", () => {
     expect(await redriveQueued(poolDoResgate(query), {
       wahaBaseUrl: "http://127.0.0.1:9999", wahaApiKey: "test-key",
       intervalMs: 1, redriveMinAgeMs: 0, redriveBatchSize: 10, redriveSpacingMs: 0,
-    }, createLogger())).toBe(0);
+    }, createLogger(), undefined, NA_JANELA)).toBe(0);
     expect(send).not.toHaveBeenCalled();
     expect(query.mock.calls[2]?.[0]).toContain("public.fn_org_operante(m.organization_id)");
     expect(query).toHaveBeenCalledWith(expect.stringContaining("error_code = 'org_suspensa'"), ["message-test", "org-test"]);
@@ -226,7 +233,7 @@ describe("redrive × canal pausado (#2318)", () => {
     expect(await redriveQueued(poolDoResgate(query), {
       wahaBaseUrl: "http://127.0.0.1:9999", wahaApiKey: "test-key",
       intervalMs: 1, redriveMinAgeMs: 0, redriveBatchSize: 10, redriveSpacingMs: 0,
-    }, createLogger())).toBe(0);
+    }, createLogger(), undefined, NA_JANELA)).toBe(0);
     expect(send).not.toHaveBeenCalled();
     expect(query).toHaveBeenCalledWith(expect.stringContaining("error_code = 'channel_disabled'"), ["message-test", "org-test"]);
   });
@@ -265,7 +272,7 @@ describe("redrive × ficha com telefone extra (Spec 31 B1)", () => {
     const reenviadas = await redriveQueued(poolDoResgate(query), {
       wahaBaseUrl: "http://127.0.0.1:9999", wahaApiKey: "test-key",
       intervalMs: 1, redriveMinAgeMs: 0, redriveBatchSize: 10, redriveSpacingMs: 0,
-    }, createLogger());
+    }, createLogger(), undefined, NA_JANELA);
 
     expect(reenviadas).toBe(1);
     const corpo = JSON.parse((send.mock.calls[0]![1] as { body: string }).body) as { chatId: string };
@@ -309,7 +316,7 @@ describe("redrive × campanha de prospecção (F4i)", () => {
       if (/from campaigns/i.test(sql)) return campanha(sql, params);
       return { rows: [] };
     });
-    const rodar = () => redriveQueued(poolDoResgate(query), CFG, createLogger());
+    const rodar = () => redriveQueued(poolDoResgate(query), CFG, createLogger(), undefined, NA_JANELA);
     const bloqueio = () => consultas.find((c) => c.sql.includes("error_code = 'campanha_sem_reenvio'"));
     const leuCampanha = () => consultas.filter((c) => /from campaigns/i.test(c.sql));
     return { send, rodar, bloqueio, leuCampanha };
@@ -452,7 +459,7 @@ describe("resgate × vaga no limite do número (F4p do cxj, P07)", () => {
     };
     const pool = { query, connect: vi.fn(async () => semVaga) } as unknown as pg.Pool;
 
-    expect(await redriveQueued(pool, CFG_DA_VAGA, createLogger())).toBe(0);
+    expect(await redriveQueued(pool, CFG_DA_VAGA, createLogger(), undefined, NA_JANELA)).toBe(0);
 
     expect(send).not.toHaveBeenCalled();
     expect(query).not.toHaveBeenCalledWith(expect.stringMatching(/update messages/i), expect.anything());
