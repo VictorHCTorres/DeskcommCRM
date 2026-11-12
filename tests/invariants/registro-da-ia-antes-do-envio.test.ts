@@ -2,7 +2,10 @@ import { randomUUID } from 'node:crypto';
 import pg from 'pg';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 
+import { enviarComFotos } from '@/lib/agent-engine/agent/fotos-do-produto';
+import { sendInBubbles } from '@/lib/agent-engine/agent/split-message';
 import type { ChannelSendResult } from '@/lib/agent-engine/channel-adapter';
+import { OrgNaoOperanteError } from '@/lib/organizacao/operante';
 import { pacingGate, runBeforeSend } from '@/lib/agent-engine/guardrails/before-send';
 import {
   loadPacingState,
@@ -439,4 +442,90 @@ describe('F4o/F4p no Postgres real · a saída da IA está no limite do número 
       await comPrazo(poolDeUm.end(), 2_000, 'pool preso').catch(() => undefined);
     }
   });
+});
+
+/**
+ * F4q do cxj (12/11/2026), Q01, no Postgres real: o envio composto (bolhas, fotos) que lança
+ * DEPOIS de uma mensagem física ter saído. A organização parada (`OrgNaoOperanteError`) era lida
+ * pela cadeia como prova de que nada saiu na chamada inteira, e o registro era apagado: com a 1ª
+ * bolha (ou a capa) já entregue, o número voltava a 59 de 60, e a reserva seguinte passava. Agora
+ * o erro carrega a marca da saída anterior, e o registro fica.
+ */
+describe('F4q no Postgres real · o envio composto que lança depois de uma saída mantém o registro (Q01)', () => {
+  /** O canal: a 1ª mensagem física sai; a 2ª encontra a organização parada. */
+  function canalQueParaNaSegunda(n: Numero) {
+    let saidas = 0;
+    const fisico = vi.fn(async (): Promise<ChannelSendResult> => {
+      if (saidas === 1) throw new OrgNaoOperanteError(n.org, 'suspended');
+      saidas += 1;
+      return ENVIADA;
+    });
+    return { fisico, saidas: () => saidas };
+  }
+
+  function composto(modo: 'bolhas' | 'fotos', fisico: () => Promise<ChannelSendResult>) {
+    return () =>
+      modo === 'bolhas'
+        ? sendInBubbles<ChannelSendResult>('Primeira parte.\n\nSegunda parte.', {
+            enabled: true,
+            maxChars: 600,
+            sleep: async () => {},
+            jitter: () => 0,
+            send: fisico,
+          })
+        : enviarComFotos<ChannelSendResult>(
+            'Legenda fictícia.',
+            [
+              { storagePath: 'ficticio/a.jpg', mime: 'image/jpeg' },
+              { storagePath: 'ficticio/b.jpg', mime: 'image/jpeg' },
+            ],
+            { enviarTexto: fisico, enviarFoto: fisico, sleep: async () => {}, jitter: () => 0 },
+          );
+  }
+
+  it.each([
+    ['bolhas', false],
+    ['fotos', false],
+    ['bolhas', true],
+    ['fotos', true],
+  ] as const)('%s, resposta=%s: a 1ª saiu e a 2ª encontrou a organização parada; o registro fica', async (modo, resposta) => {
+    const n = await numeroCom59();
+    const canal = canalQueParaNaSegunda(n);
+
+    const fim = await agente(n, composto(modo, canal.fisico), { resposta }).resultado.then(
+      () => null,
+      (erro: unknown) => erro,
+    );
+
+    expect(fim).toBeInstanceOf(OrgNaoOperanteError);
+    expect(canal.saidas()).toBe(1);
+    const estado = await estadoDoNumero(n);
+    expect({ hoje: estado.sentToday, ultima: estado.lastSentAt?.getTime() }).toEqual({
+      hoje: resposta ? 59 : 60,
+      ultima: AGORA.getTime(),
+    });
+    expect(await reservarVaga(pool, n.org, n.numero, new Date(+AGORA + 1_000), REGRA)).toBe(
+      resposta ? 'intervalo' : 'teto_cheio',
+    );
+  });
+
+  it.each(['bolhas', 'fotos'] as const)(
+    'controle (%s): a organização parada já na 1ª mensagem, nada saiu, e o registro é apagado',
+    async (modo) => {
+      const n = await numeroCom59();
+      const fisico = vi.fn(async (): Promise<ChannelSendResult> => {
+        throw new OrgNaoOperanteError(n.org, 'suspended');
+      });
+
+      const fim = await agente(n, composto(modo, fisico)).resultado.then(
+        () => null,
+        (erro: unknown) => erro,
+      );
+
+      expect(fim).toBeInstanceOf(OrgNaoOperanteError);
+      expect(fisico).toHaveBeenCalledTimes(1);
+      expect((await estadoDoNumero(n)).sentToday).toBe(59);
+      expect(await reservarVaga(pool, n.org, n.numero, new Date(+AGORA + 1_000), REGRA)).toBe('reservada');
+    },
+  );
 });

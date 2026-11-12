@@ -30,6 +30,7 @@ import type { ChannelSendResult } from '@/lib/agent-engine/channel-adapter';
 import { runBeforeSend, type RunBeforeSendArgs } from '@/lib/agent-engine/guardrails/before-send';
 import { sendInBubbles } from '@/lib/agent-engine/agent/split-message';
 import { OrgNaoOperanteError } from '@/lib/organizacao/operante';
+import { erroComSaidaParcial } from '@/lib/agent-engine/saida-parcial';
 
 const ORG = '00000000-0000-4000-8000-000000000001';
 const NUMERO = '00000000-0000-4000-8000-000000000004';
@@ -421,5 +422,80 @@ describe('F4q · envio composto: a mensagem que saiu em parte fica no limite do 
 
     expect(banco.eventos).toContain('apagou:2');
     expect(banco.linhas('pacing_ledger')).toEqual([]);
+  });
+});
+
+/**
+ * F4q do cxj (Q01) · a organização que para NO MEIO de um envio composto. A 1ª bolha saiu, e a
+ * seguinte lança `OrgNaoOperanteError` (o handler barra cada mensagem física): o erro chega
+ * marcado (`erroSaiuEmParte`), e a cadeia mantém a linha e a cópia. Sem a marca (nada saiu nesta
+ * chamada), ela as apaga, como antes. A marca nas bolhas e nas fotos está provada em
+ * `tests/unit/envio-composto-saiu-em-parte.test.ts`; no Postgres real, em
+ * `tests/invariants/registro-da-ia-antes-do-envio.test.ts`.
+ */
+describe('F4q do cxj (Q01) · a organização que para no meio de um envio composto', () => {
+  const DUAS_BOLHAS = 'Primeira parte.\n\nSegunda parte.';
+
+  /** As bolhas pelo canal falso, que lança `erro` na chamada `lancarNa` (1 = a 1ª) e manda as outras. */
+  function bolhasQueLancamNa(lancarNa: number, erro: unknown): RunBeforeSendArgs['send'] {
+    let chamadas = 0;
+    return (corpo) =>
+      sendInBubbles(corpo, {
+        enabled: true,
+        maxChars: 600,
+        sleep: async () => {},
+        jitter: () => 0,
+        send: async () => {
+          chamadas += 1;
+          if (chamadas === lancarNa) throw erro;
+          return ENVIADA;
+        },
+      });
+  }
+
+  it.each([false, true])(
+    'a 1ª bolha saiu e a 2ª lança (resposta=%s): a linha e a cópia ficam, e o mesmo erro sobe',
+    async (resposta) => {
+      const banco = bancoFalso();
+      const erro = new OrgNaoOperanteError(ORG, 'suspended');
+
+      await expect(
+        runBeforeSend(argsDoTurno(banco.pool, bolhasQueLancamNa(2, erro), { resposta, body: DUAS_BOLHAS })),
+      ).rejects.toBe(erro);
+
+      expect(banco.eventos.filter((e) => e.startsWith('apagou'))).toEqual([]);
+      expect(banco.eventos.at(-1)).toBe('auditoria');
+      expect(banco.linhas('pacing_ledger').map((l) => l.params)).toEqual([[ORG, NUMERO, AGORA, resposta]]);
+      expect(banco.linhas('outbound_copies')).toHaveLength(1);
+    },
+  );
+
+  it('o erro da organização que chega marcado, por qualquer envio composto: o registro fica', async () => {
+    const banco = bancoFalso();
+    const erro = erroComSaidaParcial(new OrgNaoOperanteError(ORG, 'suspended'), true);
+
+    await expect(
+      runBeforeSend(
+        argsDoTurno(banco.pool, async () => {
+          throw erro;
+        }),
+      ),
+    ).rejects.toBe(erro);
+
+    expect(banco.eventos.filter((e) => e.startsWith('apagou'))).toEqual([]);
+    expect(banco.linhas('pacing_ledger')).toHaveLength(1);
+  });
+
+  it('controle: a 1ª bolha já lança — nada saiu, e a linha e a cópia são apagadas', async () => {
+    const banco = bancoFalso();
+    const erro = new OrgNaoOperanteError(ORG, 'suspended');
+
+    await expect(
+      runBeforeSend(argsDoTurno(banco.pool, bolhasQueLancamNa(1, erro), { body: DUAS_BOLHAS })),
+    ).rejects.toBe(erro);
+
+    expect(banco.eventos.slice(-3)).toEqual(['release', 'apagou:2', 'auditoria']);
+    expect(banco.linhas('pacing_ledger')).toEqual([]);
+    expect(banco.linhas('outbound_copies')).toEqual([]);
   });
 });

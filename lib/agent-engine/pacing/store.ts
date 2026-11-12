@@ -259,6 +259,12 @@ export interface RegraDaVaga {
   intervaloMs: number;
   /** Quanto esperar pela trava do número antes de desistir; o padrão é `ESPERA_PELA_TRAVA_MS`. */
   esperaMs?: number;
+  /**
+   * A vaga é de uma RESPOSTA a quem escreveu (a resposta presa que o resgate da fila manda, F4q do
+   * cxj, Q08): a linha é gravada com `resposta = true`, conta no intervalo e não gasta o teto do
+   * dia, e o `limite` não é conferido — a mesma conta de `loadPacingState`. Omitir = disparo.
+   */
+  resposta?: boolean;
 }
 
 /** O que a reserva fez: gravou a vaga, ou não havia vaga (o teto do dia, ou o intervalo do número). */
@@ -272,8 +278,9 @@ export type ReservaDaVaga = 'reservada' | 'teto_cheio' | 'intervalo';
 export const ESPERA_PELA_TRAVA_MS = 15_000;
 
 /**
- * Reserva a vaga de um DISPARO do número: confere o teto do dia e o intervalo e grava
- * a linha no ledger numa transação só, sob o `pg_advisory_xact_lock(hashtext(número))`
+ * Reserva a vaga de um DISPARO do número (ou, com `regra.resposta`, de uma resposta, que
+ * não confere o teto): confere o teto do dia e o intervalo e grava a linha no ledger numa
+ * transação só, sob o `pg_advisory_xact_lock(hashtext(número))`
  * da cadeia do agente (`before-send.ts`, INBOX-008). Quem chega depois espera a vez e
  * relê o ledger já com a vaga de quem passou.
  *
@@ -313,8 +320,9 @@ export async function reservarVaga(
     );
     const doDia = Number(rows[0]?.do_dia ?? 0);
     const ultimo = rows[0]?.ultimo ?? null;
+    const resposta = regra.resposta === true;
     const semVaga: ReservaDaVaga | null =
-      regra.limite !== null && doDia + regra.vagas > regra.limite
+      !resposta && regra.limite !== null && doDia + regra.vagas > regra.limite
         ? 'teto_cheio'
         : regra.intervaloMs > 0 &&
             ultimo !== null &&
@@ -327,8 +335,8 @@ export async function reservarVaga(
     }
     await client.query(
       `insert into pacing_ledger (organization_id, channel_session_id, sent_at, resposta)
-       values ($1, $2, $3, false)`,
-      [tenantId, channelSessionId, sentAt],
+       values ($1, $2, $3, $4)`,
+      [tenantId, channelSessionId, sentAt, resposta],
     );
     await client.query('commit');
     return 'reservada';
@@ -343,7 +351,10 @@ export async function reservarVaga(
 
 /**
  * Devolve a vaga de um disparo que NÃO saiu: tira UMA linha de disparo (nunca a
- * de resposta) daquele número, naquele instante. Sem linha, não tira nada.
+ * de resposta) daquele número, naquele instante. Sem linha, não tira nada. Com
+ * `resposta: true`, tira a linha de RESPOSTA daquele instante (nunca a de disparo):
+ * a vaga que o resgate da fila reservou para uma resposta presa que o canal recusou
+ * (F4q do cxj, Q08).
  *
  * A campanha registra a vaga ANTES de o balão sair (`rodada.ts`), para nenhuma
  * mensagem sair fora do teto do número (revisão F4m do cxj, M01), e a devolve
@@ -355,13 +366,14 @@ export async function undoSend(
   tenantId: string,
   channelSessionId: string,
   sentAt: Date,
+  opts: { resposta?: boolean } = {},
 ): Promise<void> {
   await db.query(
     `delete from pacing_ledger
       where id = (select id from pacing_ledger
                    where organization_id = $1 and channel_session_id = $2
-                     and sent_at = $3 and not resposta
+                     and sent_at = $3 and resposta = $4
                    limit 1)`,
-    [tenantId, channelSessionId, sentAt],
+    [tenantId, channelSessionId, sentAt, opts.resposta === true],
   );
 }

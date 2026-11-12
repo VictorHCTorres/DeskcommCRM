@@ -102,6 +102,29 @@ describe("devolver a vaga no schema real", () => {
     expect(await linhas(outra)).toContainEqual({ quando: instante.getTime(), resposta: false });
   });
 
+  it("F4q do cxj (Q08) · com `resposta: true`, devolve a linha de RESPOSTA do instante, e o disparo do mesmo instante fica", async () => {
+    const instante = new Date(AGORA.getTime() + 240_000);
+    await recordSend(pool, org, outra, instante);
+    await recordSend(pool, org, outra, instante, { resposta: true });
+
+    await undoSend(pool, org, outra, instante, { resposta: true });
+
+    expect((await linhas(outra)).filter((l) => l.quando === instante.getTime())).toEqual([
+      { quando: instante.getTime(), resposta: false },
+    ]);
+  });
+
+  it("F4q do cxj (Q08) · com `resposta: true` e só o disparo no instante, não tira nada", async () => {
+    const instante = new Date(AGORA.getTime() + 300_000);
+    await recordSend(pool, org, outra, instante);
+
+    await undoSend(pool, org, outra, instante, { resposta: true });
+
+    expect((await linhas(outra)).filter((l) => l.quando === instante.getTime())).toEqual([
+      { quando: instante.getTime(), resposta: false },
+    ]);
+  });
+
   it("a linha do mesmo número e instante gravada com OUTRA organização não é devolvida", async () => {
     const instante = new Date(AGORA.getTime() + 180_000);
     await recordSend(pool, outraOrg, sessao, instante);

@@ -18,7 +18,7 @@ import { BUCKET_DAS_FOTOS, fotoPertenceAoProduto, mimeDaFoto } from '@/lib/catal
 import { createAdminClient } from '@/lib/supabase/admin';
 
 import type { Queryable } from '../queue/queue';
-import { comSaidaParcial, saiuAlgo } from '../saida-parcial';
+import { comSaidaParcial, erroComSaidaParcial, saiuAlgo } from '../saida-parcial';
 import { OK_KINDS, type BubbleOutcome } from './split-message';
 
 /** Teto de legenda de imagem do WhatsApp. Texto maior sai como texto, antes das fotos. */
@@ -161,16 +161,22 @@ export async function enviarComFotos<T extends BubbleOutcome>(
   const [capa, ...demais] = fotos;
   if (!capa || !cabeMaisUma()) return opts.enviarTexto(body);
   const legendaCabe = body.length <= LIMITE_DA_LEGENDA;
-  let ultimo = legendaCabe ? await opts.enviarFoto(capa, body) : await opts.enviarTexto(body);
   // Uma mensagem anterior saiu (a capa, o texto ou uma bolha dele): o desfecho final, se não for
   // `sent`, leva a marca, para quem conta a saída no limite do número não a apagar (F4q).
   let anteriorSaiu = false;
-  for (const foto of legendaCabe ? demais : fotos) {
-    if (!OK_KINDS.has(ultimo.kind)) return comSaidaParcial(ultimo, anteriorSaiu);
-    if (!cabeMaisUma()) return comSaidaParcial(ultimo, anteriorSaiu);
-    anteriorSaiu = anteriorSaiu || saiuAlgo(ultimo);
-    await opts.sleep(opts.jitter());
-    ultimo = await opts.enviarFoto(foto, '');
+  try {
+    let ultimo = legendaCabe ? await opts.enviarFoto(capa, body) : await opts.enviarTexto(body);
+    for (const foto of legendaCabe ? demais : fotos) {
+      if (!OK_KINDS.has(ultimo.kind)) return comSaidaParcial(ultimo, anteriorSaiu);
+      if (!cabeMaisUma()) return comSaidaParcial(ultimo, anteriorSaiu);
+      anteriorSaiu = anteriorSaiu || saiuAlgo(ultimo);
+      await opts.sleep(opts.jitter());
+      ultimo = await opts.enviarFoto(foto, '');
+    }
+    return comSaidaParcial(ultimo, anteriorSaiu);
+  } catch (erro) {
+    // O erro que sobe depois de uma saída (a organização parou entre as fotos) vai marcado; o que
+    // já vem marcado das bolhas do texto mantém a marca (F4q do cxj, Q01).
+    throw erroComSaidaParcial(erro, anteriorSaiu);
   }
-  return comSaidaParcial(ultimo, anteriorSaiu);
 }

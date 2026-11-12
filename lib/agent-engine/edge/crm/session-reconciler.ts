@@ -36,6 +36,7 @@ import { canalTemRiscoDeBanimento } from '@/lib/channels/capabilities';
 import type { Logger } from '../../obs/logger';
 import { dayStartInTz, tetoDoDia } from '../../pacing/engine';
 import { loadChannelKnobs, reservarVaga, undoSend, type ReservaDaVaga } from '../../pacing/store';
+import { KINDS_DE_RESPOSTA } from '../../queue/queue';
 
 export interface WatchdogConfig {
   wahaBaseUrl: string;
@@ -191,6 +192,11 @@ interface QueuedRow {
   /** O teto do CRM do número (`null` = sem teto) e o canal, para a regra da vaga. */
   daily_message_limit: number | null;
   provider: string | null;
+  /**
+   * A mensagem respondia a quem escreveu: o job da chave dela no `send_ledger` é um dos
+   * `KINDS_DE_RESPOSTA` (F4q do cxj, Q08). Sem o job (automação, sistema, linha antiga), `false`.
+   */
+  resposta: boolean;
 }
 
 /**
@@ -398,7 +404,9 @@ async function stampExternalIdAfterEcho(
  * Reserva a vaga de uma saída do resgate no limite diário do número (F4p do cxj, P07), com a
  * mesma regra da campanha (`rodada.ts`): o teto do dia (`tetoDoDia`: o aquecimento e o teto do
  * CRM) e o intervalo do número (o throttle, sem o jitter), conferidos e gravados por
- * `reservarVaga`, sob a trava do número que a cadeia do agente e a campanha também usam.
+ * `reservarVaga`, sob a trava do número que a cadeia do agente e a campanha também usam. A
+ * resposta presa reserva como resposta (F4q do cxj, Q08): conta no intervalo e não confere o teto
+ * do dia, como a cadeia faz com a resposta.
  */
 async function reservarVagaDoResgate(pool: pg.Pool, m: QueuedRow, quando: Date, log: Logger): Promise<ReservaDaVaga> {
   const { knobs, numberActivatedAt } = await loadChannelKnobs(pool, m.organization_id, m.channel_session_id, log);
@@ -414,24 +422,132 @@ async function reservarVagaDoResgate(pool: pg.Pool, m: QueuedRow, quando: Date, 
     desde: dayStartInTz(quando, knobs.timezone),
     vagas: 1,
     intervaloMs: banRisk ? knobs.throttleMs : 0,
+    resposta: m.resposta,
   });
 }
 
 /**
- * Devolve a vaga de uma saída do resgate que certamente não aconteceu (o WAHA recusou com 4xx).
- * Se o banco recusar, a vaga fica — o teto conta uma a mais, o lado seguro —, e o log diz.
+ * Devolve a vaga de uma saída do resgate que certamente não aconteceu: o WAHA recusou com 4xx, ou
+ * a conferência de depois da reserva barrou o envio (F4q do cxj, Q03). A linha devolvida é a do
+ * tipo reservado (disparo, ou resposta). Se o banco recusar, a vaga fica — o teto conta uma a
+ * mais, o lado seguro —, e o log diz.
  */
 async function devolverVagaDoResgate(pool: pg.Pool, m: QueuedRow, quando: Date, log: Logger): Promise<void> {
   try {
-    await undoSend(pool, m.organization_id, m.channel_session_id, quando);
+    await undoSend(pool, m.organization_id, m.channel_session_id, quando, { resposta: m.resposta });
   } catch (err) {
     log.error('watchdog: a vaga de um reenvio que não saiu ficou no limite do número', {
       message_id: m.id,
       channel_session_id: m.channel_session_id,
       sent_at: quando.toISOString(),
+      resposta: m.resposta,
       error: (err instanceof Error ? err.message : String(err)).slice(0, 120),
     });
   }
+}
+
+/** O que a conferência da mensagem presa decidiu: ela pode sair; o processo está de saída; ou ela não sai. */
+type Elegibilidade = 'pode_sair' | 'desligando' | 'nao_sai';
+
+/**
+ * Relê o que decide se a mensagem presa ainda pode sair por este resgate: ela segue `queued`, a
+ * sessão do número segue no ar (`WORKING`) e o contato não foi bloqueado (as condições da consulta
+ * do resgate), a organização opera, o canal não está pausado, o modo de teste deixa o número, e ela
+ * não é de campanha de prospecção. Quando não pode, grava o desfecho na mensagem e diz `nao_sai`
+ * (a que deixou a fila, a da sessão fora do ar e a do contato bloqueado não são tocadas: ficam como
+ * a consulta do resgate as deixa). Roda ANTES da reserva da vaga e de novo DEPOIS dela (F4q do cxj,
+ * Q03): a reserva espera a conexão e a trava do número, e o que muda nessa espera vale. O
+ * desligamento é conferido depois de cada leitura (`desligando`); depois da última, nada mais
+ * espera até o `fetch`. Falha de leitura lança, e quem chama não envia.
+ */
+async function conferirElegibilidade(
+  pool: pg.Pool,
+  m: QueuedRow,
+  signal: AbortSignal | undefined,
+  log: Logger,
+): Promise<Elegibilidade> {
+  const { rows: acesso } = await pool.query<{ metadata: unknown; phone_number: string | null; operante: boolean }>(
+    `select s.metadata, c.phone_number, public.fn_org_operante(m.organization_id) as operante
+     from messages m
+     join channel_sessions s on s.id = m.channel_session_id and s.organization_id = m.organization_id
+     join contacts c on c.id = m.contact_id and c.organization_id = m.organization_id
+     where m.id = $1 and m.organization_id = $2 and m.status = 'queued'
+       and s.status = 'WORKING' and c.is_blocked = false`,
+    [m.id, m.organization_id],
+  );
+  // ABORT DURANTE a espera de elegibilidade (#2823): a releitura terminou e
+  // NADA foi enviado ainda, então parar aqui não larga envio no meio — é a
+  // mesma "para entre itens", no ponto em que o item ainda é barato de
+  // recusar. Sem esta linha o `fetch` rodava com o processo já de saída, e o
+  // lote continuaria até o fim.
+  if (signal?.aborted) return 'desligando';
+  const atual = acesso[0];
+  if (!atual) return 'nao_sai';
+  // Organização parada não fala: o resgate direto ao WAHA não pode ser a
+  // porta dos fundos da suspensão. Mesmo desfecho que a suspensão grava.
+  if (atual.operante !== true) {
+    await pool.query(
+      `update messages set status = 'failed', error_code = 'org_suspensa',
+         error_message = 'Envio automático bloqueado: a organização está suspensa.'
+       where id = $1 and organization_id = $2 and status = 'queued'`,
+      [m.id, m.organization_id],
+    );
+    log.info('watchdog: reenvio bloqueado — organização não operante', { message_id: m.id });
+    return 'nao_sai';
+  }
+  // Canal PAUSADO pelo operador: a fila de antes da pausa não sai por aqui.
+  // `failed` e não `queued`, o mesmo desfecho que o `messages/_handler`
+  // grava: deixá-la na fila faria o resgate mandar tudo de uma vez quando o
+  // operador retomasse o canal.
+  if (canalDesativado(atual.metadata)) {
+    await pool.query(
+      `update messages set status = 'failed', error_code = 'channel_disabled',
+         error_message = 'Este canal está desativado. Reative-o na Central de Conexões para voltar a enviar.'
+       where id = $1 and organization_id = $2 and status = 'queued'`,
+      [m.id, m.organization_id],
+    );
+    log.info('watchdog: reenvio bloqueado — canal pausado', { message_id: m.id });
+    return 'nao_sai';
+  }
+  if (preGoLiveAtivo(atual.metadata) && !numeroPodeTestar(atual.phone_number ?? '', lerNumerosDeTeste(atual.metadata))) {
+    await pool.query(
+      `update messages set status = 'failed', error_code = 'pre_go_live',
+         error_message = 'Envio automático bloqueado pelo modo de teste do canal.'
+       where id = $1 and organization_id = $2 and status = 'queued'`,
+      [m.id, m.organization_id],
+    );
+    log.info('watchdog: reenvio bloqueado pelo modo de teste', { message_id: m.id });
+    return 'nao_sai';
+  }
+  // A campanha de PROSPECÇÃO só sai pela rodada (F4i, A1 do cxj). Este
+  // resgate manda direto ao WAHA sem conferir a pessoa — se respondeu, foi
+  // para atendimento humano, recusou, entrou na lista de exclusão — nem a
+  // campanha, que pode ter sido cancelada enquanto o canal estava fora. A
+  // rodada tira a sua mensagem da fila física e devolve a pessoa à fila da
+  // campanha; o que sobrar aqui (o veto que não gravou, a linha de antes
+  // desta versão) vira `failed`. Só a campanha de consentimento segue como
+  // antes; campanha que não se acha conta como prospecção.
+  const campanhaId = campanhaDaMensagem(m.metadata);
+  if (campanhaId !== null) {
+    const { rows: campanha } = await pool.query<{ base_legal: string | null }>(
+      `select k.base_legal from campaigns k where k.organization_id = $1 and k.id::text = $2`,
+      [m.organization_id, campanhaId],
+    );
+    // O desligamento que começou durante esta leitura também para aqui, antes de qualquer envio
+    // (F4q do cxj, Q03): a releitura de cima já passou pela sua guarda.
+    if (signal?.aborted) return 'desligando';
+    if (campanha[0]?.base_legal !== 'consent') {
+      await pool.query(
+        `update messages set status = 'failed', error_code = 'campanha_sem_reenvio',
+           error_message = 'Não reenviada: a campanha de prospecção só manda pela rodada, que confere a pessoa de novo.'
+         where id = $1 and organization_id = $2 and status = 'queued'`,
+        [m.id, m.organization_id],
+      );
+      log.info('watchdog: reenvio bloqueado — mensagem de campanha de prospecção', { message_id: m.id });
+      return 'nao_sai';
+    }
+  }
+  return 'pode_sair';
 }
 
 /**
@@ -454,7 +570,15 @@ export async function redriveQueued(
   const { rows } = await pool.query<QueuedRow>(
     `select m.id, m.organization_id, m.conversation_id, m.contact_id, m.body, s.waha_session_name,
             c.wa_identity, c.wa_lid, c.phone_number, v.is_group, v.group_chat_id, m.metadata,
-            m.channel_session_id, s.daily_message_limit, s.provider
+            m.channel_session_id, s.daily_message_limit, s.provider,
+            -- A resposta presa (F4q do cxj, Q08): a mensagem do agente nasce com o id da chave do
+            -- send_ledger (send-message.ts), e o job da chave diz se ela respondia alguém.
+            exists (
+              select 1 from send_ledger l
+              join job_queue j on j.id = l.job_id and j.organization_id = l.organization_id
+              where l.organization_id = m.organization_id and l.id = m.id
+                and j.kind = any($3::text[])
+            ) as resposta
      from messages m
      join channel_sessions s on s.id = m.channel_session_id and s.organization_id = m.organization_id
      join conversations v on v.id = m.conversation_id and v.organization_id = m.organization_id
@@ -478,7 +602,7 @@ export async function redriveQueued(
        and m.created_at < now() - make_interval(secs => $1 / 1000.0)
      order by m.created_at
      limit $2`,
-    [cfg.redriveMinAgeMs, cfg.redriveBatchSize],
+    [cfg.redriveMinAgeMs, cfg.redriveBatchSize, [...KINDS_DE_RESPOSTA]],
   );
 
   // As que este resgate NÃO alcança. Não são reenviadas daqui — enviar em dobro
@@ -524,97 +648,52 @@ export async function redriveQueued(
       // A lista pode mudar enquanto a mensagem espera ou entre itens do lote.
       // Este redrive fala direto com o WAHA, portanto também precisa da guarda
       // do sink. Falha de leitura cai no catch e NÃO envia.
-      const { rows: acesso } = await pool.query<{ metadata: unknown; phone_number: string | null; operante: boolean }>(
-        `select s.metadata, c.phone_number, public.fn_org_operante(m.organization_id) as operante
-         from messages m
-         join channel_sessions s on s.id = m.channel_session_id and s.organization_id = m.organization_id
-         join contacts c on c.id = m.contact_id and c.organization_id = m.organization_id
-         where m.id = $1 and m.organization_id = $2 and m.status = 'queued'`,
-        [m.id, m.organization_id],
-      );
-      // ABORT DURANTE a espera de elegibilidade (#2823): a releitura terminou e
-      // NADA foi enviado ainda, então parar aqui não larga envio no meio — é a
-      // mesma "para entre itens", no ponto em que o item ainda é barato de
-      // recusar. Sem esta linha o `fetch` de baixo rodava com o processo já de
-      // saída, e o lote continuaria até o fim.
-      if (signal?.aborted) break;
-      const atual = acesso[0];
-      if (!atual) continue;
-      // Organização parada não fala: o resgate direto ao WAHA não pode ser a
-      // porta dos fundos da suspensão. Mesmo desfecho que a suspensão grava.
-      if (atual.operante !== true) {
-        await pool.query(
-          `update messages set status = 'failed', error_code = 'org_suspensa',
-             error_message = 'Envio automático bloqueado: a organização está suspensa.'
-           where id = $1 and organization_id = $2 and status = 'queued'`,
-          [m.id, m.organization_id],
-        );
-        log.info('watchdog: reenvio bloqueado — organização não operante', { message_id: m.id });
-        continue;
-      }
-      // Canal PAUSADO pelo operador: a fila de antes da pausa não sai por aqui.
-      // `failed` e não `queued`, o mesmo desfecho que o `messages/_handler`
-      // grava: deixá-la na fila faria o resgate mandar tudo de uma vez quando o
-      // operador retomasse o canal.
-      if (canalDesativado(atual.metadata)) {
-        await pool.query(
-          `update messages set status = 'failed', error_code = 'channel_disabled',
-             error_message = 'Este canal está desativado. Reative-o na Central de Conexões para voltar a enviar.'
-           where id = $1 and organization_id = $2 and status = 'queued'`,
-          [m.id, m.organization_id],
-        );
-        log.info('watchdog: reenvio bloqueado — canal pausado', { message_id: m.id });
-        continue;
-      }
-      if (preGoLiveAtivo(atual.metadata) && !numeroPodeTestar(atual.phone_number ?? '', lerNumerosDeTeste(atual.metadata))) {
-        await pool.query(
-          `update messages set status = 'failed', error_code = 'pre_go_live',
-             error_message = 'Envio automático bloqueado pelo modo de teste do canal.'
-           where id = $1 and organization_id = $2 and status = 'queued'`,
-          [m.id, m.organization_id],
-        );
-        log.info('watchdog: reenvio bloqueado pelo modo de teste', { message_id: m.id });
-        continue;
-      }
-      // A campanha de PROSPECÇÃO só sai pela rodada (F4i, A1 do cxj). Este
-      // resgate manda direto ao WAHA sem conferir a pessoa — se respondeu, foi
-      // para atendimento humano, recusou, entrou na lista de exclusão — nem a
-      // campanha, que pode ter sido cancelada enquanto o canal estava fora. A
-      // rodada tira a sua mensagem da fila física e devolve a pessoa à fila da
-      // campanha; o que sobrar aqui (o veto que não gravou, a linha de antes
-      // desta versão) vira `failed`. Só a campanha de consentimento segue como
-      // antes; campanha que não se acha conta como prospecção.
-      const campanhaId = campanhaDaMensagem(m.metadata);
-      if (campanhaId !== null) {
-        const { rows: campanha } = await pool.query<{ base_legal: string | null }>(
-          `select k.base_legal from campaigns k where k.organization_id = $1 and k.id::text = $2`,
-          [m.organization_id, campanhaId],
-        );
-        if (campanha[0]?.base_legal !== 'consent') {
-          await pool.query(
-            `update messages set status = 'failed', error_code = 'campanha_sem_reenvio',
-               error_message = 'Não reenviada: a campanha de prospecção só manda pela rodada, que confere a pessoa de novo.'
-             where id = $1 and organization_id = $2 and status = 'queued'`,
-            [m.id, m.organization_id],
-          );
-          log.info('watchdog: reenvio bloqueado — mensagem de campanha de prospecção', { message_id: m.id });
-          continue;
-        }
-      }
+      const antes = await conferirElegibilidade(pool, m, signal, log);
+      if (antes === 'desligando') break;
+      if (antes === 'nao_sai') continue;
       // ─── A VAGA NO LIMITE DO NÚMERO, ANTES DE MANDAR (F4p do cxj, P07) ───
       //
       // Este resgate manda direto ao WAHA, por fora da cadeia do agente, e não contava a saída:
       // com 59 de 60 no dia, a campanha seguinte liberava a 61ª; depois de uma resposta
       // resgatada, passava 1 s depois. Agora ele reserva a vaga como a campanha: o teto do dia e
       // o intervalo do número, conferidos e gravados sob a trava do número. Sem vaga, nada sai, e
-      // a mensagem fica `queued` para o próximo tique (ou para o job, que reagenda com a mesma
-      // chave e a manda pela cadeia). A reserva conta como disparo: o resgate não sabe se a
-      // mensagem respondia alguém, e contar a mais é o lado seguro. Erro na reserva cai no
-      // `catch` de baixo, antes de qualquer envio.
+      // a mensagem fica `queued` para o próximo tique. A resposta presa (o job que a mandou é um
+      // dos `KINDS_DE_RESPOSTA`) reserva como resposta, como a cadeia a contaria: conta no
+      // intervalo e não gasta o teto do dia, e não espera o dia seguinte com o teto batido (F4q
+      // do cxj, Q08). Sem o job, ela conta como disparo: a mais, o lado seguro. Erro na reserva
+      // cai no `catch` de baixo, antes de qualquer envio.
       const quando = agora();
       const vaga = await reservarVagaDoResgate(pool, m, quando, log);
       if (vaga !== 'reservada') {
-        log.info('watchdog: reenvio adiado — o número está sem vaga agora', { message_id: m.id, motivo: vaga });
+        log.info('watchdog: reenvio adiado — o número está sem vaga agora', {
+          message_id: m.id,
+          motivo: vaga,
+          resposta: m.resposta,
+        });
+        continue;
+      }
+      // ─── O QUE MUDOU NA ESPERA DA VAGA VALE (F4q do cxj, Q03) ───
+      //
+      // A reserva espera a conexão e a trava do número; nesse tempo o operador pode pausar o
+      // canal, a sessão pode cair, o contato pode ser bloqueado, a organização pode parar, o modo
+      // de teste pode voltar, outro caminho pode mandar a mensagem, e o processo pode começar a
+      // desligar. A mesma conferência roda de novo, e o que
+      // ela barrar devolve a vaga: nada saiu. Falha de leitura também devolve, e não envia. Entre
+      // ela e o `fetch` não há espera nenhuma.
+      let depois: Elegibilidade;
+      try {
+        depois = await conferirElegibilidade(pool, m, signal, log);
+      } catch (err) {
+        await devolverVagaDoResgate(pool, m, quando, log);
+        throw err;
+      }
+      if (depois !== 'pode_sair') {
+        await devolverVagaDoResgate(pool, m, quando, log);
+        log.info('watchdog: reenvio desfeito — a mensagem mudou enquanto esperava a vaga, e a vaga voltou', {
+          message_id: m.id,
+          motivo: depois,
+        });
+        if (depois === 'desligando') break;
         continue;
       }
       const res = await fetch(`${cfg.wahaBaseUrl}/api/sendText`, {

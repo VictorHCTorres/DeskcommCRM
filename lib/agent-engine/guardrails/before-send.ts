@@ -46,7 +46,12 @@ import { assertMeetingDeliveryPg, type MeetingDeliveryContext } from '@/lib/agen
  * (`redriveQueued`) reserva a vaga do mesmo jeito antes de mandar.
  */
 import type pg from 'pg';
-import { saiuAlgo, type ChannelSendResult, type MarcaDeSaidaParcial } from '../channel-adapter';
+import {
+  erroSaiuEmParte,
+  saiuAlgo,
+  type ChannelSendResult,
+  type MarcaDeSaidaParcial,
+} from '../channel-adapter';
 
 import type { Logger } from '../obs/logger';
 import { emitVetoActivity } from '@/lib/leads/veto-activity';
@@ -1979,10 +1984,12 @@ async function enviarComORegistroConfirmado(
     outcome = await args.send(decisao.corpo);
   } catch (erroDoEnvio) {
     // Organização parada: o handler barra na primeira linha (`assertOrgOperante`), antes de
-    // gravar a mensagem e de chamar o canal — nada saiu. Outro erro deixa a saída incerta (o
-    // provedor pode ter aceitado antes do erro, como no `store.update` do `sendWithLedger`), e
-    // o registro fica: a mais, nunca a menos.
-    if (erroDoEnvio instanceof OrgNaoOperanteError)
+    // gravar a mensagem e de chamar o canal — nada saiu NESTA mensagem física. No envio composto
+    // (bolhas, fotos), uma anterior pode ter saído (a organização parou entre uma e outra): o erro
+    // chega marcado (`erroSaiuEmParte`), e o registro fica (F4q do cxj, Q01). Outro erro deixa a
+    // saída incerta (o provedor pode ter aceitado antes do erro, como no `store.update` do
+    // `sendWithLedger`), e o registro fica: a mais, nunca a menos.
+    if (erroDoEnvio instanceof OrgNaoOperanteError && !erroSaiuEmParte(erroDoEnvio))
       await apagarRegistroDaSaida(args, decisao.registro, 'org_nao_operante');
     // Auditoria da tentativa que ERROU (ex.: envio com o transporte fora): autônoma no pool.
     await persistTrace(args, decisao.trace, null);
@@ -1991,8 +1998,9 @@ async function enviarComORegistroConfirmado(
   // Só 'sent' saiu agora — ou, no envio composto (bolhas, fotos), uma mensagem física anterior à
   // última (`saiuEmParte`, F4q). 'already_sent' foi contado na tentativa original (o ledger F2-06
   // curto-circuita a repetição); 'queued', 'failed', 'blocked' e 'unavailable' não saíram, e quem
-  // os manda depois conta a própria saída: o job, que reagenda com a mesma chave e passa por esta
-  // cadeia de novo, ou o resgate da fila, que reserva a vaga antes de mandar (`redriveQueued`).
+  // os manda depois conta a própria saída: a mensagem 'queued' fica na fila física, e o resgate
+  // (`redriveQueued`) reserva a vaga antes de mandá-la — como resposta, quando o job que a mandou
+  // responde a quem escreveu (F4q do cxj, Q08); a nova tentativa de um job passa por esta cadeia.
   if (!saiuAlgo(outcome)) await apagarRegistroDaSaida(args, decisao.registro, outcome.kind);
   // Auditoria DURÁVEL por run (F4-08 acc 3), gravada sem a conexão da cadeia na mão (#2426, P05).
   // Autônoma no pool; falha vira log.error (o logger é o backup).

@@ -94,7 +94,13 @@ export type ChannelSendResult =
 
 // A marca do envio composto (bolhas, fotos) mora num módulo sem import (`saida-parcial.ts`), para os
 // testes das bolhas seguirem nas cercas; a cadeia de envio a lê por aqui, com o desfecho do canal.
-export { comSaidaParcial, saiuAlgo, type MarcaDeSaidaParcial } from './saida-parcial';
+export {
+  comSaidaParcial,
+  erroComSaidaParcial,
+  erroSaiuEmParte,
+  saiuAlgo,
+  type MarcaDeSaidaParcial,
+} from './saida-parcial';
 
 /** Saúde da sessão do número no canal (o "session health" do adapter). */
 export interface ChannelSessionHealth {

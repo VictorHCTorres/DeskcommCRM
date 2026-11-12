@@ -317,3 +317,58 @@ describe("a reserva da vaga no schema real", () => {
     }
   });
 });
+
+/**
+ * F4q do cxj (Q08) · a vaga de uma RESPOSTA. O resgate da fila manda a resposta que ficou presa
+ * (o canal segurou a mensagem do turno de resposta) e a reserva como resposta: ela não gasta o teto
+ * do dia, como na cadeia do agente, mas conta no intervalo do número e é gravada com
+ * `resposta = true`, para não aparecer como disparo na contagem do dia.
+ */
+describe("F4q do cxj (Q08) · a reserva da vaga de uma resposta", () => {
+  async function linhasDoInstante(numero: string, quando: Date) {
+    const { rows } = await pool.query<{ resposta: boolean }>(
+      `select resposta from pacing_ledger
+        where organization_id = $1 and channel_session_id = $2 and sent_at = $3`,
+      [org, numero, quando],
+    );
+    return rows.map((r) => r.resposta);
+  }
+
+  it("com o teto batido, a resposta é reservada, gravada como resposta, e o dia continua em 60", async () => {
+    const numero = await novoNumero();
+    await disparos(numero, 60);
+
+    expect(await reservarVaga(pool, org, numero, AGORA, { ...TETO, resposta: true })).toBe("reservada");
+
+    expect(await linhasDoInstante(numero, AGORA)).toEqual([true]);
+    expect(await doDia(numero)).toBe(60);
+  });
+
+  it("a resposta conta no intervalo: com um envio há 1 s e intervalo de 30 s, não há vaga, e nada é gravado", async () => {
+    const numero = await novoNumero();
+    await recordSend(pool, org, numero, new Date(AGORA.getTime() - 1_000));
+
+    expect(
+      await reservarVaga(pool, org, numero, AGORA, { ...TETO, limite: null, intervaloMs: 30_000, resposta: true }),
+    ).toBe("intervalo");
+
+    expect(await linhasDoInstante(numero, AGORA)).toEqual([]);
+  });
+
+  it("a resposta reservada segura o intervalo do disparo seguinte", async () => {
+    const numero = await novoNumero();
+    await reservarVaga(pool, org, numero, AGORA, { ...TETO, resposta: true });
+
+    expect(
+      await reservarVaga(pool, org, numero, new Date(AGORA.getTime() + 1_000), { ...TETO, intervaloMs: 30_000 }),
+    ).toBe("intervalo");
+  });
+
+  it("controle: sem `resposta`, a vaga com o teto batido é recusada, como antes", async () => {
+    const numero = await novoNumero();
+    await disparos(numero, 60);
+
+    expect(await reservarVaga(pool, org, numero, AGORA, TETO)).toBe("teto_cheio");
+    expect(await linhasDoInstante(numero, AGORA)).toEqual([]);
+  });
+});

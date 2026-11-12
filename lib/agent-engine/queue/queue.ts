@@ -25,6 +25,15 @@ export type JobKind =
   | 'operator_turn'
   | 'transactional_delivery'
   | 'approved_reply';
+
+/**
+ * Os jobs que RESPONDEM a quem escreveu: a cadeia do agente manda a saída deles como resposta (o
+ * turno de resposta, `eTurnoDeResposta` em `inbound-turn.ts`, e a resposta aprovada,
+ * `approved-reply.ts`). O resgate da fila (`redriveQueued`) lê esta lista para mandar a resposta
+ * presa como resposta, com a vaga que conta no intervalo e não gasta o teto do dia (F4q do cxj,
+ * Q08). `tests/unit/kinds-de-resposta-batem-com-a-cadeia.test.ts` prende as duas classificações.
+ */
+export const KINDS_DE_RESPOSTA: readonly JobKind[] = ['inbound_turn', 'case_reply_turn', 'approved_reply'];
 export type JobStatus = 'pending' | 'running' | 'done' | 'failed' | 'dead';
 
 export interface JobRow {

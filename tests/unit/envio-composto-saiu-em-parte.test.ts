@@ -19,6 +19,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { enviarComFotos, type FotoParaEnvio } from '@/lib/agent-engine/agent/fotos-do-produto';
 import { sendInBubbles, type BubbleOutcome } from '@/lib/agent-engine/agent/split-message';
+import { erroSaiuEmParte } from '@/lib/agent-engine/saida-parcial';
 
 const TRES_BOLHAS = 'Primeira parte.\n\nSegunda parte.\n\nTerceira parte.';
 const FOTO: FotoParaEnvio = { storagePath: 'org/conversa/catalogo-1.jpg', mime: 'image/jpeg' };
@@ -159,5 +160,138 @@ describe('F4q · enviarComFotos: a marca atravessa as fotos e as bolhas', () => 
 
     expect(r.kind).toBe('failed');
     expect(r.saiuEmParte).toBeUndefined();
+  });
+});
+
+/**
+ * F4q do cxj (Q01) · o erro que sobe DEPOIS de uma mensagem física desta chamada sair. A
+ * organização parada lança (`OrgNaoOperanteError`) na mensagem seguinte, e a cadeia, que lê esse
+ * erro como "nada saiu", apagava o registro da que saiu. O erro sobe o MESMO objeto, com a mesma
+ * classe (a organização parada encerra o job), e a marca fica guardada fora dele:
+ * `erroSaiuEmParte`. Quem lê a marca é `runBeforeSend`
+ * (`tests/unit/registro-da-ia-antes-do-envio.test.ts`).
+ */
+describe('F4q do cxj (Q01) · o erro que sobe depois de uma saída leva a marca', () => {
+  /** Classe local: o arquivo não importa o erro da organização (que puxa o handler da API). */
+  class ErroDoCanal extends Error {}
+
+  /** O canal falso: devolve os desfechos na ordem e, na chamada `lancarNa` (1 = a 1ª), lança. */
+  function canalQueLanca(kinds: string[], lancarNa: number, erro: unknown) {
+    const fila = [...kinds];
+    let chamadas = 0;
+    return vi.fn(async (_corpo: string): Promise<BubbleOutcome> => {
+      chamadas += 1;
+      if (chamadas === lancarNa) throw erro;
+      return { kind: fila.shift() ?? 'sent', messageId: null };
+    });
+  }
+
+  it.each([
+    [['sent'], 2],
+    [['sent', 'sent'], 3],
+    [['queued', 'sent'], 3],
+    [['sent', 'queued'], 3],
+  ])('bolhas %j e a chamada %i lança: o mesmo erro sobe, marcado', async (kinds, lancarNa) => {
+    const erro = new ErroDoCanal('a organização parou entre as bolhas');
+    const send = canalQueLanca(kinds, lancarNa, erro);
+
+    await expect(emBolhas(send)(TRES_BOLHAS)).rejects.toBe(erro);
+
+    expect(send).toHaveBeenCalledTimes(lancarNa);
+    expect(erroSaiuEmParte(erro)).toBe(true);
+  });
+
+  it.each([
+    [[], 1],
+    [['queued'], 2],
+    [['already_sent', 'queued'], 3],
+  ])('bolhas %j e a chamada %i lança: nada saiu nesta chamada, e o erro sobe sem marca', async (kinds, lancarNa) => {
+    const erro = new ErroDoCanal('a organização parou');
+
+    await expect(emBolhas(canalQueLanca(kinds, lancarNa, erro))(TRES_BOLHAS)).rejects.toBe(erro);
+
+    expect(erroSaiuEmParte(erro)).toBe(false);
+  });
+
+  it('a pausa entre as bolhas lança depois de a 1ª sair: marcado', async () => {
+    const erro = new ErroDoCanal('a pausa foi interrompida');
+    const send = canal(['sent']);
+
+    await expect(
+      sendInBubbles(TRES_BOLHAS, {
+        enabled: true,
+        maxChars: 600,
+        jitter: () => 0,
+        sleep: async () => {
+          throw erro;
+        },
+        send,
+      }),
+    ).rejects.toBe(erro);
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(erroSaiuEmParte(erro)).toBe(true);
+  });
+
+  it('a capa saiu com a legenda e a foto seguinte lança: marcado', async () => {
+    const erro = new ErroDoCanal('a organização parou entre as fotos');
+    const fotos = canalQueLanca(['sent'], 2, erro);
+
+    await expect(
+      enviarComFotos('Legenda curta.', [FOTO, FOTO], comFotos(canal([]), (_foto, legenda) => fotos(legenda))),
+    ).rejects.toBe(erro);
+
+    expect(erroSaiuEmParte(erro)).toBe(true);
+  });
+
+  it('o texto longo saiu inteiro pelas bolhas e a 1ª foto lança: marcado', async () => {
+    const erro = new ErroDoCanal('a organização parou antes da foto');
+    const textoLongo = `${'Uma frase longa sobre o produto. '.repeat(40)}\n\nOutra parte.`;
+    expect(textoLongo.length).toBeGreaterThan(1024); // o texto vai antes, em bolhas
+
+    await expect(
+      enviarComFotos(textoLongo, [FOTO], comFotos(emBolhas(canal([])), async () => Promise.reject(erro))),
+    ).rejects.toBe(erro);
+
+    expect(erroSaiuEmParte(erro)).toBe(true);
+  });
+
+  it('a 1ª bolha do texto longo saiu e a 2ª lança, dentro das fotos: a marca de dentro se mantém', async () => {
+    const erro = new ErroDoCanal('a organização parou entre as bolhas do texto');
+    const textoLongo = `${'Uma frase longa sobre o produto. '.repeat(40)}\n\nOutra parte.`;
+    const foto = vi.fn(async (): Promise<BubbleOutcome> => ({ kind: 'sent', messageId: null }));
+
+    await expect(
+      enviarComFotos(textoLongo, [FOTO], comFotos(emBolhas(canalQueLanca(['sent'], 2, erro)), foto)),
+    ).rejects.toBe(erro);
+
+    expect(foto).not.toHaveBeenCalled();
+    expect(erroSaiuEmParte(erro)).toBe(true);
+  });
+
+  it('a capa lança: nada saiu, sem marca', async () => {
+    const erro = new ErroDoCanal('a organização parou antes da capa');
+
+    await expect(
+      enviarComFotos('Legenda curta.', [FOTO, FOTO], comFotos(canal([]), async () => Promise.reject(erro))),
+    ).rejects.toBe(erro);
+
+    expect(erroSaiuEmParte(erro)).toBe(false);
+  });
+
+  it('a marca é do objeto: um erro novo, da mesma classe, não a herda', async () => {
+    const primeiro = new ErroDoCanal('primeira vez');
+    await expect(emBolhas(canalQueLanca(['sent'], 2, primeiro))(TRES_BOLHAS)).rejects.toBe(primeiro);
+
+    expect(erroSaiuEmParte(primeiro)).toBe(true);
+    expect(erroSaiuEmParte(new ErroDoCanal('outra vez'))).toBe(false);
+  });
+
+  it('o que não é objeto sobe como veio, e não há onde guardar a marca', async () => {
+    await expect(emBolhas(canalQueLanca(['sent'], 2, 'texto lançado'))(TRES_BOLHAS)).rejects.toBe('texto lançado');
+
+    expect(erroSaiuEmParte('texto lançado')).toBe(false);
+    expect(erroSaiuEmParte(null)).toBe(false);
+    expect(erroSaiuEmParte(undefined)).toBe(false);
   });
 });
