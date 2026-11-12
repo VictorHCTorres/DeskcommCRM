@@ -262,14 +262,19 @@ describe("a reserva da vaga no schema real", () => {
   });
 
   it("sem espera pedida, a reserva espera o padrão de 15 s pela trava e desiste", async () => {
+    // O número vai escrito, e não lido da constante: comparar com a própria constante
+    // deixaria passar qualquer valor dela (o arnês da v9 provou, com 1 s no lugar de 15).
+    // Os 15 s são o contrato da operação (F5-OPERACAO, seção 3).
+    const PADRAO_MS = 15_000;
+    expect(ESPERA_PELA_TRAVA_MS).toBe(PADRAO_MS);
     const numero = await novoNumero();
     const agente = await prenderONumero(numero);
     try {
       const inicio = Date.now();
       await expect(reservarVaga(pool, org, numero, AGORA, TETO)).rejects.toThrow(/lock/i);
       const esperou = Date.now() - inicio;
-      expect(esperou).toBeGreaterThanOrEqual(ESPERA_PELA_TRAVA_MS - 500);
-      expect(esperou).toBeLessThan(ESPERA_PELA_TRAVA_MS + 8_000);
+      expect(esperou).toBeGreaterThanOrEqual(PADRAO_MS - 500);
+      expect(esperou).toBeLessThan(PADRAO_MS + 8_000);
     } finally {
       await agente.query("rollback").catch(() => undefined);
       agente.release(true);
