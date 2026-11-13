@@ -98,7 +98,14 @@ function duble(respostas: Resposta[]) {
   const from = (tabela: string) => {
     tabelas.push(tabela);
     const r = respostas[Math.min(i++, respostas.length - 1)] ?? {};
-    const devolve = () => Promise.resolve({ data: r.data ?? null, error: r.error ?? null });
+    // Fork (D9): a lista recusa com 500 quando o PostgREST não devolve o total exato
+    // (`meta.total`/`meta.cortada`), então o dublê devolve `count` como o PostgREST real.
+    const devolve = () =>
+      Promise.resolve({
+        data: r.data ?? null,
+        error: r.error ?? null,
+        count: Array.isArray(r.data) ? r.data.length : null,
+      });
     const elo: Record<string, unknown> = {};
     for (const m of ["select", "insert", "update", "delete", "order", "in", "is", "neq"]) {
       elo[m] = () => elo;

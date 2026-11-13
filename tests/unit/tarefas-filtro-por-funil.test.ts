@@ -55,7 +55,10 @@ function fazerSupabase() {
   elo.select = (colunas: string) => (selects.push(colunas), elo);
   elo.eq = (coluna: string, valor: unknown) => (filtros.push(["eq", coluna, valor]), elo);
   elo.is = (coluna: string, valor: unknown) => (filtros.push(["is", coluna, valor]), elo);
-  elo.then = (res: (v: unknown) => unknown) => Promise.resolve({ data: [], error: null }).then(res);
+  // Fork (D9): a lista recusa com 500 quando o PostgREST não devolve o total exato
+  // (`meta.total`/`meta.cortada`), então o dublê devolve `count` como o PostgREST real.
+  elo.then = (res: (v: unknown) => unknown) =>
+    Promise.resolve({ data: [], error: null, count: 0 }).then(res);
   vi.mocked(createClient).mockResolvedValue({ from: () => elo } as never);
   return { filtros, selects };
 }
