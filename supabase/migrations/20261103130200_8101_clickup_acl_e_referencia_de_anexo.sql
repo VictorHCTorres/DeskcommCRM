@@ -26,7 +26,7 @@ grant execute on function public.fn_guard_clickup_attachment_quota() to service_
 grant execute on function public.fn_queue_clickup_asset_delete() to service_role;
 
 -- Defesa forward-safe para bancos em que uma reaplicação antiga do bloco
--- 0731 tenha removido a constraint. Não substitui a forma ampliada da 9097.
+-- 0731 tenha removido a constraint. Não substitui a forma ampliada da 8097.
 do $$
 begin
   if not exists (
