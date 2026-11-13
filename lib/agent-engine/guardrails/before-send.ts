@@ -2109,7 +2109,8 @@ async function enviarComORegistroConfirmado(
   // E a ordem (versão 18, F4w do cxj, W02): a mensagem que vence no último passo do handler fica na fila, e o turno
   // segue. A saída leva ao handler se este envio responde a quem escreveu, e a pergunta “há, nesta conversa, uma
   // resposta do agente retida e mais antiga do que esta mensagem?”, lida no banco: havendo, o texto não sai na frente
-  // dela (`lib/agent-engine/pacing/resposta-retida.ts`).
+  // dela (`lib/agent-engine/pacing/resposta-retida.ts`). Na versão 19 (F4x do cxj, X01 e X08), o handler também lê
+  // daqui se a mensagem de texto nasce com a marca de resposta: é a resposta ainda na fila que segura as seguintes.
   const saida =
     decisao.registro.folgaMs > 0 && args.relogio
       ? novaSaidaDoAgente(decisao.registro.instante, decisao.registro.folgaMs, args.relogio, {

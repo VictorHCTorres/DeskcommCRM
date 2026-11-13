@@ -11,6 +11,14 @@
  * texto não sai: fica na fila, com o motivo `atras_de_resposta_retida`, e sai depois da mais antiga. A resposta retida
  * leva a marca `queued_resposta`: é ela que segura as seguintes.
  *
+ * A MARCA NASCE COM A MENSAGEM (versão 19, F4x do cxj, 12/11/2026, X01 e X08). Na versão 18, a marca de resposta era
+ * gravada só na retenção, junto com o motivo, e o erro dessa gravação era ignorado: se ela falhasse, a linha ficava na
+ * fila sem a marca, fora da ordem, e a resposta seguinte passava na frente (X01). E a ordem pedia um dos dois motivos da
+ * cadeia: a nova tentativa com o canal fora do ar trocava o motivo, e a retida deixava de segurar a seguinte (X08).
+ * Agora a resposta de texto do agente é gravada já com a marca, e a pergunta da ordem conta a resposta que ainda está
+ * na fila, com qualquer motivo, ou sem nenhum. O motivo segue sendo gravado na retenção, com uma 2ª tentativa e o erro
+ * no log; ele informa a tela, e não decide mais a ordem.
+ *
  * Aqui, a metade do handler, com a pergunta em memória sobre a tabela viva do dublê. A consulta de verdade
  * (`haRespostaRetidaAntes`), a cadeia e o resgate estão em `tests/invariants/resposta-retida-na-ordem.test.ts`.
  */
@@ -19,9 +27,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { sendMessageHandler } from "@/app/api/v1/messages/_handler";
 import {
   ATRASO_MAXIMO_DA_SAIDA_DO_AGENTE_MS as FOLGA,
+  MARCA_DE_RESPOSTA_RETIDA,
   MOTIVO_DA_SAIDA_ATRAS_DE_RETIDA,
   MOTIVO_DA_SAIDA_VENCIDA,
-  MOTIVOS_DA_SAIDA_RETIDA,
   comSaidaDoAgente,
   novaSaidaDoAgente,
   saidaDoAgenteNoEscopo,
@@ -30,7 +38,14 @@ import {
 } from "@/lib/agent-engine/pacing/saida-do-agente";
 import type { HandlerCtx } from "@/lib/api/handlers/types";
 import type { SendMessageInput } from "@/lib/schemas";
-import { criarDubleDoHandler, type LinhaDoDuble } from "@/tests/helpers/duble-do-handler";
+import {
+  criarDubleDoHandler,
+  type LinhaDoDuble,
+  type OpcoesDoDubleDoHandler,
+} from "@/tests/helpers/duble-do-handler";
+
+/** O log de erro do handler: o que a gravação da retenção que falha deixa para quem opera. */
+const registro = vi.hoisted(() => ({ error: vi.fn() }));
 
 vi.mock("@/lib/channels/endereco-da-ultima-recebida", () => ({
   enderecoDaUltimaRecebida: vi.fn(async () => null),
@@ -45,7 +60,7 @@ vi.mock("@/lib/supabase/admin", () => ({
   }),
 }));
 vi.mock("@/lib/audit", () => ({ audit: vi.fn(async () => {}) }));
-vi.mock("@/lib/logger", () => ({ logger: { info: () => {}, warn: () => {}, error: () => {} } }));
+vi.mock("@/lib/logger", () => ({ logger: { info: () => {}, warn: () => {}, error: registro.error } }));
 
 const ORG = "11111111-1111-4111-8111-111111111111";
 const CONV = "22222222-2222-4222-8222-222222222222";
@@ -64,7 +79,13 @@ const boundary = {
   demanda_revision: null,
 };
 
-function montar() {
+interface OpcoesDaMontagem {
+  /** O estado da sessão do canal; fora de `WORKING`, o handler deixa a mensagem na fila antes de qualquer corte. */
+  sessao?: string;
+  mensagensIniciais?: LinhaDoDuble[];
+  erroAoAtualizarMensagem?: OpcoesDoDubleDoHandler["erroAoAtualizarMensagem"];
+}
+function montar(opcoes: OpcoesDaMontagem = {}) {
   const conversation = {
     ...boundary,
     id: CONV,
@@ -73,12 +94,14 @@ function montar() {
     group_chat_id: null,
     bot_silenced_until: null,
     contacts: { phone_number: "+5588999990000", wa_identity: null, wa_lid: null, is_blocked: false, is_personal: false },
-    channel_sessions: { provider: "waha", waha_session_name: "ficticia", status: "WORKING" },
+    channel_sessions: { provider: "waha", waha_session_name: "ficticia", status: opcoes.sessao ?? "WORKING" },
   };
   const duble = criarDubleDoHandler({
     conversation,
     chavePrimariaDaMensagem: true,
     rpcData: () => ({ ...boundary, status: "open", demanda_fechada_em: null }),
+    mensagensIniciais: opcoes.mensagensIniciais,
+    erroAoAtualizarMensagem: opcoes.erroAoAtualizarMensagem,
   });
   /** O que chegou ao provedor, na ordem: o texto, ou `[imagem]`. */
   const saidas: string[] = [];
@@ -97,7 +120,8 @@ function montar() {
 
 /**
  * A pergunta da ordem, em memória, sobre a tabela viva do dublê: a mesma que `haRespostaRetidaAntes` faz ao banco. A
- * mais antiga é a que entrou antes na tabela.
+ * mais antiga é a que entrou antes na tabela. Na versão 19, conta a resposta que ainda está na fila, com a marca, seja
+ * qual for o motivo.
  */
 function ordemEmMemoria(mensagens: LinhaDoDuble[], resposta = true) {
   const perguntas: Array<{ conversationId: string; messageId: string }> = [];
@@ -114,7 +138,6 @@ function ordemEmMemoria(mensagens: LinhaDoDuble[], resposta = true) {
           r.direction === "outbound" &&
           r.type === "text" &&
           r.status === "queued" &&
-          (MOTIVOS_DA_SAIDA_RETIDA as readonly string[]).includes(String(metadata.queued_reason)) &&
           metadata.queued_resposta === true
         );
       });
@@ -141,13 +164,17 @@ const metadataDe = (linha: LinhaDoDuble | undefined) => (linha?.metadata ?? {}) 
 afterEach(() => {
   vi.unstubAllEnvs();
   vi.unstubAllGlobals();
+  registro.error.mockClear();
 });
 
 describe("a ordem no escopo da saída do agente (versão 18)", () => {
   it("os dois motivos da mensagem retida pela cadeia do agente: por idade e por ordem", () => {
     expect(MOTIVO_DA_SAIDA_VENCIDA).toBe("saida_do_agente_vencida");
     expect(MOTIVO_DA_SAIDA_ATRAS_DE_RETIDA).toBe("atras_de_resposta_retida");
-    expect([...MOTIVOS_DA_SAIDA_RETIDA]).toEqual(["saida_do_agente_vencida", "atras_de_resposta_retida"]);
+  });
+
+  it("a marca de resposta, em `messages.metadata`: o nome que a pergunta da ordem lê no banco", () => {
+    expect(MARCA_DE_RESPOSTA_RETIDA).toBe("queued_resposta");
   });
 
   it("a saída do escopo é lida sem ser tomada: a 2ª mensagem física do envio também a acha", async () => {
@@ -359,5 +386,204 @@ describe("sendMessageHandler × a resposta retida (F4w, W02)", () => {
     await comSaidaDoAgente(vencida(null), () => sendMessageHandler(supabase, com(CHAVE_A), texto("Primeira")));
     await comSaidaDoAgente(dentro(null), () => sendMessageHandler(supabase, com(CHAVE_B), texto("Segunda")));
     expect(saidas).toEqual(["Segunda"]);
+  });
+});
+
+describe("sendMessageHandler × a marca que nasce com a mensagem (versão 19, F4x do cxj, X01 e X08)", () => {
+  const manual: HandlerCtx = { ...ctx, actor: { type: "user", id: "atendente-ficticia" } };
+  const imagem = {
+    conversation_id: CONV,
+    type: "image",
+    media_storage_path: `${ORG}/${CONV}/foto.jpg`,
+    media_mime: "image/jpeg",
+  } as SendMessageInput;
+  /** A recusa do banco, fictícia. */
+  const RECUSA = { code: "57014", message: "gravação recusada (fictícia)" };
+  /** A mensagem do agente que já estava na fila sem a marca: a que nasceu antes desta versão. */
+  const SEM_A_MARCA: LinhaDoDuble = {
+    id: CHAVE_A,
+    organization_id: ORG,
+    conversation_id: CONV,
+    contact_id: CONTACT,
+    channel_session_id: SESSION,
+    direction: "outbound",
+    type: "text",
+    status: "queued",
+    body: "Primeira",
+    sent_via: "ai",
+    metadata: { ai_actor_id: "agente-ficticio" },
+  };
+
+  it("⭐ a resposta de texto do agente nasce com a marca: a linha é gravada com ela, antes de qualquer corte", async () => {
+    const { supabase, saidas, mensagens, capturas } = montar();
+    const { ordem } = ordemEmMemoria(mensagens);
+    await comSaidaDoAgente(dentro(ordem), () => sendMessageHandler(supabase, com(CHAVE_A), texto("Primeira")));
+    expect(capturas.inserts.messages).toHaveLength(1);
+    expect(metadataDe(capturas.inserts.messages![0])).toMatchObject({ queued_resposta: true });
+    // Enviada, ela não segura ninguém: a pergunta só conta a que ainda está na fila.
+    expect(saidas).toEqual(["Primeira"]);
+    expect(mensagens[0]).toMatchObject({ status: "sent" });
+    await comSaidaDoAgente(dentro(ordem), () => sendMessageHandler(supabase, com(CHAVE_B), texto("Segunda")));
+    expect(saidas).toEqual(["Primeira", "Segunda"]);
+  });
+
+  it("controle: não nasce com a marca o envio do agente que não é resposta, nem a mídia, nem a saída sem a ordem, nem o envio manual", async () => {
+    const { supabase, mensagens, capturas } = montar();
+    const resposta = ordemEmMemoria(mensagens).ordem;
+    const naoResposta = ordemEmMemoria(mensagens, false).ordem;
+    await comSaidaDoAgente(dentro(naoResposta), () => sendMessageHandler(supabase, com(CHAVE_A), texto("Retorno")));
+    await comSaidaDoAgente(dentro(resposta), () => sendMessageHandler(supabase, com(CHAVE_B), imagem));
+    await comSaidaDoAgente(dentro(null), () => sendMessageHandler(supabase, com(CHAVE_C), texto("Sem a ordem")));
+    await sendMessageHandler(supabase, manual, texto("Manual"));
+    expect(capturas.inserts.messages).toHaveLength(4);
+    for (const linha of capturas.inserts.messages!) expect(metadataDe(linha)).not.toHaveProperty("queued_resposta");
+  });
+
+  it("a marca é do handler: a que vem no metadata de quem chama não é gravada, e o resto do metadata fica", async () => {
+    const { supabase, mensagens, capturas } = montar();
+    const forjada = (body: string) =>
+      ({ ...texto(body), metadata: { queued_resposta: true, origem: "integração" } }) as SendMessageInput;
+    await sendMessageHandler(supabase, manual, forjada("Manual"));
+    const naoResposta = ordemEmMemoria(mensagens, false).ordem;
+    await comSaidaDoAgente(dentro(naoResposta), () => sendMessageHandler(supabase, com(CHAVE_A), forjada("Retorno")));
+    expect(capturas.inserts.messages).toHaveLength(2);
+    for (const linha of capturas.inserts.messages!) {
+      expect(metadataDe(linha)).not.toHaveProperty("queued_resposta");
+      expect(metadataDe(linha)).toMatchObject({ origem: "integração" });
+    }
+  });
+
+  it("⭐ X01 do cxj: a gravação do motivo que falha não tira a resposta da ordem, e o erro fica no log", async () => {
+    const recusadas: LinhaDoDuble[] = [];
+    const { supabase, saidas, mensagens } = montar({
+      erroAoAtualizarMensagem: (patch) => {
+        if (metadataDe(patch).queued_reason !== "saida_do_agente_vencida") return null;
+        recusadas.push(patch);
+        return RECUSA;
+      },
+    });
+    const { ordem } = ordemEmMemoria(mensagens);
+    const primeira = await comSaidaDoAgente(vencida(ordem), () =>
+      sendMessageHandler(supabase, com(CHAVE_A), texto("Primeira")),
+    );
+    // Nada saiu, e a linha segue na fila: sem o motivo, que não gravou, e com a marca, que nasceu com ela.
+    expect(saidas).toEqual([]);
+    expect(primeira).toMatchObject({ status: "queued" });
+    expect(metadataDe(mensagens[0])).toMatchObject({ queued_resposta: true });
+    expect(metadataDe(mensagens[0])).not.toHaveProperty("queued_reason");
+    // A resposta seguinte espera atrás dela.
+    await comSaidaDoAgente(dentro(ordem), () => sendMessageHandler(supabase, com(CHAVE_B), texto("Segunda")));
+    expect(saidas).toEqual([]);
+    expect(metadataDe(mensagens[1])).toMatchObject({ queued_reason: "atras_de_resposta_retida", queued_resposta: true });
+    // Duas tentativas de gravar o motivo, e o erro no log, com a mensagem e o motivo que não gravou.
+    expect(recusadas).toHaveLength(2);
+    expect(registro.error).toHaveBeenCalledTimes(1);
+    expect(registro.error).toHaveBeenCalledWith("messages.send.retencao_sem_motivo", {
+      message_id: CHAVE_A,
+      organization_id: ORG,
+      motivo: "saida_do_agente_vencida",
+      erro: RECUSA.message,
+    });
+  });
+
+  it("a gravação do motivo que falha uma vez é tentada de novo: o motivo fica gravado, e nada vai para o log", async () => {
+    let tentativas = 0;
+    const { supabase, mensagens } = montar({
+      erroAoAtualizarMensagem: (patch) =>
+        metadataDe(patch).queued_reason === "saida_do_agente_vencida" && tentativas++ === 0 ? RECUSA : null,
+    });
+    const { ordem } = ordemEmMemoria(mensagens);
+    const primeira = await comSaidaDoAgente(vencida(ordem), () =>
+      sendMessageHandler(supabase, com(CHAVE_A), texto("Primeira")),
+    );
+    expect(tentativas).toBe(2);
+    expect(metadataDe(primeira as unknown as LinhaDoDuble)).toMatchObject({
+      queued_reason: "saida_do_agente_vencida",
+      queued_resposta: true,
+    });
+    expect(metadataDe(mensagens[0])).toMatchObject({ queued_reason: "saida_do_agente_vencida", queued_resposta: true });
+    expect(registro.error).not.toHaveBeenCalled();
+  });
+
+  it("⭐ a mensagem que nasceu sem a marca (antes desta versão) a ganha na nova tentativa do job, antes de qualquer saída", async () => {
+    const { supabase, saidas, mensagens } = montar({ sessao: "STOPPED", mensagensIniciais: [SEM_A_MARCA] });
+    const { ordem } = ordemEmMemoria(mensagens);
+    const retomada = await comSaidaDoAgente(dentro(ordem), () =>
+      sendMessageHandler(supabase, com(CHAVE_A), texto("Primeira")),
+    );
+    // O canal está fora do ar: a linha segue na fila, com o motivo dele, e já com a marca.
+    expect(saidas).toEqual([]);
+    expect(retomada).toMatchObject({ status: "queued" });
+    expect(mensagens).toHaveLength(1);
+    expect(metadataDe(mensagens[0])).toEqual({
+      ai_actor_id: "agente-ficticio",
+      queued_resposta: true,
+      queued_reason: "channel_session_not_working",
+    });
+  });
+
+  it("se a marca não grava na nova tentativa, nada sai e o erro sobe: a linha segue na fila, sem virar falha", async () => {
+    const { supabase, saidas, mensagens } = montar({
+      mensagensIniciais: [SEM_A_MARCA],
+      erroAoAtualizarMensagem: (patch) => (metadataDe(patch).queued_resposta === true ? RECUSA : null),
+    });
+    const { ordem } = ordemEmMemoria(mensagens);
+    await expect(
+      comSaidaDoAgente(dentro(ordem), () => sendMessageHandler(supabase, com(CHAVE_A), texto("Primeira"))),
+    ).rejects.toThrow("marca_de_resposta_nao_gravada");
+    expect(saidas).toEqual([]);
+    expect(mensagens).toHaveLength(1);
+    expect(mensagens[0]).toMatchObject({ status: "queued", metadata: { ai_actor_id: "agente-ficticio" } });
+    expect(metadataDe(mensagens[0])).not.toHaveProperty("queued_resposta");
+  });
+
+  it("a marca que falha uma vez na nova tentativa é gravada na 2ª, e o envio segue", async () => {
+    let tentativas = 0;
+    const { supabase, saidas, mensagens } = montar({
+      mensagensIniciais: [SEM_A_MARCA],
+      erroAoAtualizarMensagem: (patch) =>
+        !("status" in patch) && metadataDe(patch).queued_resposta === true && tentativas++ === 0 ? RECUSA : null,
+    });
+    const { ordem } = ordemEmMemoria(mensagens);
+    await comSaidaDoAgente(dentro(ordem), () => sendMessageHandler(supabase, com(CHAVE_A), texto("Primeira")));
+    expect(tentativas).toBe(2);
+    expect(saidas).toEqual(["Primeira"]);
+    expect(mensagens[0]).toMatchObject({ status: "sent" });
+    expect(metadataDe(mensagens[0])).toMatchObject({ queued_resposta: true });
+  });
+
+  it("a linha que some entre a leitura e a gravação da marca: nada sai, e o erro sobe", async () => {
+    let tabela: LinhaDoDuble[] = [];
+    const montagem = montar({
+      mensagensIniciais: [SEM_A_MARCA],
+      erroAoAtualizarMensagem: (patch) => {
+        // Outro processo apagou a linha: a gravação da marca não acha ninguém, sem erro do banco.
+        if (metadataDe(patch).queued_resposta === true) tabela.length = 0;
+        return null;
+      },
+    });
+    tabela = montagem.mensagens;
+    const { ordem } = ordemEmMemoria(montagem.mensagens);
+    await expect(
+      comSaidaDoAgente(dentro(ordem), () => sendMessageHandler(montagem.supabase, com(CHAVE_A), texto("Primeira"))),
+    ).rejects.toThrow("marca_de_resposta_nao_gravada");
+    expect(montagem.saidas).toEqual([]);
+  });
+
+  it("controle: na nova tentativa, a mensagem que já tem a marca não é regravada, e a que não é resposta segue sem ela", async () => {
+    const comAMarca = { ...SEM_A_MARCA, metadata: { ai_actor_id: "agente-ficticio", queued_resposta: true } };
+    const a = montar({ sessao: "STOPPED", mensagensIniciais: [comAMarca] });
+    await comSaidaDoAgente(dentro(ordemEmMemoria(a.mensagens).ordem), () =>
+      sendMessageHandler(a.supabase, com(CHAVE_A), texto("Primeira")),
+    );
+    // Uma gravação só: a do canal fora do ar.
+    expect(a.capturas.patches.messages).toHaveLength(1);
+    expect(metadataDe(a.mensagens[0])).toMatchObject({ queued_resposta: true, queued_reason: "channel_session_not_working" });
+    const b = montar({ sessao: "STOPPED", mensagensIniciais: [SEM_A_MARCA] });
+    await comSaidaDoAgente(dentro(ordemEmMemoria(b.mensagens, false).ordem), () =>
+      sendMessageHandler(b.supabase, com(CHAVE_A), texto("Retorno")),
+    );
+    expect(b.capturas.patches.messages).toHaveLength(1);
+    expect(metadataDe(b.mensagens[0])).not.toHaveProperty("queued_resposta");
   });
 });

@@ -220,8 +220,10 @@ const SEM_JOB_VIVO = `not exists (
 
 /**
  * A mensagem presa sem resposta retida mais antiga na conversa (versão 18, F4w do cxj, W02): a resposta do agente que
- * ficou na fila por idade, ou por ordem, sai antes do que veio depois dela. Fragmento de SQL sobre o alias `m` de
- * `messages`, na consulta do resgate e na releitura de `conferirElegibilidade`. A regra, a validade e o porquê estão em
+ * ficou na fila sai antes do que veio depois dela. Na versão 19 (F4x do cxj, X01 e X08), a resposta na fila conta com
+ * qualquer motivo, ou sem nenhum: a que venceu no último passo, a que esperou por ordem, a que achou o canal fora do
+ * ar, a que ainda está a caminho do provedor. Fragmento de SQL sobre o alias `m` de `messages`, na consulta do resgate
+ * e na releitura de `conferirElegibilidade`. A regra, a validade e o porquê estão em
  * `lib/agent-engine/pacing/resposta-retida.ts`.
  */
 const SEM_RESPOSTA_RETIDA_ANTES = `not ${respostaRetidaAntesSql('m')}`;
@@ -824,11 +826,12 @@ export async function redriveQueued(
        and ${SEM_JOB_VIVO}
        -- ─── A resposta retida mais antiga da conversa sai primeiro (versão 18, F4w do cxj, W02) ───
        --
-       -- A resposta do agente que ficou na fila por idade (ou atrás de outra) é mandada por este
-       -- resgate, ou pela nova tentativa do job dela. O que veio depois dela na conversa espera: a
-       -- mensagem com uma resposta retida mais antiga não entra no lote, nem quando a retida ainda é
-       -- de um job vivo. Sai uma por conversa a cada tique, da mais antiga para a mais nova; a
-       -- releitura de antes do envio (conferirElegibilidade) confere de novo.
+       -- A resposta do agente que ficou na fila (por idade, atrás de outra, pelo canal fora do ar:
+       -- na versão 19, com qualquer motivo) é mandada por este resgate, ou pela nova tentativa do
+       -- job dela. O que veio depois dela na conversa espera: a mensagem com uma resposta retida
+       -- mais antiga não entra no lote, nem quando a retida ainda é de um job vivo. Sai uma por
+       -- conversa a cada tique, da mais antiga para a mais nova; a releitura de antes do envio
+       -- (conferirElegibilidade) confere de novo.
        and ${SEM_RESPOSTA_RETIDA_ANTES}
        -- ─── Só as sessões que ESTE resgate consegue alcançar ───────────────
        --

@@ -77,6 +77,13 @@ export interface OpcoesDoDubleDoHandler {
    * agente entre uma bolha e outra.
    */
   agente?: LinhaDoDuble | null | (() => LinhaDoDuble | null);
+  /**
+   * A gravação que o banco recusa: para o `update` de `messages` com este patch, devolve o erro (e nada é gravado), ou
+   * `null` para gravar. É o que prova o que o handler faz quando a gravação da retenção falha (F4x do cxj, X01).
+   *
+   * LIGADO SÓ por quem prova a queda da gravação: nos demais casos, todo `update` grava.
+   */
+  erroAoAtualizarMensagem?: (patch: LinhaDoDuble) => { code: string; message: string } | null;
 }
 
 export interface RetornoDoDubleDoHandler {
@@ -404,6 +411,8 @@ export function criarDubleDoHandler(
           patch: LinhaDoDuble,
           filtros: Array<(r: LinhaDoDuble) => boolean>,
         ): { data: LinhaDoDuble | null; error: { code: string; message: string } | null } => {
+          const recusa = opcoes.erroAoAtualizarMensagem?.(patch) ?? null;
+          if (recusa) return { data: null, error: recusa };
           const alvos = filtrarMensagens(filtros);
           const externo = typeof patch.external_id === "string" ? patch.external_id : null;
           if (externo !== null && opcoes.indiceUnicoMensagem === true) {

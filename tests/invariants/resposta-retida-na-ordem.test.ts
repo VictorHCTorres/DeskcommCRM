@@ -14,6 +14,11 @@
  * mais antiga (por idade, ou por ordem). No handler, o texto espera atrás dela (`atras_de_resposta_retida`); no
  * resgate, a mensagem que tem uma resposta retida mais antiga na conversa fica para o tique seguinte.
  *
+ * A versão 19 (F4x do cxj, X01 e X08): a marca de resposta nasce com a mensagem, e a ordem conta a resposta do agente
+ * que ainda está na fila, com qualquer motivo, ou sem nenhum. Na 18, a marca era gravada só na retenção (se a gravação
+ * falhasse, a linha ficava fora da ordem: X01), e a ordem pedia um dos dois motivos da cadeia (a nova tentativa com o
+ * canal fora do ar trocava o motivo, e a retida deixava de segurar a seguinte: X08).
+ *
  * A metade do handler, com o dublê, está em `tests/unit/resposta-retida-espera-no-handler.test.ts`; a consulta
  * sozinha, em `tests/invariants/resposta-retida-consulta.test.ts`.
  */
@@ -62,10 +67,13 @@ const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
 let relogio = +agora;
 const saidas: string[] = [];
 const recusadas = new Set<string>();
+/** Roda enquanto o texto está no provedor, antes de ele aceitar: é o envio em curso. */
+let noProvedor: ((texto: string) => Promise<void>) | null = null;
 beforeEach(() => {
   relogio = +agora;
   saidas.length = 0;
   recusadas.clear();
+  noProvedor = null;
   vi.stubEnv("WAHA_API_BASE_URL", "http://127.0.0.1:3030");
   vi.stubEnv("WAHA_API_KEY", "ficticia");
   vi.stubGlobal(
@@ -74,6 +82,7 @@ beforeEach(() => {
       if (String(url).endsWith("/sendText")) {
         const texto = String(JSON.parse(String(init?.body ?? "{}")).text);
         if (recusadas.has(texto)) return new Response("recusada", { status: 400 });
+        await noProvedor?.(texto);
         saidas.push(texto);
       }
       return Response.json({ id: { id: `FICTICIA-${randomUUID()}` } });
@@ -238,6 +247,26 @@ async function presaSemJob(f: Fixture, body: string) {
     [id, f.org, f.conversa, f.contact, f.session, body],
   );
   return id;
+}
+
+/** O estado da sessão do canal: fora de `WORKING`, o handler deixa a mensagem na fila antes de qualquer corte. */
+const sessao = (f: Fixture, status: "WORKING" | "STOPPED") =>
+  pool.query("update channel_sessions set status=$2 where id=$1", [f.session, status]);
+/**
+ * O banco recusa toda gravação de `messages` que leve este motivo (a queda que o X01 do cxj injeta), até `desfazer`.
+ * As outras consultas passam.
+ */
+function recusarGravacaoDoMotivo(motivo: string) {
+  let recusas = 0;
+  const consultar = pool.query.bind(pool);
+  const espia = vi.spyOn(pool, "query").mockImplementation((async (...args: unknown[]) => {
+    if (String(args[0]).startsWith('update public."messages"') && JSON.stringify(args[1] ?? []).includes(motivo)) {
+      recusas++;
+      throw new Error("gravação recusada (fictícia)");
+    }
+    return Reflect.apply(consultar, pool, args);
+  }) as typeof pool.query);
+  return { recusas: () => recusas, desfazer: () => espia.mockRestore() };
 }
 
 describe("versão 18 — a resposta retida não é ultrapassada (F4w do cxj, W02)", () => {
@@ -453,5 +482,146 @@ describe("versão 18 — a ordem no escopo que a cadeia entrega ao transporte", 
     });
     expect(noEscopo).toBeNull();
     expect(saidas).toEqual(["Primeira"]);
+  });
+});
+
+describe("versão 19 — a marca nasce com a resposta, e a ordem não depende do motivo (F4x do cxj, X01 e X08)", () => {
+  it("⭐ X01 do cxj: a gravação do motivo falha, e a resposta posterior ainda espera atrás da retida", async () => {
+    const f = await fixture();
+    const queda = recusarGravacaoDoMotivo("saida_do_agente_vencida");
+    expect(await responder(f, f.turno, 1, "Primeira", { atrasoNoHandler: FOLGA_DA_IA + 1 })).toMatchObject({
+      outcome: { kind: "queued" },
+    });
+    // O motivo não gravou: a linha segue na fila sem ele, e com a marca, que nasceu com ela.
+    expect(await mensagens(f)).toEqual([["Primeira", "queued", null, "true"]]);
+    expect(await responder(f, f.turno, 2, "Segunda")).toMatchObject({ outcome: { kind: "queued" } });
+    expect(saidas).toEqual([]);
+    expect(await mensagens(f)).toEqual([
+      ["Primeira", "queued", null, "true"],
+      ["Segunda", "queued", "atras_de_resposta_retida", "true"],
+    ]);
+    // Duas tentativas de gravar o motivo, as duas recusadas.
+    expect(queda.recusas()).toBe(2);
+    queda.desfazer();
+    await terminar(f.turno);
+    expect(await tique()).toBe(1);
+    relogio += TIQUE_SEGUINTE;
+    expect(await tique()).toBe(1);
+    expect(saidas).toEqual(["Primeira", "Segunda"]);
+  });
+
+  it("⭐ X08 do cxj: a nova tentativa com o canal fora do ar troca o motivo da retida, e ela segue segurando a seguinte", async () => {
+    const f = await fixture();
+    await responder(f, f.turno, 1, "Primeira", { atrasoNoHandler: FOLGA_DA_IA + 1 });
+    expect(await mensagens(f)).toEqual([["Primeira", "queued", "saida_do_agente_vencida", "true"]]);
+    await sessao(f, "STOPPED");
+    expect(await responder(f, f.turno, 1, "Primeira")).toMatchObject({ outcome: { kind: "queued" } });
+    expect(await mensagens(f)).toEqual([["Primeira", "queued", "channel_session_not_working", "true"]]);
+    await sessao(f, "WORKING");
+    expect(await responder(f, f.turno, 2, "Segunda")).toMatchObject({ outcome: { kind: "queued" } });
+    expect(saidas).toEqual([]);
+    await terminar(f.turno);
+    relogio += TIQUE_SEGUINTE;
+    expect(await tique()).toBe(1);
+    relogio += TIQUE_SEGUINTE;
+    expect(await tique()).toBe(1);
+    expect(saidas).toEqual(["Primeira", "Segunda"]);
+  });
+
+  it("⭐ a resposta que ficou na fila pelo canal fora do ar, desde o começo, segura a seguinte, e o resgate entrega as duas na ordem", async () => {
+    const f = await fixture();
+    await sessao(f, "STOPPED");
+    expect(await responder(f, f.turno, 1, "Primeira")).toMatchObject({ outcome: { kind: "queued" } });
+    expect(await mensagens(f)).toEqual([["Primeira", "queued", "channel_session_not_working", "true"]]);
+    // O canal volta (a reconexão de 1 s a 2 s), e o turno segue: a resposta seguinte não passa na frente.
+    await sessao(f, "WORKING");
+    expect(await responder(f, f.turno, 2, "Segunda")).toMatchObject({ outcome: { kind: "queued" } });
+    expect(saidas).toEqual([]);
+    expect(await mensagens(f)).toEqual([
+      ["Primeira", "queued", "channel_session_not_working", "true"],
+      ["Segunda", "queued", "atras_de_resposta_retida", "true"],
+    ]);
+    await terminar(f.turno);
+    expect(await tique()).toBe(1);
+    relogio += TIQUE_SEGUINTE;
+    expect(await tique()).toBe(1);
+    expect(saidas).toEqual(["Primeira", "Segunda"]);
+  });
+
+  it("controle: de volta o canal, a nova tentativa do job manda a resposta pelo mesmo id (ela não segura a si mesma), e a seguinte sai pela cadeia", async () => {
+    const f = await fixture();
+    await sessao(f, "STOPPED");
+    await responder(f, f.turno, 1, "Primeira");
+    await sessao(f, "WORKING");
+    expect(await responder(f, f.turno, 1, "Primeira")).toMatchObject({ outcome: { kind: "sent" } });
+    relogio += INTERVALO;
+    expect(await responder(f, f.turno, 2, "Segunda")).toMatchObject({ outcome: { kind: "sent" } });
+    expect(saidas).toEqual(["Primeira", "Segunda"]);
+    expect((await mensagens(f)).map((m) => [m[0], m[1], m[3]])).toEqual([
+      ["Primeira", "sent", "true"],
+      ["Segunda", "sent", "true"],
+    ]);
+  });
+
+  it("⭐ a resposta ainda em curso (gravada, e ainda no provedor) já segura a seguinte: o corte deixa de ser uma corrida", async () => {
+    const f = await fixture();
+    let outro: Turno | null = null;
+    let segunda: unknown = "não rodou";
+    noProvedor = async (texto) => {
+      if (texto !== "Primeira") return;
+      noProvedor = null;
+      // A “Primeira” está no provedor, que demora. O job dela perde a vez (o banco só deixa um job do contato rodar de
+      // cada vez: `uniq_job_queue_one_running_per_contact`), e o turno seguinte da conversa chega ao corte dele.
+      await devolverAFila(f.turno);
+      outro = await novoTurno(f);
+      segunda = await responder(f, outro, 1, "Segunda");
+    };
+    expect(await responder(f, f.turno, 1, "Primeira")).toMatchObject({ outcome: { kind: "sent" } });
+    expect(segunda).toMatchObject({ outcome: { kind: "queued" } });
+    expect(saidas).toEqual(["Primeira"]);
+    expect(await mensagens(f)).toEqual([
+      ["Primeira", "sent", null, "true"],
+      ["Segunda", "queued", "atras_de_resposta_retida", "true"],
+    ]);
+    // O turno seguinte termina, e o resgate entrega a que esperou.
+    await terminar(outro!);
+    relogio += TIQUE_SEGUINTE;
+    expect(await tique()).toBe(1);
+    expect(saidas).toEqual(["Primeira", "Segunda"]);
+  });
+
+  it("⭐ a resposta que nasceu sem a marca (antes desta versão) a ganha na nova tentativa do job, e passa a segurar a seguinte", async () => {
+    const f = await fixture();
+    await sessao(f, "STOPPED");
+    await responder(f, f.turno, 1, "Primeira");
+    // Como a linha de antes desta versão: na fila, sem a marca.
+    await pool.query("update messages set metadata = metadata - 'queued_resposta' where conversation_id=$1", [f.conversa]);
+    expect(await mensagens(f)).toEqual([["Primeira", "queued", "channel_session_not_working", null]]);
+    // A nova tentativa do job, ainda com o canal fora do ar: a marca entra antes de qualquer saída.
+    expect(await responder(f, f.turno, 1, "Primeira")).toMatchObject({ outcome: { kind: "queued" } });
+    expect(await mensagens(f)).toEqual([["Primeira", "queued", "channel_session_not_working", "true"]]);
+    await sessao(f, "WORKING");
+    expect(await responder(f, f.turno, 2, "Segunda")).toMatchObject({ outcome: { kind: "queued" } });
+    expect(saidas).toEqual([]);
+  });
+
+  it("controle: a resposta que o provedor recusa vira falha, e não segura a seguinte", async () => {
+    const f = await fixture();
+    recusadas.add("Primeira");
+    await responder(f, f.turno, 1, "Primeira");
+    expect((await mensagens(f)).map((m) => [m[0], m[1], m[3]])).toEqual([["Primeira", "failed", "true"]]);
+    relogio += INTERVALO + FOLGA_DA_IA;
+    expect(await responder(f, f.turno, 2, "Segunda")).toMatchObject({ outcome: { kind: "sent" } });
+    expect(saidas).toEqual(["Segunda"]);
+  });
+
+  it("controle: o envio do agente que não é resposta nasce sem a marca, e na fila pelo canal fora do ar não segura a resposta seguinte", async () => {
+    const f = await fixture();
+    await sessao(f, "STOPPED");
+    await responder(f, f.turno, 1, "Retorno", { resposta: false });
+    expect(await mensagens(f)).toEqual([["Retorno", "queued", "channel_session_not_working", null]]);
+    await sessao(f, "WORKING");
+    expect(await responder(f, f.turno, 2, "Resposta")).toMatchObject({ outcome: { kind: "sent" } });
+    expect(saidas).toEqual(["Resposta"]);
   });
 });

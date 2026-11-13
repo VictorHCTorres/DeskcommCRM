@@ -971,6 +971,21 @@ export async function sendMessageHandler(
     );
   }
 
+  // ─── A marca de resposta nasce com a mensagem (versão 19, F4x do cxj, X01 e X08) ───
+  //
+  // A resposta de texto do agente não é ultrapassada enquanto está na fila (a ordem, mais abaixo, e
+  // `lib/agent-engine/pacing/resposta-retida.ts`), e o que a identifica é esta marca. Na versão 18 ela era gravada só
+  // na retenção, junto com o motivo, num UPDATE cujo erro era ignorado: se ele falhasse, a linha ficava na fila sem a
+  // marca, fora da ordem, e a resposta seguinte passava na frente (X01). Agora a linha já nasce com ela, no mesmo
+  // INSERT: não há instante em que a resposta esteja na fila sem a marca. Só a resposta (o envio que não responde a
+  // ninguém não segura as seguintes), e só o texto (o resgate só manda texto). Fora do escopo do agente, ou sem a ordem
+  // nele, nada muda.
+  //
+  // A marca é do handler: a que vier no `metadata` de quem chama não é gravada.
+  const respostaDoAgente = input.type === "text" && saidaDoAgenteNoEscopo()?.ordem?.resposta === true;
+  const metadataDeQuemChama: Record<string, unknown> = { ...(input.metadata ?? {}) };
+  delete metadataDeQuemChama[MARCA_DE_RESPOSTA_RETIDA];
+
   const insertRow = {
     ...(ctx.internalMessageId ? { id: ctx.internalMessageId } : {}),
     organization_id: c.organization_id,
@@ -1002,7 +1017,7 @@ export async function sendMessageHandler(
     sent_on_behalf_of_user_id: ctx.onBehalfOf?.userId ?? null,
     sent_at: now,
     metadata: {
-      ...(input.metadata ?? {}),
+      ...metadataDeQuemChama,
       ...(ctx.actor.type === "ai_agent" ? { ai_actor_id: ctx.actor.id } : {}),
       ...(origemDoEmissor === "ai" ? { ai_actor_name: nomeDoAgente } : {}),
       // Os dois nomes viajam GRAVADOS porque o balão não faz join: "Fulano ·
@@ -1018,6 +1033,7 @@ export async function sendMessageHandler(
             },
           }
         : {}),
+      ...(respostaDoAgente ? { [MARCA_DE_RESPOSTA_RETIDA]: true } : {}),
     },
   };
 
@@ -1045,6 +1061,26 @@ export async function sendMessageHandler(
       )
     )
       return created as unknown as Message;
+    // A linha que já existia (a nova tentativa do job) e nasceu sem a marca de resposta — antes da versão 19, ou fora
+    // do escopo da ordem — a ganha aqui, antes de qualquer saída que a deixe na fila. Se a gravação falhar (duas
+    // tentativas), ou a linha não for mais achada, nada sai e o erro sobe: a linha segue como estava, e o job tenta de
+    // novo.
+    const existente = created as unknown as Message;
+    if (respostaDoAgente && (existente.metadata ?? {})[MARCA_DE_RESPOSTA_RETIDA] !== true) {
+      const marcar = () =>
+        supabase
+          .from("messages")
+          .update({ metadata: { ...(existente.metadata ?? {}), [MARCA_DE_RESPOSTA_RETIDA]: true } })
+          .eq("id", existente.id)
+          .eq("organization_id", ctx.organization_id)
+          .select(MSG_COLS)
+          .maybeSingle();
+      let marcada = await marcar();
+      if (marcada.error) marcada = await marcar();
+      if (marcada.error || !marcada.data)
+        throw new ApiError(500, "internal_error", undefined, ctx.requestId, "marca_de_resposta_nao_gravada");
+      created = marcada.data;
+    }
   }
   if (insErr || !created) {
     throw new ApiError(
@@ -1474,21 +1510,34 @@ export async function sendMessageHandler(
         // mesmo id. Cada um com o próprio registro no limite do número. Não é falha de entrega: nada de
         // `emitirFalhaDeEntrega`.
         //
-        // Ou há na conversa uma resposta retida e mais antiga (versão 18, F4w do cxj, W02): a conferência da ordem
-        // lançou antes do provedor, e a linha fica em `queued` do mesmo jeito, com o motivo dela, para sair depois da
-        // mais antiga. Nos dois casos, a mensagem que responde a quem escreveu leva a marca de resposta: é a resposta
-        // retida que segura as seguintes da conversa (`lib/agent-engine/pacing/resposta-retida.ts`).
+        // Ou há na conversa uma resposta do agente mais antiga e ainda na fila (versão 18, F4w do cxj, W02): a
+        // conferência da ordem lançou antes do provedor, e a linha fica em `queued` do mesmo jeito, com o motivo dela,
+        // para sair depois da mais antiga.
+        //
+        // O que segura as seguintes da conversa é a marca de resposta, e ela nasceu com a linha (versão 19, F4x do
+        // cxj, X01): aqui se grava só o motivo, que informa a tela e quem opera, e não decide a ordem. O erro deste
+        // UPDATE era ignorado; agora uma 2ª tentativa cobre a queda passageira, e, sem ela, o log diz qual mensagem
+        // ficou na fila sem o motivo. Com ou sem ele, a linha segue na fila com a marca, e nada passa na frente dela.
         const motivoDaRetencao =
           err instanceof SaidaDoAgenteVencidaError ? MOTIVO_DA_SAIDA_VENCIDA : MOTIVO_DA_SAIDA_ATRAS_DE_RETIDA;
-        const marcaDeResposta =
-          saidaDoAgenteNoEscopo()?.ordem?.resposta === true ? { [MARCA_DE_RESPOSTA_RETIDA]: true } : {};
-        const { data: emFila } = await supabase
-          .from("messages")
-          .update({ metadata: { ...(message.metadata ?? {}), queued_reason: motivoDaRetencao, ...marcaDeResposta } })
-          .eq("id", message.id)
-          .eq("organization_id", ctx.organization_id)
-          .select(MSG_COLS)
-          .maybeSingle();
+        const gravarOMotivo = () =>
+          supabase
+            .from("messages")
+            .update({ metadata: { ...(message.metadata ?? {}), queued_reason: motivoDaRetencao } })
+            .eq("id", message.id)
+            .eq("organization_id", ctx.organization_id)
+            .select(MSG_COLS)
+            .maybeSingle();
+        let { data: emFila, error: erroAoGravar } = await gravarOMotivo();
+        if (erroAoGravar) ({ data: emFila, error: erroAoGravar } = await gravarOMotivo());
+        if (erroAoGravar) {
+          logger.error("messages.send.retencao_sem_motivo", {
+            message_id: message.id,
+            organization_id: ctx.organization_id,
+            motivo: motivoDaRetencao,
+            erro: erroAoGravar.message,
+          });
+        }
         if (emFila) message = emFila as unknown as Message;
         return message;
       }

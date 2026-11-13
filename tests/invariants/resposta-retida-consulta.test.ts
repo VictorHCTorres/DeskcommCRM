@@ -5,9 +5,13 @@
  * esta mensagem?”. É a pergunta que o handler faz antes de mandar um texto do agente, e a mesma condição que o resgate
  * põe na seleção e na releitura dele (`respostaRetidaAntesSql`).
  *
- * Retida é a mensagem de saída, de texto, ainda na fila (`queued`), com um dos dois motivos da cadeia do agente (a
- * idade, ou a ordem), com a marca de resposta, e criada há menos do que a validade. Mais antiga é pela hora de criação
- * e, na mesma hora, pelo id.
+ * Retida é a mensagem de saída, de texto, ainda na fila (`queued`), com a marca de resposta, e criada há menos do que
+ * a validade. Mais antiga é pela hora de criação e, na mesma hora, pelo id.
+ *
+ * Na versão 18, a retida ainda precisava de um dos dois motivos da cadeia do agente (a idade, ou a ordem). Na versão 19
+ * (F4x do cxj, X01 e X08), o motivo não decide: a marca nasce com a resposta, e a resposta que ainda está na fila
+ * segura as seguintes com qualquer motivo (o canal fora do ar, por exemplo), ou sem nenhum (o envio em curso, ou a
+ * retenção cujo motivo não gravou).
  *
  * A regra de ponta a ponta (a cadeia, o handler e o resgate) está em `tests/invariants/resposta-retida-na-ordem.test.ts`.
  */
@@ -107,7 +111,7 @@ async function mensagem(f: Fixture, linha: Linha = {}) {
 const pergunta = (f: Fixture, id: string, conversa = f.conversa) =>
   haRespostaRetidaAntes(pool, f.org, { conversationId: conversa, messageId: id });
 
-describe("haRespostaRetidaAntes — a pergunta da ordem, no banco (versão 18)", () => {
+describe("haRespostaRetidaAntes — a pergunta da ordem, no banco (versões 18 e 19)", () => {
   it("⭐ a resposta retida por idade, mais antiga, na mesma conversa, segura a mensagem", async () => {
     const f = await fixture();
     await mensagem(f, { criada: quando(-10), metadata: RETIDA });
@@ -117,6 +121,16 @@ describe("haRespostaRetidaAntes — a pergunta da ordem, no banco (versão 18)",
   it("⭐ a que esperou por ordem também segura a seguinte", async () => {
     const f = await fixture();
     await mensagem(f, { criada: quando(-10), metadata: { queued_reason: "atras_de_resposta_retida", queued_resposta: true } });
+    expect(await pergunta(f, await mensagem(f))).toBe(true);
+  });
+
+  it.each<[string, Record<string, unknown>]>([
+    ["X08 do cxj: a que está na fila por outro motivo (o canal fora do ar)", { queued_reason: "channel_session_not_working", queued_resposta: true }],
+    ["X01 do cxj: a que está na fila sem motivo (o envio em curso, ou a retenção cujo motivo não gravou)", { queued_resposta: true }],
+    ["a que está na fila com um motivo qualquer", { queued_reason: "motivo_ficticio", queued_resposta: true }],
+  ])("⭐ versão 19, o motivo não decide: %s segura a seguinte", async (_nome, metadata) => {
+    const f = await fixture();
+    await mensagem(f, { criada: quando(-10), metadata });
     expect(await pergunta(f, await mensagem(f))).toBe(true);
   });
 
@@ -136,10 +150,10 @@ describe("haRespostaRetidaAntes — a pergunta da ordem, no banco (versão 18)",
     ["a retida por idade sem a marca de resposta", () => ({ criada: quando(-10), metadata: { queued_reason: "saida_do_agente_vencida" } })],
     ["a que tem a marca de resposta falsa", () => ({ criada: quando(-10), metadata: { ...RETIDA, queued_resposta: false } })],
     [
-      "a presa por outro motivo (o canal fora do ar), mesmo com a marca",
-      () => ({ criada: quando(-10), metadata: { queued_reason: "channel_session_not_working", queued_resposta: true } }),
+      "a presa pelo canal fora do ar sem a marca (o envio que não é resposta, a automação, a linha de antes da versão 19)",
+      () => ({ criada: quando(-10), metadata: { queued_reason: "channel_session_not_working" } }),
     ],
-    ["a que está na fila sem motivo (o envio em curso)", () => ({ criada: quando(-10), metadata: { queued_resposta: true } })],
+    ["a que está na fila sem motivo e sem a marca", () => ({ criada: quando(-10) })],
     ["a recebida", () => ({ criada: quando(-10), direction: "inbound", metadata: RETIDA })],
   ])("não segura: %s", async (_nome, linha) => {
     const f = await fixture();

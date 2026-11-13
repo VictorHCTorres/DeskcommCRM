@@ -32,6 +32,11 @@
  * `atras_de_resposta_retida`, e sai depois da mais antiga. Para isso a saída é lida no escopo sem ser tomada
  * (`saidaDoAgenteNoEscopo`): a idade é só da 1ª mensagem física, e a ordem é de todas as de texto.
  *
+ * A MARCA (versão 19, F4x do cxj, X01 e X08). O handler também lê a ordem do escopo ao criar a linha: a mensagem de
+ * texto do envio que responde a quem escreveu nasce com a marca de resposta, e é a resposta ainda na fila, com
+ * qualquer motivo, que segura as seguintes. Na versão 18 a marca era gravada só na retenção, e a ordem dependia do
+ * motivo.
+ *
  * Módulo sem import do projeto, para o handler e a cadeia o lerem sem ciclo.
  */
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -52,20 +57,19 @@ export const MOTIVO_DA_SAIDA_VENCIDA = "saida_do_agente_vencida";
  */
 export const MOTIVO_DA_SAIDA_ATRAS_DE_RETIDA = "atras_de_resposta_retida";
 
-/** Os motivos com que a cadeia do agente retém uma mensagem na fila: a idade, e a ordem. */
-export const MOTIVOS_DA_SAIDA_RETIDA = [MOTIVO_DA_SAIDA_VENCIDA, MOTIVO_DA_SAIDA_ATRAS_DE_RETIDA] as const;
-
 /**
- * A marca da resposta retida, em `messages.metadata`: a mensagem retida que responde a quem escreveu a leva, e é ela
- * que segura as seguintes da conversa. O handler a grava; a pergunta da ordem a lê.
+ * A marca de resposta, em `messages.metadata`: a mensagem de texto do agente que responde a quem escreveu nasce com
+ * ela (versão 19), e, enquanto está na fila, segura as seguintes da conversa. O handler a grava na criação da linha
+ * (e, na nova tentativa do job, na linha que nasceu sem ela); a pergunta da ordem a lê.
  */
 export const MARCA_DE_RESPOSTA_RETIDA = "queued_resposta";
 
 /** A ordem que a saída do agente leva até o handler (versão 18, F4w do cxj, W02). */
 export interface OrdemDaSaidaDoAgente {
   /**
-   * O envio responde a quem escreveu. A resposta retida leva a marca (`MARCA_DE_RESPOSTA_RETIDA`), e é ela que segura
-   * as mensagens seguintes da conversa: o envio que não é resposta (com teto do dia e janela) não segura ninguém.
+   * O envio responde a quem escreveu. A mensagem de texto dele nasce com a marca (`MARCA_DE_RESPOSTA_RETIDA`), e,
+   * enquanto está na fila, segura as mensagens seguintes da conversa: o envio que não é resposta (com teto do dia e
+   * janela) não segura ninguém.
    */
   readonly resposta: boolean;
   /**
