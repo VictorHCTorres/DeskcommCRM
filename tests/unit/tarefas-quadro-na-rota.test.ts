@@ -191,6 +191,32 @@ describe("GET /api/v1/tasks — a carga do quadro", () => {
     expect(corpo.error?.details).toHaveProperty("limite");
   });
 
+  it("(fork) no quadro (`?limite=`) a lista NÃO traz a família da subtarefa", async () => {
+    const PAI = "66666666-6666-4666-8666-666666666666";
+    const d = montar([{ data: [{ ...LINHA, parent_task_id: PAI }] }]);
+    const { GET } = await import("@/app/api/v1/tasks/route");
+
+    const res = await GET(get("?limite=200"));
+
+    expect(res.status).toBe(200);
+    // Uma consulta só: nem a do pai ausente, nem a das irmãs.
+    expect(d.tabelas).toEqual(["crm_tasks"]);
+    const corpo = (await res.json()) as { data?: { tasks?: Array<{ id: string }> } };
+    expect(corpo.data?.tasks?.map((t) => t.id)).toEqual([TAREFA]);
+  });
+
+  it("(fork) controle: sem `limite`, a lista da tela continua trazendo a família", async () => {
+    const PAI = "66666666-6666-4666-8666-666666666666";
+    const d = montar([{ data: [{ ...LINHA, parent_task_id: PAI }] }]);
+    const { GET } = await import("@/app/api/v1/tasks/route");
+
+    const res = await GET(get());
+
+    expect(res.status).toBe(200);
+    // A base, o pai ausente e as filhas da raiz: três consultas.
+    expect(d.tabelas).toEqual(["crm_tasks", "crm_tasks", "crm_tasks"]);
+  });
+
   it("limite zero também é recusado — coluna vazia não é quadro", async () => {
     const d = montar([{ data: [LINHA] }]);
     const { GET } = await import("@/app/api/v1/tasks/route");

@@ -291,7 +291,12 @@ async function listar(req: NextRequest): Promise<Response> {
   const cortada = count > limite;
   const encontradas = (data ?? []) as unknown as Tarefa[];
   // Consulta por chave é consulta de ROBÔ: só as linhas que casaram, sem a família da tela.
-  if (filtros.external_id || filtros.external_id_prefix) {
+  //
+  // O QUADRO (`?limite=`, #4028 do upstream) também recebe só as linhas que casaram. Ele não
+  // desenha hierarquia (as colunas são as situações, e todas aparecem), então a família não tem
+  // onde morar: sob "Minhas" viraria cartão do pai e das irmãs de outra pessoa, e o aviso de
+  // carga no teto (`tarefas.length >= limite`) dispararia com a família somada.
+  if (filtros.external_id || filtros.external_id_prefix || filtros.limite !== undefined) {
     return ok({ tasks: encontradas }, { requestId, meta: { total: count, cortada } });
   }
   // Filtro é aplicado à DEMANDA de trabalho, não pode amputar a família. Se
