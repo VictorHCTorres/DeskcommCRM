@@ -1,5 +1,6 @@
 "use client";
 
+import { useUser } from "@/hooks/auth/AuthProvider";
 import { useT } from "@/hooks/i18n/useT";
 import { useTasks } from "@/hooks/tasks/useTasks";
 import { tarefaEstaAberta } from "@/lib/tarefas/tipos";
@@ -25,6 +26,12 @@ import { cn } from "@/lib/utils";
  * trabalho encerrado. Gerente e administrador também veem só as suas aqui — a
  * visão da equipe é a tela, como antes.
  *
+ * ⚠️ Fork (subtarefas): a lista de `/api/v1/tasks` devolve a FAMÍLIA de cada
+ * tarefa que casou com o filtro — a raiz e todas as irmãs, de qualquer
+ * responsável e situação —, porque a tela de Tarefas não pode amputar a família.
+ * Contar `tarefas.length` por situação inflaria o número com o pai e as irmãs de
+ * outra pessoa; por isso a régua de responsável se repete aqui, no cliente.
+ *
  * ─── Zero, erro e primeiro carregamento ─────────────────────────────────────
  *
  * Nada é desenhado nos três: número que nunca some ensina a ignorar o número
@@ -38,8 +45,11 @@ import { cn } from "@/lib/utils";
  */
 export function ContadorDeTarefas({ compacto }: { compacto: boolean }) {
   const t = useT();
+  const usuario = useUser();
   const { tarefas } = useTasks({ aberto: true, assigned_to: "me" }, { refetchInterval: 60_000 });
-  const emAberto = tarefas.filter((tarefa) => tarefaEstaAberta(tarefa.status)).length;
+  const emAberto = tarefas.filter(
+    (tarefa) => tarefaEstaAberta(tarefa.status) && tarefa.assigned_to === usuario.id,
+  ).length;
   if (emAberto === 0) return null;
   const rotulo = emAberto === 1 ? t("1 tarefa em aberto") : `${emAberto} ${t("tarefas em aberto")}`;
   return (

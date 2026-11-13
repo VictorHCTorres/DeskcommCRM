@@ -17,6 +17,9 @@
  * 5. O tenant sai da SESSÃO no servidor: a rota filtra `organization_id` da
  *    organização ativa mesmo que o navegador peça outra, e a RLS segura o
  *    resto. Um contador que somasse a organização errada seria vazamento mudo.
+ * 6. (Fork) A lista do fork traz a FAMÍLIA da tarefa que casou — a raiz e as
+ *    irmãs, de qualquer responsável. O contador repete a régua do responsável
+ *    no cliente, senão o pai e as irmãs de outra pessoa entrariam na conta.
  */
 import { render, screen } from "@testing-library/react";
 import { NextRequest } from "next/server";
@@ -34,7 +37,7 @@ const ANA = "11111111-1111-4111-8111-111111111111";
 
 /** O que o componente pede ao hook — o instrumento do escopo por usuário. */
 let pedido: { filtros?: unknown; opcoes?: unknown } = {};
-let tarefas: Array<Pick<Tarefa, "id" | "status">> = [];
+let tarefas: Array<Pick<Tarefa, "id" | "status" | "assigned_to">> = [];
 
 vi.mock("@/hooks/tasks/useTasks", () => ({
   useTasks: (filtros: unknown, opcoes: unknown) => {
@@ -43,6 +46,7 @@ vi.mock("@/hooks/tasks/useTasks", () => ({
   },
 }));
 vi.mock("@/hooks/i18n/useT", () => ({ useT: () => (texto: string) => texto }));
+vi.mock("@/hooks/auth/AuthProvider", () => ({ useUser: () => ({ id: ANA }) }));
 
 vi.mock("@/lib/auth/require-role", () => ({ requireRole: vi.fn() }));
 vi.mock("@/lib/supabase/server", () => ({ createClient: vi.fn() }));
@@ -51,8 +55,10 @@ vi.mock("@/lib/audit", () => ({ audit: vi.fn(async () => undefined) }));
 import { ContadorDeTarefas } from "@/components/shell/ContadorDeTarefas";
 import { sidebarGroups } from "@/lib/navigation/registry";
 
-function comStatus(...situacoes: Array<Tarefa["status"]>): Array<Pick<Tarefa, "id" | "status">> {
-  return situacoes.map((status, i) => ({ id: `t${i}`, status }));
+function comStatus(
+  ...situacoes: Array<Tarefa["status"]>
+): Array<Pick<Tarefa, "id" | "status" | "assigned_to">> {
+  return situacoes.map((status, i) => ({ id: `t${i}`, status, assigned_to: ANA }));
 }
 
 describe("contador de tarefas no menu", () => {
@@ -109,6 +115,20 @@ describe("contador de tarefas no menu", () => {
     expect(contador.getAttribute("aria-label")).toBe("3 tarefas em aberto");
     expect(contador.className).toContain("h-2");
     expect(contador.className).toContain("w-2");
+  });
+
+  it("(fork) a família que a lista traz junto — pai e irmãs de outra pessoa — não entra na conta", () => {
+    // A rota do fork devolve a minha subtarefa aberta E a raiz dela (de outra pessoa, aberta)
+    // E a irmã (sem responsável, aberta): só a minha é "minha em aberto".
+    tarefas = [
+      { id: "minha", status: "pending", assigned_to: ANA },
+      { id: "raiz", status: "in_progress", assigned_to: "44444444-4444-4444-8444-444444444444" },
+      { id: "irma", status: "pending", assigned_to: null },
+    ];
+    render(<ContadorDeTarefas compacto={false} />);
+    expect(screen.getByTestId("contador-de-tarefas").getAttribute("aria-label")).toBe(
+      "1 tarefa em aberto",
+    );
   });
 
   it("Tarefas está no menu com o contador declarado", () => {
