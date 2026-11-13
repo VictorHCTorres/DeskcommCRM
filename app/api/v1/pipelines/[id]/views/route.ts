@@ -7,6 +7,7 @@ import { audit } from "@/lib/audit";
 import { requireRole } from "@/lib/auth/require-role";
 import { roleAtLeast } from "@/lib/auth/types";
 import { requireSupportWrite } from "@/lib/impersonate/support";
+import { logger } from "@/lib/logger";
 import {
   canonicalizarCorpoDaVisao,
   corpoDaVisaoSchema,
@@ -46,7 +47,11 @@ export async function GET(_req: NextRequest, ctx: RouteCtx): Promise<Response> {
     .order("position")
     .order("id");
   if (error) {
-    console.error("[pipeline-views.list] query failed", { requestId, error });
+    logger.error("[pipeline-views.list] query failed", {
+      requestId,
+      code: error.code,
+      erro: error.message,
+    });
     return fail("internal_error", "Não foi possível carregar as visualizações.", 500, {
       requestId,
     });
@@ -111,7 +116,11 @@ export async function POST(req: NextRequest, ctx: RouteCtx): Promise<Response> {
         requestId,
       });
     }
-    console.error("[pipeline-views.create] insert failed", { requestId, error });
+    logger.error("[pipeline-views.create] insert failed", {
+      requestId,
+      code: error.code,
+      erro: error.message,
+    });
     return fail("internal_error", "Não foi possível salvar a visualização.", 500, { requestId });
   }
   void audit({

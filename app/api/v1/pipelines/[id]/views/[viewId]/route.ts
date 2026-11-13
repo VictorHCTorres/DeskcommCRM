@@ -7,6 +7,7 @@ import { audit } from "@/lib/audit";
 import { requireRole } from "@/lib/auth/require-role";
 import { roleAtLeast } from "@/lib/auth/types";
 import { requireSupportWrite } from "@/lib/impersonate/support";
+import { logger } from "@/lib/logger";
 import {
   canonicalizarCorpoDaVisao,
   corpoBaseDaVisaoSchema,
@@ -119,7 +120,11 @@ export async function PATCH(req: NextRequest, ctx: RouteCtx): Promise<Response> 
         requestId,
       });
     }
-    console.error("[pipeline-views.update] update failed", { requestId, error });
+    logger.error("[pipeline-views.update] update failed", {
+      requestId,
+      code: error.code,
+      erro: error.message,
+    });
     return fail("internal_error", "Não foi possível atualizar a visualização.", 500, {
       requestId,
     });
@@ -149,7 +154,11 @@ export async function DELETE(_req: NextRequest, ctx: RouteCtx): Promise<Response
     .eq("pipeline_id", c.ids.id)
     .eq("id", c.ids.viewId);
   if (error) {
-    console.error("[pipeline-views.delete] delete failed", { requestId, error });
+    logger.error("[pipeline-views.delete] delete failed", {
+      requestId,
+      code: error.code,
+      erro: error.message,
+    });
     return fail("internal_error", "Não foi possível excluir a visualização.", 500, { requestId });
   }
   void audit({
