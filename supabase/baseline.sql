@@ -84602,7 +84602,18 @@ create trigger zz_crm_tasks_chave_externa_ultimo
   before insert or update on public.crm_tasks
   for each row execute function public.fn_crm_tasks_chave_externa_guarda();
 
--- ---- VARREDURA anon: função nova nasce exposta em quem ATUALIZA (migration 0116) ----
+-- ---- VARREDURA anon do fork (Suindara): a cópia da 0116 que fecha o apêndice próprio ----
+--
+-- CÓPIA, de propósito, do bloco da varredura do upstream (migration 0116, lá em
+-- cima, logo depois do último apêndice de função dele). Os blocos do fork vêm
+-- DEPOIS do miolo pós-varredura (0237…9084), de que dependem — o gatilho de
+-- subtarefa declara `update of … demanda_id`, coluna que nasce na 0659 —, então a
+-- varredura do upstream não os alcança e esta cópia os cura. O cabeçalho é outro
+-- para os testes do upstream que ancoram no cabeçalho de lá seguirem achando UM
+-- só (cerca `tests/unit/sonda-do-baseline-ancora-na-ultima-definicao.test.ts`). O
+-- CÓDIGO tem de ser idêntico ao da cópia do upstream:
+-- `tests/unit/varredura-anon-e-o-ultimo-bloco.test.ts` compara as duas e reprova
+-- função criada depois desta.
 --
 -- ⚠️ DE PROPÓSITO, NENHUMA FUNÇÃO É CRIADA DEPOIS DESTE BLOCO. Apêndice que cria
 -- função entra ANTES dele — quem o empurrar para o meio desarma a cura para tudo
