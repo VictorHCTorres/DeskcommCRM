@@ -95,6 +95,22 @@ export const edgeBranchIdSchema = z
   });
 
 /**
+ * O horário em que uma espera fixa pode terminar (`wait.ate_o_horario`).
+ *
+ * ⚠️ FROUXO AQUI DE PROPÓSITO, como `lead_date.key` mais abaixo: o rascunho é
+ * validado só estruturalmente e o painel grava a cada clique. Exigir aqui "fim
+ * depois do início" faria o painel recusar o estado intermediário (quem troca
+ * 08:00 por 18:00 passa por um horário torto) e a tela mostraria um valor que
+ * não foi gravado. Quem exige um horário que dá para obedecer é o publish
+ * (`horario_da_espera_invalido` em `validate-publish.ts`).
+ */
+export const horarioDaEsperaSchema = z.strictObject({
+  start: z.string().max(5),
+  end: z.string().max(5),
+  weekdays: z.array(z.number().int().min(0).max(6)).max(7),
+});
+
+/**
  * Wait node configuration schema.
  * Supports two modes:
  * - fixed: absolute wait duration in milliseconds (5 min to 90 days)
@@ -124,6 +140,16 @@ export const waitConfigSchema = z
        * do alcance da reatividade e libera o slot único anti-spam.
        */
       immune_to_reply: z.boolean().optional(),
+      /**
+       * A espera só TERMINA dentro deste horário (dias + horas, no fuso da
+       * organização). Se a duração vencer fora dele — de noite, no domingo —, a
+       * espera continua até a próxima abertura. Ver `espera-no-horario.ts`.
+       *
+       * Opcional: os grafos publicados não têm a chave e seguem válidos byte a
+       * byte. Só em `fixed`, como `immune_to_reply`: a espera adaptativa é a IA
+       * escolhendo dentro de uma faixa, e o `strictObject` dela recusa a chave.
+       */
+      ate_o_horario: horarioDaEsperaSchema.optional(),
     }),
     z.strictObject({
       mode: z.literal('smart'),
@@ -240,6 +266,14 @@ export const aiClassifyConfigSchema = z
   );
 
 /**
+ * #4429 — quantas redações EXTRAS um passo de texto aceita (além do `body`).
+ * Teto de configuração, e não de motor: a tela usa o mesmo número para parar de
+ * oferecer "adicionar". Mora aqui (e não em `variacoes-do-passo.ts`, que
+ * importa `node:crypto`) porque o formulário é componente de cliente.
+ */
+export const MAX_VARIACOES_DO_PASSO = 5;
+
+/**
  * Action node configuration schema.
  * - text: send this body as-is (no model)
  * - ai_message: generate a message using AI with a prompt hint
@@ -249,6 +283,20 @@ export const actionConfigSchema = z.discriminatedUnion('mode', [
   z.strictObject({
     mode: z.literal('text'),
     body: z.string().min(1).max(4000),
+    /**
+     * #4429 — OUTRAS REDAÇÕES DO MESMO PASSO.
+     *
+     * O `body` continua sendo a PRIMEIRA redação (é o que todo leitor antigo — a
+     * tela, o cartão do nó, a prévia do fluxo — mostra, e o que um grafo já
+     * publicado tem). `variacoes` são redações ADICIONAIS, e o motor alterna
+     * entre `[body, ...variacoes]` a cada envio (`lib/followup/engine.ts` →
+     * `redacaoDaVez` em `lib/followup/variacoes-do-passo.ts`).
+     *
+     * Opcional de propósito: um passo de texto único — o de hoje — não tem a
+     * chave e continua válido byte a byte, sem migration e sem reescrita do
+     * grafo. Ausente ou vazia = comportamento de sempre.
+     */
+    variacoes: z.array(z.string().trim().min(1).max(4000)).max(MAX_VARIACOES_DO_PASSO).optional(),
     /**
      * #2734 — MÍDIA OPCIONAL (imagem, vídeo, áudio ou documento, #2972) por URL.
      * Presente, o `body` vira a

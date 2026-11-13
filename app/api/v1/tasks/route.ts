@@ -28,11 +28,10 @@ import { type NextRequest } from "next/server";
 import { z } from "zod";
 
 import { ok, fail } from "@/lib/api/wrappers";
-import { audit, isServiceRoleConfigured } from "@/lib/audit";
+import { audit } from "@/lib/audit";
 import { resolveAuthDual, tetoDeEscritaDoToken, type AuthDual } from "@/lib/api/auth-dual";
 import { traduzir } from "@/lib/i18n/dicionario";
-import { createAdminClient } from "@/lib/supabase/admin";
-import { createClient } from "@/lib/supabase/server";
+import { portaDaAplicacao } from "@/lib/db";
 import { registraAtividadeDaTarefa } from "@/lib/tarefas/atividade";
 import {
   CHAVE_SO_POR_TOKEN,
@@ -51,13 +50,24 @@ import { buscarDonaDaChave } from "@/lib/tarefas/dona-da-chave";
 import { conferirDemanda } from "@/lib/tarefas/demanda";
 import { conferirResponsavel } from "@/lib/tarefas/responsavel";
 import { COLUNAS_DA_TAREFA, gravarTarefa } from "@/lib/tarefas/gravar-tarefa";
-import { PRIORIDADES_DA_TAREFA, SITUACOES_DA_TAREFA, type Tarefa } from "@/lib/tarefas/tipos";
+import {
+  PRIORIDADES_DA_TAREFA,
+  SITUACOES_ABERTAS_DA_TAREFA,
+  SITUACOES_DA_TAREFA,
+  type Tarefa,
+} from "@/lib/tarefas/tipos";
 import { conferirVinculosDaTarefa } from "@/lib/tarefas/vinculos";
 
 export const dynamic = "force-dynamic";
 
-/** O corte da lista. `meta.cortada` compara a contagem da consulta base com ele. */
-const LIMITE_DA_LISTA = 500;
+/**
+ * O teto da lista — e o máximo que `?limite=` aceita. Está nomeado porque agora
+ * tem dois leitores (o default do `.limit()` e a validação do parâmetro): o dia
+ * em que um deles mudar sozinho, a rota passaria a aceitar mais do que serve.
+ * `meta.cortada` (D9) compara a contagem da consulta base com o limite EM VIGOR
+ * nesta busca — o pedido em `?limite=`, ou este teto.
+ */
+const LIMITE_MAXIMO = 500;
 
 /**
  * Sessão de navegador OU token de servidor (`dsk_…`), mesma dualidade de
@@ -73,6 +83,14 @@ function usuarioDaSessao(authz: Autorizado): string | null {
 
 /** As colunas que a tela lê. Explícitas para o `select *` não vazar coluna nova. */
 const COLUNAS = COLUNAS_DA_TAREFA;
+
+/**
+ * Com o filtro de funil o `lead` vira INNER JOIN: o PostgREST só filtra pela coluna de um
+ * recurso embutido se o embutido for obrigatório; com o join comum a tarefa de outro funil
+ * continuaria na lista, só que com `lead: null`. Sem o filtro a consulta é a de sempre — o
+ * join obrigatório esconderia as tarefas soltas (sem negócio), que são caso real.
+ */
+const COLUNAS_NO_FUNIL = COLUNAS.replace("lead:crm_leads(", "lead:crm_leads!inner(");
 
 const criacaoSchema = z.object({
   title: z.string().trim().min(1).max(255),
@@ -116,6 +134,21 @@ const listaSchema = z.object({
    * da sessão e a RLS segura o resto.
    */
   assigned_to: z.union([z.literal("me"), z.literal("ninguem"), z.string().uuid()]).optional(),
+  /**
+   * Só as tarefas de negócios DESTE funil (`crm_leads.pipeline_id`). A tarefa não tem funil
+   * próprio: ela herda o do negócio a que está presa, então tarefa solta fica de fora quando
+   * o filtro está ligado. Um id de outra organização não devolve nada — o `organization_id`
+   * da consulta e a RLS continuam valendo.
+   */
+  pipeline_id: z.string().uuid().optional(),
+  /**
+   * Teto de linhas desta busca (#4028). Existe porque a visão em QUADRO desenha
+   * todas as colunas de uma vez e pediria a base inteira: ela manda um número
+   * menor que o teto da lista. O máximo é DAQUI, não do navegador — um cliente
+   * que peça mais que `LIMITE_MAXIMO` recebe 422 em vez de uma consulta do
+   * tamanho que ele quiser.
+   */
+  limite: z.coerce.number().int().min(1).max(LIMITE_MAXIMO).optional(),
   /**
    * D9 — casamento EXATO por chave externa: `?external_id=a&external_id=b`, até 100. Com este
    * filtro ou o de prefixo a resposta traz só as linhas que casaram, sem a expansão de família.
@@ -218,13 +251,14 @@ async function listar(req: NextRequest): Promise<Response> {
   // acrescentado = 501 recebidas contra total 501, e a 501ª que casa ficou de fora): ali quem
   // decide é `meta.cortada`, verdadeira quando a consulta base casou mais linhas que o limite.
   // Nenhum robô deve usar a lista expandida para provar que uma tarefa NÃO existe.
+  const limite = filtros.limite ?? LIMITE_MAXIMO;
   let query = supabase
     .from("crm_tasks")
-    .select(COLUNAS, { count: "exact" })
+    .select(filtros.pipeline_id ? COLUNAS_NO_FUNIL : COLUNAS, { count: "exact" })
     .eq("organization_id", orgId)
     .order("due_date", { ascending: true, nullsFirst: false })
     .order("created_at", { ascending: false })
-    .limit(LIMITE_DA_LISTA);
+    .limit(limite);
 
   if (filtros.status) query = query.eq("status", filtros.status);
   if (filtros.priority) query = query.eq("priority", filtros.priority);
@@ -233,10 +267,11 @@ async function listar(req: NextRequest): Promise<Response> {
   if (filtros.demanda_id) query = query.eq("demanda_id", filtros.demanda_id);
   if (filtros.due_from) query = query.gte("due_date", filtros.due_from);
   if (filtros.due_to) query = query.lte("due_date", filtros.due_to);
-  if (filtros.aberto === "true") query = query.in("status", ["pending", "in_progress"]);
+  if (filtros.aberto === "true") query = query.in("status", [...SITUACOES_ABERTAS_DA_TAREFA]);
   if (filtros.assigned_to === "me") query = query.eq("assigned_to", usuario!);
   else if (filtros.assigned_to === "ninguem") query = query.is("assigned_to", null);
   else if (filtros.assigned_to) query = query.eq("assigned_to", filtros.assigned_to);
+  if (filtros.pipeline_id) query = query.eq("lead.pipeline_id", filtros.pipeline_id);
   // NÃO usar `.in()` do supabase-js: ele não escapa `"` e `\` nos valores (D9v2-1). `valorDoFiltroIn`
   // põe cada valor entre aspas e escapa as duas, na gramática do PostgREST.
   if (filtros.external_id) query = query.filter("external_id", "in", valorDoFiltroIn(filtros.external_id));
@@ -253,7 +288,7 @@ async function listar(req: NextRequest): Promise<Response> {
     return fail("internal_error", t("Erro ao listar as tarefas."), 500, { requestId });
   }
 
-  const cortada = count > LIMITE_DA_LISTA;
+  const cortada = count > limite;
   const encontradas = (data ?? []) as unknown as Tarefa[];
   // Consulta por chave é consulta de ROBÔ: só as linhas que casaram, sem a família da tela.
   if (filtros.external_id || filtros.external_id_prefix) {
@@ -343,9 +378,9 @@ async function criar(req: NextRequest): Promise<Response> {
   if (parsed.data.assigned_to) {
     // A chave estrangeira de `assigned_to` é só para `auth.users`: sem esta conferência, um id de
     // outra organização (ou de quem saiu da equipe) gravaria sem erro. A régua
-    // e o porquê do admin client estão em `lib/tarefas/responsavel.ts`.
-    const equipe = isServiceRoleConfigured() ? createAdminClient() : await createClient();
-    const veredito = await conferirResponsavel(equipe, orgId, parsed.data.assigned_to);
+    // e o porquê do filtro de organização estão em `lib/tarefas/responsavel.ts`
+    // (SQL direto na porta de `lib/db` — o pool NÃO passa por RLS).
+    const veredito = await conferirResponsavel(portaDaAplicacao(), orgId, parsed.data.assigned_to);
     if (veredito === "falha_na_consulta") {
       return fail("internal_error", t("Erro ao salvar a tarefa."), 500, { requestId });
     }
@@ -406,7 +441,7 @@ async function criar(req: NextRequest): Promise<Response> {
   if (demandaParaConferir) {
     // A chave estrangeira não passa pela RLS: sem esta conferência, a demanda
     // de outra organização gravaria sem erro. A régua está em `lib/tarefas/demanda.ts`.
-    const veredito = await conferirDemanda(supabase, orgId, demandaParaConferir);
+    const veredito = await conferirDemanda(portaDaAplicacao(), orgId, demandaParaConferir);
     if (veredito === "falha_na_consulta") {
       return fail("internal_error", t("Erro ao salvar a tarefa."), 500, { requestId });
     }
@@ -493,7 +528,7 @@ async function criar(req: NextRequest): Promise<Response> {
   });
 
   // O laço de retorno: tarefa presa a um negócio aparece na linha do tempo dele.
-  await registraAtividadeDaTarefa(supabase, {
+  await registraAtividadeDaTarefa(portaDaAplicacao(), {
     organizationId: orgId,
     tarefa,
     tipo: "task_created",

@@ -41,6 +41,7 @@ interface ErroPg {
 export interface RespostaFalsa<T> {
   data: T | null;
   error: ErroPg | null;
+  count?: number | null;
 }
 
 function naoImplementado(metodo: string): never {
@@ -171,6 +172,13 @@ function projecaoSql(colunas: string, aliasExterno: string): { sql: string; temE
   return { sql, temEmbed };
 }
 
+/** Forma temporal usada pelos claims antigos: a condição continua no SQL. */
+function ouTemporal(expressao: string): { coluna: string; operador: string; valor: string } {
+  const m = /^([a-z_][a-z0-9_]*)\.is\.null,\1\.(lt|lte)\.(.+)$/.exec(expressao);
+  if (!m) return naoImplementado(`or(${expressao})`);
+  return { coluna: m[1]!, operador: m[2] === "lt" ? "<" : "<=", valor: m[3]! };
+}
+
 class ConsultaPg<T> implements PromiseLike<RespostaFalsa<T[]>> {
   /** [operador, coluna, valor] — o operador entra porque `.lt`/`.gt` existem. */
   private filtros: Array<[string, string, unknown]> = [];
@@ -183,6 +191,7 @@ class ConsultaPg<T> implements PromiseLike<RespostaFalsa<T[]>> {
     private readonly pool: pg.Pool,
     private readonly tabela: string,
     private readonly colunas: string,
+    private readonly opcoes?: { count?: "exact"; head?: boolean },
   ) {}
 
   eq(coluna: string, valor: unknown): this {
@@ -296,14 +305,26 @@ class ConsultaPg<T> implements PromiseLike<RespostaFalsa<T[]>> {
    * `contact_id.eq.<id>,lead_id.in.(<ids>)` para alcançar todas as tarefas do
    * titular. Ignorar esse grupo faria o invariante afirmar anonimização sem
    * sequer consultar o mesmo conjunto que a produção consulta.
+   *
+   * Também a forma temporal dos claims antigos (`col.is.null,col.lt.<instante>`,
+   * que o upstream tratava à parte em `ouTemporal`): `is.null`, `lt` e `lte`
+   * viram condições do MESMO grupo, e o SQL sai igual —
+   * `("col" is null or "col" < $n)`.
    */
   or(filtro: string): this {
     const grupo = fatiarNoTopo(filtro).map((parte): [string, string, unknown] => {
-      const match = /^([A-Za-z0-9_]+)\.(eq|in)\.([^]*)$/.exec(parte.trim());
+      const match = /^([A-Za-z0-9_]+)\.(eq|in|is|lt|lte)\.([^]*)$/.exec(parte.trim());
       if (!match) return naoImplementado(`or(${filtro})`);
       const [, coluna, operador, valor] = match;
       if (operador === "eq") {
         return ["=", coluna!, valor!.replace(/^"(.*)"$/, "$1")];
+      }
+      if (operador === "is") {
+        if (valor !== "null") return naoImplementado(`or(${filtro})`);
+        return ["is", coluna!, null];
+      }
+      if (operador === "lt" || operador === "lte") {
+        return [operador === "lt" ? "<" : "<=", coluna!, valor!.replace(/^"(.*)"$/, "$1")];
       }
       return ["= any", coluna!, listaDoPostgrest(valor)];
     });
@@ -317,7 +338,7 @@ class ConsultaPg<T> implements PromiseLike<RespostaFalsa<T[]>> {
     return naoImplementado("neq");
   }
 
-  private montar(): { texto: string; valores: unknown[] } {
+  private montar(contagem = false): { texto: string; valores: unknown[] } {
     const valores: unknown[] = [];
     const condicao = ([op, c, v]: [string, string, unknown]) => {
       // `is` não gasta placeholder: a palavra entra inline.
@@ -333,13 +354,13 @@ class ConsultaPg<T> implements PromiseLike<RespostaFalsa<T[]>> {
     const onde = this.filtros.map(condicao);
     onde.push(...this.filtrosOu.map((grupo) => `(${grupo.map(condicao).join(" or ")})`));
     const projecao = projecaoSql(this.colunas, "linha");
-    let texto = `select ${projecao.sql} from public."${this.tabela}"`;
+    let texto = `select ${contagem ? "count(*)::int as quantidade" : projecao.sql} from public."${this.tabela}"`;
     // O alias só entra quando há embed: a subquery precisa apontar para a
     // coluna de FK DA LINHA EXTERNA, e sem alias a referência seria ambígua.
     if (projecao.temEmbed) texto += " linha";
     if (onde.length > 0) texto += ` where ${onde.join(" and ")}`;
-    if (this.ordem) texto += ` order by "${this.ordem.coluna}" ${this.ordem.asc ? "asc" : "desc"}`;
-    if (this.teto !== null) texto += ` limit ${this.teto}`;
+    if (this.ordem && !contagem) texto += ` order by "${this.ordem.coluna}" ${this.ordem.asc ? "asc" : "desc"}`;
+    if (this.teto !== null && !contagem) texto += ` limit ${this.teto}`;
     return { texto, valores };
   }
 
@@ -383,10 +404,42 @@ class ConsultaPg<T> implements PromiseLike<RespostaFalsa<T[]>> {
     aoResolver?: ((v: RespostaFalsa<T[]>) => R1 | PromiseLike<R1>) | null,
     aoRejeitar?: ((r: unknown) => R2 | PromiseLike<R2>) | null,
   ): PromiseLike<R1 | R2> {
-    return this.linhas()
-      .then(({ rows, error }) => (error ? { data: null, error } : { data: rows, error: null }))
-      .then(aoResolver, aoRejeitar);
+    const executar = async (): Promise<RespostaFalsa<T[]>> => {
+      try {
+        let count: number | undefined;
+        if (this.opcoes?.count === "exact") {
+          const q = this.montar(true);
+          const result = await this.pool.query(q.texto, q.valores);
+          count = Number(result.rows[0]?.quantidade);
+          if (!Number.isFinite(count)) throw new Error("pg_como_supabase_count_invalid");
+          if (this.opcoes.head) return { data: null, error: null, count };
+        }
+        const { rows, error } = await this.linhas();
+        return { data: error ? null : rows, error, ...(count === undefined ? {} : { count }) };
+      } catch (error) { return { data: null, error: erroDe(error), count: null }; }
+    };
+    return executar().then(aoResolver, aoRejeitar);
   }
+}
+
+/** O driver pg codifica [] como array SQL. Só colunas JSON recebem JSON.stringify. */
+async function valoresDeEscrita(pool: pg.Pool, tabela: string, linha: Record<string, unknown>): Promise<unknown[]> {
+  const chaves = Object.keys(linha);
+  const arrays = chaves.filter((k) => Array.isArray(linha[k]));
+  const json = new Set<string>();
+  if (arrays.length > 0) {
+    const tipos = await pool.query<{ attname: string }>(
+      `select a.attname from pg_attribute a join pg_class c on c.oid=a.attrelid
+       join pg_namespace n on n.oid=c.relnamespace where n.nspname='public' and c.relname=$1
+       and a.attname=any($2::text[]) and a.atttypid in ('json'::regtype,'jsonb'::regtype) and not a.attisdropped`,
+      [tabela, arrays],
+    );
+    for (const r of tipos.rows) json.add(r.attname);
+  }
+  return chaves.map((k) => {
+    const v = linha[k];
+    return v !== null && typeof v === "object" && (!Array.isArray(v) || json.has(k)) ? JSON.stringify(v) : v;
+  });
 }
 
 class InsercaoPg<T> implements PromiseLike<RespostaFalsa<null>> {
@@ -403,13 +456,9 @@ class InsercaoPg<T> implements PromiseLike<RespostaFalsa<null>> {
     return this;
   }
 
-  private montar(): { texto: string; valores: unknown[] } {
+  private async montar(): Promise<{ texto: string; valores: unknown[] }> {
     const chaves = Object.keys(this.linha);
-    const valores = chaves.map((k) => {
-      const v = this.linha[k];
-      // jsonb/array vão como parâmetro; objeto solto o driver não converte.
-      return v !== null && typeof v === "object" && !Array.isArray(v) ? JSON.stringify(v) : v;
-    });
+    const valores = await valoresDeEscrita(this.pool, this.tabela, this.linha);
     const marcas = chaves.map((_, i) => `$${i + 1}`).join(", ");
     const texto =
       `insert into public."${this.tabela}" (${chaves.map((k) => `"${k}"`).join(", ")}) values (${marcas})` +
@@ -418,8 +467,8 @@ class InsercaoPg<T> implements PromiseLike<RespostaFalsa<null>> {
   }
 
   async single(): Promise<RespostaFalsa<T>> {
-    const { texto, valores } = this.montar();
     try {
+      const { texto, valores } = await this.montar();
       const r = await this.pool.query(texto, valores);
       return { data: (r.rows[0] ?? null) as T, error: null };
     } catch (e) {
@@ -440,9 +489,8 @@ class InsercaoPg<T> implements PromiseLike<RespostaFalsa<null>> {
     aoResolver?: ((v: RespostaFalsa<null>) => R1 | PromiseLike<R1>) | null,
     aoRejeitar?: ((r: unknown) => R2 | PromiseLike<R2>) | null,
   ): PromiseLike<R1 | R2> {
-    const { texto, valores } = this.montar();
-    return this.pool
-      .query(texto, valores)
+    return this.montar()
+      .then(({ texto, valores }) => this.pool.query(texto, valores))
       .then(() => ({ data: null, error: null }) as RespostaFalsa<null>)
       .catch((e: unknown) => ({ data: null, error: erroDe(e) }) as RespostaFalsa<null>)
       .then(aoResolver, aoRejeitar);
@@ -461,6 +509,7 @@ class AtualizacaoPg<T> implements PromiseLike<RespostaFalsa<unknown>> {
   /** [operador, coluna, valor] — mesmo contrato do `ConsultaPg`. */
   private filtros: Array<[string, string, unknown]> = [];
   private colunasDeVolta: string | null = null;
+  private ou: ReturnType<typeof ouTemporal> | null = null;
 
   constructor(
     private readonly pool: pg.Pool,
@@ -472,6 +521,9 @@ class AtualizacaoPg<T> implements PromiseLike<RespostaFalsa<unknown>> {
     this.filtros.push(["=", coluna, valor]);
     return this;
   }
+
+  lte(coluna: string, valor: unknown): this { this.filtros.push(["<=", coluna, valor]); return this; }
+  or(expressao: string): this { this.ou = ouTemporal(expressao); return this; }
 
   /**
    * `.is()` na ESCRITA — o caminho que motivou a peça.
@@ -511,13 +563,9 @@ class AtualizacaoPg<T> implements PromiseLike<RespostaFalsa<unknown>> {
     return this;
   }
 
-  private montar(): { texto: string; valores: unknown[] } {
-    const valores: unknown[] = [];
-    const sets = Object.keys(this.patch).map((k) => {
-      const v = this.patch[k];
-      valores.push(v !== null && typeof v === "object" && !Array.isArray(v) ? JSON.stringify(v) : v);
-      return `"${k}" = $${valores.length}`;
-    });
+  private async montar(): Promise<{ texto: string; valores: unknown[] }> {
+    const valores = await valoresDeEscrita(this.pool, this.tabela, this.patch);
+    const sets = Object.keys(this.patch).map((k, i) => `"${k}" = $${i + 1}`);
     const onde = this.filtros.map(([op, c, v]) => {
       // `is` não gasta placeholder: a palavra entra inline.
       if (op === "is") return `"${c}" is ${literalDeIs(v)}`;
@@ -526,6 +574,10 @@ class AtualizacaoPg<T> implements PromiseLike<RespostaFalsa<unknown>> {
       if (op === "not = any") return `not ("${c}" = any($${valores.length}))`;
       return `"${c}" ${op} $${valores.length}`;
     });
+    if (this.ou) {
+      valores.push(this.ou.valor);
+      onde.push(`("${this.ou.coluna}" is null or "${this.ou.coluna}" ${this.ou.operador} $${valores.length})`);
+    }
     let texto = `update public."${this.tabela}" set ${sets.join(", ")}`;
     if (onde.length > 0) texto += ` where ${onde.join(" and ")}`;
     if (this.colunasDeVolta) texto += ` returning ${colunasSql(this.colunasDeVolta)}`;
@@ -533,8 +585,8 @@ class AtualizacaoPg<T> implements PromiseLike<RespostaFalsa<unknown>> {
   }
 
   async maybeSingle(): Promise<RespostaFalsa<T>> {
-    const { texto, valores } = this.montar();
     try {
+      const { texto, valores } = await this.montar();
       const r = await this.pool.query(texto, valores);
       if (r.rows.length > 1) {
         return { data: null, error: { message: "multiple rows returned", code: "PGRST116" } };
@@ -570,10 +622,9 @@ class AtualizacaoPg<T> implements PromiseLike<RespostaFalsa<unknown>> {
     aoResolver?: ((v: RespostaFalsa<unknown>) => R1 | PromiseLike<R1>) | null,
     aoRejeitar?: ((r: unknown) => R2 | PromiseLike<R2>) | null,
   ): PromiseLike<R1 | R2> {
-    const { texto, valores } = this.montar();
     const pediuRetorno = this.colunasDeVolta !== null;
-    return this.pool
-      .query(texto, valores)
+    return this.montar()
+      .then(({ texto, valores }) => this.pool.query(texto, valores))
       .then(
         (r) =>
           ({ data: pediuRetorno ? r.rows : null, error: null }) as RespostaFalsa<unknown>,
@@ -616,7 +667,7 @@ export function pgComoSupabase(pool: pg.Pool): SupabaseClient {
   return {
     from(tabela: string) {
       return {
-        select: (colunas = "*") => new ConsultaPg(pool, tabela, colunas),
+        select: (colunas = "*", opcoes?: { count?: "exact"; head?: boolean }) => new ConsultaPg(pool, tabela, colunas, opcoes),
         insert: (linha: Record<string, unknown>) => new InsercaoPg(pool, tabela, linha),
         update: (patch: Record<string, unknown>) => new AtualizacaoPg(pool, tabela, patch),
         delete: () => naoImplementado("delete"),
