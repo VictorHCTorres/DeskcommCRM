@@ -505,7 +505,46 @@ const FRASES_DE_OPT_OUT: readonly RegExp[] = [
   // E o espelho da forma com objeto: "cancelar la suscripción a los mensajes"
   // bloqueia na hora; "cancelar la suscripción" sozinha só escala.
   /\bcancelar\s+(?:la\s+|mi\s+)?suscripcion\s+(?:a|de)\s+(?:los|estos|tus|sus)\s+(?:mensajes|promociones|ofertas)\b/u,
+  // ── o botão "Parar mensagens" do modelo oficial (Linha A, 1.110.2) ─────────
+  //
+  // A Meta recusou o botão de descadastro nativo e aprovou "Parar mensagens"
+  // como resposta rápida COMUM: o toque chega como texto, com o rótulo do botão
+  // (`textoDoClique`, `lib/channels/meta/webhook.ts`). Medido antes deste bloco:
+  // "Parar mensagens", "parar as mensagens", "não mande mais mensagem" e
+  // "cancelar mensagens" devolviam `false` — quem tocava no botão seguia
+  // recebendo, no canal em que denúncia derruba a nota do número.
+  //
+  // O objeto de comunicação ("mensagem/mensagens") é OBRIGATÓRIO, como no resto
+  // da lista. Só as formas de `parar` no infinitivo e no imperativo entram:
+  // "para" fica de fora porque é também preposição ("para mensagens de voz,
+  // ligue...").
+  /\b(?:parar|pare|parem)\s+(?:(?:com\s+)?(?:as|essas|estas|suas)\s+|com\s+|de\s+)?mensage(?:m|ns)\b/u,
+  // "não mande mais mensagem", "não envie mais mensagens", "não mandem mais
+  // nada": sem o "me" (que a regra de cima exige), o objeto precisa estar escrito.
+  /\bnao\s+(?:mande|manda|mandem|mandar|envie|envia|enviem|enviar)\s+mais\s+(?:mensage(?:m|ns)|nada)\b/u,
+  /\bnao\s+quero\s+mais\s+(?:essas|estas|suas|as)\s+mensagens\b/u,
 ];
+
+/**
+ * Pedidos que só valem quando são a MENSAGEM INTEIRA (pontuação e emoji de borda
+ * fora) — o irmão de `PALAVRAS_DE_OPT_OUT` para duas ou três palavras. No meio de
+ * uma frase maior não bloqueiam: "como cancelar mensagens agendadas?" é dúvida de
+ * produto, e "não mande mais, já recebi o boleto" é reclamação.
+ */
+const MENSAGENS_INTEIRAS_DE_OPT_OUT: readonly RegExp[] = [
+  // O payload do botão, quando a Meta não manda o rótulo: "PARAR_MENSAGENS",
+  // "parar-mensagens". Sem espaço, a frase de cima não casa; aqui a mensagem já
+  // chegou só com letras e espaços.
+  /^(?:parar|pare)\s+(?:(?:as|de)\s+)?mensage(?:m|ns)$/u,
+  /^(?:cancelar|cancele|cancela|para)\s+(?:(?:as|essas|estas)\s+)?mensage(?:m|ns)$/u,
+  /^nao\s+(?:me\s+)?(?:mande|manda|mandem|envie|envia|enviem)\s+mais(?:\s+isso)?$/u,
+  /^(?:pare|parem|para)\s+de\s+mandar$/u,
+];
+
+/** A mensagem inteira, só com letras e espaços simples — o que `MENSAGENS_INTEIRAS_DE_OPT_OUT` lê. */
+function soLetrasEEspacos(normalizado: string): string {
+  return normalizado.replace(/[^a-z]+/gu, " ").trim();
+}
 
 /**
  * Frases AMBÍGUAS: sugerem que a pessoa quer parar, sem nomear a mensagem. Não
@@ -688,6 +727,8 @@ function ehPedidoInequivoco(texto: string): boolean {
   const normalizado = normalizarTexto(texto.trim());
   if (normalizado === "") return false;
   if (ehPalavraIsolada(normalizado)) return true;
+  const inteira = soLetrasEEspacos(normalizado);
+  if (MENSAGENS_INTEIRAS_DE_OPT_OUT.some((re) => re.test(inteira))) return true;
   return FRASES_DE_OPT_OUT.some((re) => re.test(normalizado));
 }
 
