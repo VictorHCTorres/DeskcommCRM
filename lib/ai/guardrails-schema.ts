@@ -195,6 +195,23 @@ export const agentConfigSchema = z.object({
    * a leitura recusaria em silêncio.
    */
   aviso_de_handoff: z.string().max(TETO_DA_FRASE_DO_AVISO).nullable().optional(),
+  /**
+   * O complemento da frase acima FORA do horário de atendimento humano
+   * (1.110.2): "Ele te responde no próximo dia útil, a partir das 8h." Ausente
+   * por padrão; só existe junto da frase própria. Sem tela ainda — grava-se
+   * pelo PATCH do agente. Ver `lib/escalacao/frase-do-aviso-configurada.ts`.
+   */
+  aviso_de_handoff_fora_do_horario: z.string().max(TETO_DA_FRASE_DO_AVISO).nullable().optional(),
+  /** Quando há gente para responder. Ausente = segunda a sexta, 8h às 18h, America/Sao_Paulo. */
+  aviso_de_handoff_expediente: z
+    .object({
+      fuso: z.string().min(1).max(64).optional(),
+      dias: z.array(z.number().int().min(0).max(6)).min(1).max(7).optional(),
+      inicio: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/).optional(),
+      fim: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/).optional(),
+    })
+    .nullable()
+    .optional(),
 });
 export type AgentConfig = z.infer<typeof agentConfigSchema>;
 
