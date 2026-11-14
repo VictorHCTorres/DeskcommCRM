@@ -58,15 +58,24 @@ interface Opcoes {
   /** A etiqueta que o contato ganha DEPOIS da conferência da entrada. */
   etiquetaDepoisDaEntrada?: string;
   resposta?: boolean;
+  /** O 1º `rollback` da conexão falha (a conexão caiu depois do veto). */
+  rollbackFalha?: boolean;
 }
 
 function cenario(o: Opcoes) {
   let relogio = new Date(o.inicio).getTime();
   let leiturasDoContato = 0;
   const consultas: string[] = [];
+  const daConexao: string[] = [];
+  const doPool: Array<{ sql: string; params: unknown[] }> = [];
+  let rollbacks = 0;
   const responder = (sql: string) => {
     const s = n(sql);
     consultas.push(s);
+    if (s === 'rollback') {
+      rollbacks += 1;
+      if (o.rollbackFalha && rollbacks === 1) throw new Error('conexão caiu');
+    }
     if (s.includes('left join channel_knobs')) return { rows: [knobs(o.throttleMs ?? 60_000, o.janela ?? [8, 18])], rowCount: 1 };
     if (s.startsWith('select (select sent_at from pacing_ledger'))
       return { rows: [{ last_sent_at: new Date(o.ultimaSaida), sent_today: '1' }], rowCount: 1 };
@@ -87,8 +96,20 @@ function cenario(o: Opcoes) {
     if (s.startsWith('insert into before_send_traces')) return { rows: [{ id: 't' }], rowCount: 1 };
     return { rows: [], rowCount: 0 };
   };
-  const cliente = { query: vi.fn(async (sql: string) => responder(sql)), release: vi.fn() };
-  const pool = { connect: vi.fn(async () => cliente), query: vi.fn(async (sql: string) => responder(sql)) };
+  const cliente = {
+    query: vi.fn(async (sql: string) => {
+      daConexao.push(n(sql));
+      return responder(sql);
+    }),
+    release: vi.fn(),
+  };
+  const pool = {
+    connect: vi.fn(async () => cliente),
+    query: vi.fn(async (sql: string, params?: unknown[]) => {
+      doPool.push({ sql: n(sql), params: params ?? [] });
+      return responder(sql);
+    }),
+  };
   const enviadoAs: Date[] = [];
   const send = vi.fn(async () => {
     enviadoAs.push(new Date(relogio));
@@ -98,6 +119,8 @@ function cenario(o: Opcoes) {
     enviadoAs,
     send,
     consultas,
+    daConexao,
+    doPool,
     run: () =>
       runBeforeSend({
         pool: pool as unknown as pg.Pool,
@@ -208,6 +231,32 @@ describe('v20 · o número de prospecção: a hora é reconferida depois da espe
     expect(r.code).toBe('chip_de_prospeccao:etiqueta_de_parada');
     expect(r.nextAllowedAt).toBeUndefined();
     expect(gravouALinha(c.consultas)).toBe(false);
+  });
+
+  it('⭐ a reconferência lê pela conexão que segura a trava do número, uma vez; a da entrada, pelo pool', async () => {
+    const c = cenario({ inicio: '2026-11-18T20:58:00.000Z', ultimaSaida: '2026-11-18T20:57:50.000Z' });
+    await c.run();
+    const ehATrava = (sql: string) => sql.includes("'prospeccao' as marca_da_prospeccao");
+    expect(c.daConexao.filter(ehATrava)).toHaveLength(1);
+    expect(c.doPool.filter((q) => ehATrava(q.sql))).toHaveLength(1);
+    // Depois da espera (a leitura do limite) e antes do registro.
+    const naConexao = c.daConexao.findIndex(ehATrava);
+    expect(naConexao).toBeGreaterThan(c.daConexao.findIndex((s) => s.startsWith('select (select sent_at from pacing_ledger')));
+    expect(naConexao).toBeLessThan(c.daConexao.findIndex((s) => s.includes('insert into pacing_ledger')));
+  });
+
+  it('⭐ o rollback do veto falhou: o erro sobe, nada sai, e a auditoria leva o veto', async () => {
+    const c = cenario({
+      inicio: '2026-11-18T20:59:50.000Z',
+      ultimaSaida: '2026-11-18T20:59:40.000Z',
+      rollbackFalha: true,
+    });
+    await expect(c.run()).rejects.toThrow('conexão caiu');
+    expect(c.send).not.toHaveBeenCalled();
+    expect(gravouALinha(c.consultas)).toBe(false);
+    const auditoria = c.doPool.filter((q) => q.sql.startsWith('insert into before_send_traces'));
+    expect(auditoria).toHaveLength(1);
+    expect(auditoria[0]!.params.slice(5, 7)).toEqual(['chip_de_prospeccao', 'outside_window']);
   });
 
   it('não-regressão: num número que não é de prospecção, a espera que atravessa as 18h00 segue como antes', async () => {
