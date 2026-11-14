@@ -58,9 +58,29 @@ export async function agenteDaCampanhaDaConversa(
       `select c.agent_id
          from campaign_recipients r
          join campaigns c on c.id = r.campaign_id
+         join conversations cv on cv.id = r.conversation_id and cv.organization_id = r.organization_id
         where r.organization_id = $1
           and r.conversation_id = $2
           and c.agent_id is not null
+          -- O número de prospecção (Linha A, v20) só responde com o agente DO NÚMERO: a campanha que declara um
+          -- agente publicado em outro número (ou em nenhum) não o põe para responder aqui. Fora do número de
+          -- prospecção, nada muda.
+          and (
+            not exists (
+              select 1 from campaigns p
+               where p.organization_id = r.organization_id
+                 and p.base_legal = 'legitimate_interest' and p.status <> 'draft'
+                 and (p.channel_session_id = cv.channel_session_id
+                      or exists (select 1 from campaign_channel_sessions q
+                                  where q.organization_id = p.organization_id and q.campaign_id = p.id
+                                    and q.channel_session_id = cv.channel_session_id)))
+            or exists (
+              select 1 from ai_agents a
+                join ai_agent_versions v on v.id = a.published_version_id
+               where a.organization_id = r.organization_id and a.id = c.agent_id
+                 and a.archived_at is null and v.status = 'published'
+                 and v.channel_session_id = cv.channel_session_id)
+          )
         order by r.sent_at desc nulls last
         limit 1`,
       [tenantId, conversationId],
