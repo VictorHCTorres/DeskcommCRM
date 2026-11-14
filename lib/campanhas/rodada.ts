@@ -60,7 +60,6 @@ import {
   falhaDoEnvioInteiro,
   fraseDaFalha,
 } from "@/lib/channels/erro-da-plataforma";
-import { feriadosDoBrasilDoAno } from "@/lib/lgpd/holidays-br";
 import { logger } from "@/lib/logger";
 import { OrgNaoOperanteError, STATUS_OPERANTE, ehOperante, statusDaOrgEmbutida } from "@/lib/organizacao/operante";
 import type { Message } from "@/lib/types/messaging";
@@ -81,6 +80,7 @@ import { estadoDeEnvio } from "./estado-de-envio";
 import { VetoDaCampanhaError, type MotivoDaHora, type VetoDaCampanha } from "./entrega";
 import type { ConteudoDoEnvio } from "./modelo";
 import { renderizar } from "./renderizador";
+import { ehFeriadoNacional } from "./chip-de-prospeccao";
 import { RAJADA, RajadaInterrompida, rodarEmRajada } from "./rajada";
 import { rodarCampanhaEmTransmissao } from "./transmissao";
 import { escolherNumero, poolDaCampanha, type NumeroDisponivel } from "./rodizio";
@@ -230,6 +230,22 @@ export async function rodarUmaRodadaDeCampanha(
     if (principaisOcupados.size >= NUMEROS_POR_RODADA) break;
 
     try {
+      // A prospecção NÃO sai por transmissão (Linha A, v20): o provedor manda a lista de uma vez, sem conferir cada
+      // pessoa na hora do envio, e entre a última releitura e o `enviar` quem pedir para sair recebe (ver o cabeçalho
+      // de `transmissao.ts`). A campanha pausa com o motivo, antes de criar qualquer transmissão.
+      if (emTransmissao(campanha) && ehProspeccao(campanha)) {
+        await pausarPorFalha(
+          admin,
+          campanha.id,
+          {
+            codigo: "prospeccao_sem_transmissao",
+            detalhe: "Campanha de prospecção não sai por transmissão: escolha a velocidade gradual ou rápida.",
+          },
+          agora,
+        );
+        detalhes.push(`${campanha.id.slice(0, 8)}:prospeccao_sem_transmissao`);
+        continue;
+      }
       const r = emTransmissao(campanha)
         ? await rodarCampanhaEmTransmissao(admin, campanha, agora)
         : emRajada(campanha)
@@ -367,17 +383,6 @@ function desfechoDoVeto(
   detalhe: string,
 ): { enviadas: 0; pulados: 0 | 1; concluidas: 0; detalhe: string } {
   return { enviadas: 0, pulados: "pular" in veto ? 1 : 0, concluidas: 0, detalhe };
-}
-
-/** O dia de `agora`, no fuso dado, é um dos feriados nacionais de `lib/lgpd/holidays-br.ts`? */
-function ehFeriadoNacional(agora: Date, fuso: string): boolean {
-  const dia = new Intl.DateTimeFormat("sv-SE", {
-    timeZone: fuso,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).format(agora);
-  return feriadosDoBrasilDoAno(Number(dia.slice(0, 4))).includes(dia);
 }
 
 /** A meia-noite LOCAL seguinte: 36 h depois da de hoje cai sempre no dia seguinte, com ou sem horário de verão. */

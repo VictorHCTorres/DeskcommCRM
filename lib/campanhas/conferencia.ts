@@ -17,6 +17,7 @@
  * aberta, e o cancelamento entre um balão e outro.
  */
 import type { SupabaseClient } from "@supabase/supabase-js";
+import { dayStartInTz } from "@/lib/agent-engine/pacing/engine";
 
 import { samePhone } from "@/lib/channels/phone-variants";
 import { logger } from "@/lib/logger";
@@ -270,7 +271,56 @@ export async function travaDaProspeccao(
   const escreveu = await escreveuDepoisDe(admin, campanha.organization_id, alvo.contact_id, campanha.prepared_at);
   if (escreveu === null) return { esperar: "sem_leitura" };
   if (escreveu) return { pular: "escreveu_depois_da_preparacao" };
+
+  const duplicada = await recebeuOutraCampanhaNoDia(admin, campanha, alvo, agora);
+  if (duplicada === null) return { esperar: "sem_leitura" };
+  if (duplicada) return { pular: "recebeu_outra_campanha_hoje" };
   return null;
+}
+
+/** O fuso do dia da duplicidade: o da operação (Linha A, Fortaleza e São Paulo têm o mesmo relógio). */
+export const FUSO_DA_DUPLICIDADE = "America/Sao_Paulo";
+
+/** Os estados de quem já recebeu ou está recebendo agora, em qualquer campanha. */
+const ESTADOS_QUE_CONTAM_NO_DIA = ["sending", "sent", "delivered", "read", "replied"] as const;
+
+/**
+ * A DUPLICIDADE (Linha A, v20): ninguém recebe duas mensagens de prospecção no mesmo dia, nem pelo mesmo cadastro
+ * nem por um cadastro gêmeo com o mesmo número. A unicidade da fila (`campaign_recipients_contato_unico` e
+ * `_endereco_unico`) vale DENTRO de uma campanha; duas campanhas do mesmo dia (dois toques, ou um lote importado
+ * duas vezes) mandavam as duas. Conta o destinatário de OUTRA linha, de qualquer campanha da organização, que está
+ * saindo ou já saiu hoje (no fuso da operação), pelo contato ou pelo número congelado. `null` = não deu para ler
+ * (a trava espera: falha fechada).
+ */
+export async function recebeuOutraCampanhaNoDia(
+  admin: SupabaseClient,
+  campanha: { organization_id: string },
+  alvo: DestinatarioRow,
+  agora: Date,
+): Promise<boolean | null> {
+  const inicioDoDia = dayStartInTz(agora, FUSO_DA_DUPLICIDADE).getTime();
+  const consultas: Array<["contact_id" | "recipient_address", string]> = [["contact_id", alvo.contact_id]];
+  const endereco = (alvo.recipient_address ?? "").trim();
+  if (endereco !== "") consultas.push(["recipient_address", endereco]);
+  for (const [coluna, valor] of consultas) {
+    const { data, error } = await admin
+      .from("campaign_recipients")
+      .select("id, status, sending_at, sent_at")
+      .eq("organization_id", campanha.organization_id)
+      .eq(coluna, valor)
+      .in("status", [...ESTADOS_QUE_CONTAM_NO_DIA]);
+    if (error) return null;
+    const hoje = ((data ?? []) as Array<{ id: string; status: string; sending_at: string | null; sent_at: string | null }>).some(
+      (r) => {
+        if (r.id === alvo.id) return false;
+        const quando = Date.parse(r.sent_at ?? r.sending_at ?? "");
+        // Sem hora nenhuma num estado de quem recebeu: conta (falha fechada).
+        return Number.isNaN(quando) || quando >= inicioDoDia;
+      },
+    );
+    if (hoje) return true;
+  }
+  return false;
 }
 
 /** Os estados de quem já saiu: o 1º balão foi, e o ack pode ter avançado o destinatário antes do balão seguinte. */

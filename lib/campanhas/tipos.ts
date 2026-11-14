@@ -121,6 +121,7 @@ export const MOTIVOS_DE_EXCLUSAO = [
   "atendimento_humano",
   "contato_mesclado",
   "destino_mudou",
+  "recebeu_outra_campanha_hoje",
 ] as const;
 
 export type MotivoDeExclusao = (typeof MOTIVOS_DE_EXCLUSAO)[number];
@@ -147,4 +148,5 @@ export const TEXTO_DA_EXCLUSAO: Record<MotivoDeExclusao, string> = {
   atendimento_humano: "Contato travado para atendimento humano",
   contato_mesclado: "Contato mesclado em outro",
   destino_mudou: "O telefone mudou depois da preparação",
+  recebeu_outra_campanha_hoje: "Já recebeu mensagem de outra campanha hoje",
 };
