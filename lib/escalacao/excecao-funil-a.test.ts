@@ -251,7 +251,7 @@ describe("lerExcecaoFunilA — a leitura", () => {
   const CONTATO = "00000000-0000-4000-8000-000000000002";
   const banco = (opcao: unknown[], contato: unknown[] | Error) => {
     const query = vi.fn(async (sql: string, _v: unknown[]) => {
-      if (sql.includes("org_guardrail_layers")) return { rows: opcao as Array<Record<string, unknown>> };
+      if (sql.includes("org_guardrail_layers") && !sql.includes("from contacts")) return { rows: opcao as Array<Record<string, unknown>> };
       if (contato instanceof Error) throw contato;
       return { rows: contato as Array<Record<string, unknown>> };
     });

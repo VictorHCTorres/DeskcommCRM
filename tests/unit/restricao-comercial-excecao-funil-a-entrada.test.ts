@@ -106,7 +106,7 @@ function rodar(mensagem: string, c: Cenario) {
   const leuNegocio = vi.fn();
   const pool = {
     query: vi.fn(async (sql: string, values?: unknown[]) => {
-      if (sql.includes('org_guardrail_layers')) {
+      if (sql.includes('org_guardrail_layers') && !sql.includes('from contacts')) {
         if (values?.[1] === OPCAO_EXCECAO_FUNIL_A) return { rows: c.opcao === null ? [] : [{ enabled: c.opcao }] };
         return { rows: [{ enabled: true }] };
       }

@@ -43,6 +43,15 @@ export const OPCAO_EXCECAO_FUNIL_A = "restricao_comercial_excecao_funil_a";
 /** A etiqueta do CONTATO que a importação da Linha A põe. */
 export const ETIQUETA_FUNIL_A = "funil-a";
 
+/**
+ * Segunda opção (1.110.3): parcelamento em até {@link PARCELAS_MAX} no cartão.
+ * Sem linha = desligada: o texto continua sem "parcela", "cartão", "Nx" e "link de pagamento".
+ */
+export const OPCAO_PARCELAMENTO_FUNIL_A = "restricao_comercial_excecao_funil_a_parcelamento";
+
+/** Teto de parcelas que a resposta pode citar. */
+export const PARCELAS_MAX = 6;
+
 /** O funil da Linha A, pelo nome ou pelo slug normalizados. */
 const FUNIL_PROSPECCAO = "prospeccao";
 
@@ -54,6 +63,8 @@ export type ExcecaoFunilA = {
   codigo: string | null;
   /** O `link_pagina` do negócio, o único endereço próprio que a resposta pode levar; `null` se vazio. */
   linkPagina: string | null;
+  /** Teto de parcelas liberado (opção de parcelamento ligada); `null`/ausente = sem parcelamento. */
+  parcelasMax?: number | null;
 };
 
 const normalizar = (texto: string): string =>
@@ -222,6 +233,31 @@ const CONDICOES_PROIBIDAS: ReadonlyArray<readonly [string, RegExp]> = [
   ["gratis", /\bgratis\b|\bgratuit\w*|\bde\s+graca\b/u],
 ];
 
+/** Rótulos que a opção de parcelamento troca pelas checagens de `conferirParcelamento`. */
+const LIBERADOS_COM_PARCELAMENTO = new Set(["parcelamento", "n_vezes", "n_x", "juros", "cartao", "link_de_pagamento"]);
+
+const PARCELAS_POR_EXTENSO: Readonly<Record<string, number>> = {
+  uma: 1, um: 1, duas: 2, dois: 2, tres: 3, quatro: 4, cinco: 5, seis: 6, sete: 7, oito: 8, nove: 9,
+  dez: 10, onze: 11, doze: 12,
+};
+
+/**
+ * Com o parcelamento ligado: só "até N" com N ≤ teto, "sem juros", cartão de CRÉDITO.
+ * Valor de parcela não precisa de regra própria: qualquer R$ diferente do preço já barra.
+ */
+function conferirParcelamento(normal: string, teto: number): string[] {
+  const motivos: string[] = [];
+  const numeros = [
+    ...[...normal.matchAll(/\b(\d{1,2})\s*(?:x(?![a-z])|vezes\b|parcelas?\b)/gu)].map((m) => Number(m[1])),
+    ...[...normal.matchAll(/\b(uma|um|duas|dois|tres|quatro|cinco|seis|sete|oito|nove|dez|onze|doze)\s+(?:vezes|parcelas?)\b/gu)]
+      .map((m) => PARCELAS_POR_EXTENSO[m[1]!] ?? 99),
+  ];
+  if (numeros.some((n) => n < 1 || n > teto)) motivos.push("parcelas_acima_do_teto");
+  if (/\bjuros\b/u.test(normal.replace(/\bsem\s+juros\b/gu, ""))) motivos.push("juros");
+  if (/\bdebito\b/u.test(normal)) motivos.push("cartao_de_debito");
+  return motivos;
+}
+
 /** Promessa de resultado. */
 const PROMESSAS_PROIBIDAS: ReadonlyArray<readonly [string, RegExp]> = [
   ["garantia", /\bgarant\w*/u],
@@ -277,9 +313,12 @@ export function conferirRespostaDaLinhaA(body: string, excecao: ExcecaoFunilA): 
   if (dinheiro.ilegivel) motivos.push("valor_ilegivel");
   if (dinheiro.centavos.some((c) => c !== excecao.precoCentavos)) motivos.push("valor_diferente_do_preco");
 
+  const teto = excecao.parcelasMax ?? null;
   for (const [rotulo, re] of [...CONDICOES_PROIBIDAS, ...PROMESSAS_PROIBIDAS, ...MEIOS_DE_PAGAMENTO_PROIBIDOS]) {
+    if (teto !== null && LIBERADOS_COM_PARCELAMENTO.has(rotulo)) continue;
     if (re.test(normal)) motivos.push(rotulo);
   }
+  if (teto !== null) motivos.push(...conferirParcelamento(normal, teto));
 
   for (const m of normal.matchAll(ENDERECO)) {
     if (!enderecoPermitido(m[0], excecao.linkPagina)) {
@@ -304,6 +343,8 @@ export function conferirRespostaDaLinhaA(body: string, excecao: ExcecaoFunilA): 
 export type FatosDaExcecao = {
   /** A linha da opção em `org_guardrail_layers` (`enabled`). */
   opcaoLigada: boolean;
+  /** A linha da opção de parcelamento (`enabled`); ausente = desligada. */
+  parcelamentoLigado?: boolean;
   /** As etiquetas do contato. */
   etiquetas: readonly string[];
   /** Os negócios ABERTOS do contato, com o funil de cada um. */
@@ -331,7 +372,12 @@ export function resolverExcecaoFunilA(fatos: FatosDaExcecao): ExcecaoFunilA | nu
     typeof campos === "object" && campos !== null ? (campos as Record<string, unknown>).preco : null,
   );
   if (precoCentavos === null) return null;
-  return { precoCentavos, codigo: textoDoCampo(campos, "codigo"), linkPagina: textoDoCampo(campos, "link_pagina") };
+  return {
+    precoCentavos,
+    codigo: textoDoCampo(campos, "codigo"),
+    linkPagina: textoDoCampo(campos, "link_pagina"),
+    ...(fatos.parcelamentoLigado === true ? { parcelasMax: PARCELAS_MAX } : {}),
+  };
 }
 
 type Db = { query: (sql: string, values: unknown[]) => Promise<{ rows: Array<Record<string, unknown>> }> };
@@ -359,6 +405,8 @@ export async function lerExcecaoFunilA(
     if (opcao.rows[0]?.enabled !== true) return null;
     const { rows } = await db.query(
       `select c.tags as etiquetas,
+              (select g.enabled from org_guardrail_layers g
+                where g.organization_id = c.organization_id and g.layer = '${OPCAO_PARCELAMENTO_FUNIL_A}') as parcelamento,
               coalesce((
                 select jsonb_agg(jsonb_build_object('funil_nome', p.name, 'funil_slug', p.slug, 'campos', l.custom_fields))
                   from crm_leads l
@@ -374,6 +422,7 @@ export async function lerExcecaoFunilA(
     const negocios = Array.isArray(linha.negocios) ? (linha.negocios as Array<Record<string, unknown>>) : [];
     return resolverExcecaoFunilA({
       opcaoLigada: true,
+      parcelamentoLigado: linha.parcelamento === true,
       etiquetas: Array.isArray(linha.etiquetas) ? (linha.etiquetas as unknown[]).filter((e): e is string => typeof e === "string") : [],
       negociosAbertos: negocios.map((n) => ({
         funilNome: typeof n.funil_nome === "string" ? n.funil_nome : null,

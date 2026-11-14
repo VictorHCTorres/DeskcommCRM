@@ -30,3 +30,7 @@ A exceção vale para o contato que tem a etiqueta `funil-a` **e** exatamente um
 - **Fora do alcance:** o texto fixo do follow-up e a mensagem de IA da automação (`restricaoComercialBarra` inline) não consultam a exceção; seguem barrados como antes.
 
 Ligar: `insert into org_guardrail_layers (organization_id, layer, enabled) values ('<org>', 'restricao_comercial_excecao_funil_a', true) on conflict (organization_id, layer) do update set enabled = true, updated_at = now();`. Desligar: o mesmo com `false`.
+
+### Parcelamento em até 6x (`restricao_comercial_excecao_funil_a_parcelamento`, 1.110.3)
+
+Segunda opção, também **desligada por padrão** (sem linha = desligada) e só lida junto com a exceção acima, na mesma consulta do contato. Ligada, a resposta da Linha A pode citar parcelamento, "N vezes"/"Nx", cartão de crédito, "sem juros" e "link de pagamento". Passa a barrar: número de parcelas acima de `PARCELAS_MAX` (6) ou abaixo de 1, em dígito ou por extenso (`parcelas_acima_do_teto`); "juros" que não seja "sem juros" (`juros`); "débito" (`cartao_de_debito`). Continuam barrados: qualquer valor em dinheiro diferente do `preco` (logo, valor de parcela), boleto, desconto, `%`, garantia, endereços e chave/QR/copia-e-cola. Ligar e desligar: o mesmo SQL acima, com a layer `restricao_comercial_excecao_funil_a_parcelamento`.
