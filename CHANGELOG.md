@@ -8,6 +8,71 @@ Se você roda o DeskcommCRM numa VPS, **leia a seção da versão para a qual es
 
 ## [Não lançado]
 
+## [1.110.0] — 2026-11-13
+
+### ⚠️ Requer atenção
+
+- **A instalação recebe o produto do projeto original até a 1.109.0, e o que é próprio da Suindara continua** Os avisos de ação do projeto original entre a 1.100.0 e a 1.109.0, reunidos aqui: a tela de atualização de quem está na 1.102.0 deste canal para no cabeçalho 1.102.0 do projeto original, que tem o mesmo número e é outra versão, e não chegaria aos três primeiros.
+
+  - **Contato do tipo Fornecedor sai do rodízio automático (1.100.0).** A conversa dele fica sem dono até alguém atribuí-la; no modo "Só os seus", o atendente não a vê enquanto estiver sem dono. Quem nunca marcou o tipo não é afetado.
+  - **A credencial reserva do canal oficial no `.env` vale só para o número dela (1.100.0).** O par `META_PHONE_NUMBER_ID`/`META_SYSTEM_USER_TOKEN` deixa de servir a outras conexões oficiais; uma conexão sem token legível fica como canal não conectado até ser reconectada.
+  - **Regra sobre as colunas de CPF responde só se estão preenchidas, e a API de contatos troca `cpf_hash` por `cpf_available` (1.104.0).** Regra que comparava o valor deixa de disparar (use "está preenchido"); integração que lia `cpf_hash` passa a ler `cpf_available`; modelo de mensagem que citava `contact.cpf_hash` ou `contact.cpf_encrypted` sai com o trecho em branco.
+  - **Cadastro só por convite: confira a chave (1.105.0).** Se você usa `SIGNUP_MODE=so_convite` e já salvou o comportamento, o molde de IA ou os destinos internos, abra Cadastro no painel da instalação e ligue Cadastro apenas por convite de novo.
+  - **O follow-up automático escolhe o agente pelo número da conversa (1.105.0).** Com mais de um número, confira que quem atende cada fluxo atende no número onde ele roda; o fluxo que disparava no número errado deixa de disparar.
+  - **Backup e pasta de anexos (1.109.0).** Com o Supabase na própria VPS, o backup do kit interrompe quando a pasta de anexos não existe, e a atualização para antes de mexer na instalação. Confira a pasta antes de atualizar. A atualização também troca a linha do crontab do dreno de eventos por um vigia de 15 em 15 minutos.
+
+### Adicionado
+
+- **Em IA › Credenciais, a tela avisa que a assinatura do ChatGPT existe e vem desligada de fábrica** O login por assinatura do ChatGPT é um recurso da instalação e nasce desligado.
+  Desligado, o painel de conexão não aparece — e a tela não dizia nada sobre ele,
+  então quem procurava a assinatura concluía que o produto não tinha o recurso.
+  Agora, com o recurso desligado, a tela de Credenciais mostra um aviso dizendo o
+  que a assinatura faz, que ela vem desligada de fábrica, onde se liga
+  (Administração › Recursos opcionais, em `/admin/sistema`) e que quem não
+  administra a instalação precisa pedir a quem administra. Com o recurso ligado, a
+  tela continua exatamente como era: painel de conexão, sem aviso. Contribuição de
+  @webtecnica (#4438).
+
+### Alterado
+
+- **A instalação recebe o produto do projeto original até a 1.109.0, e o que é próprio da Suindara continua** Esta versão incorpora as versões 1.100.0 a 1.109.0 do projeto original (melgarafael/DeskcommCRM), cada uma com a sua seção mais abaixo neste arquivo, e mantém tudo o que é próprio deste canal: a importação do ClickUp, as áreas e os grupos de funis com as visualizações salvas, o formulário público em `/f/<token>`, as subtarefas e as tarefas recorrentes, os anexos, comentários e relações das tarefas, e a chave externa e o token de servidor em `/api/v1/tasks`.
+
+  Por dentro, sem ação de quem opera:
+
+  - As migrations próprias deste canal passaram para a faixa 8xxx (eram 9093 a 9103 e 9338, números que o projeto original também usa). A atualização aplica o `baseline.sql` inteiro, então o banco não percebe a troca.
+  - Na tela de Tarefas chegam o filtro por funil e a visão em quadro do projeto original. O quadro mostra só as tarefas que casam com os filtros, sem o pai e as irmãs da subtarefa, e o número de tarefas em aberto no menu conta só as da própria pessoa.
+
+### Corrigido
+
+- **A tela da Nuvemshop diz que o catálogo vai para Agente de IA › Conhecimento e mostra o estado dele** A integração com a Nuvemshop dizia que sincronizava "pedidos, produtos e
+  clientes", e quem conectava a loja ia procurar os produtos em CRM › Produtos,
+  onde eles nunca aparecem. O catálogo sempre foi para o acervo do agente, na
+  fonte "Catálogo de produtos". Agora a tela da integração e o `docs/SETUP.md`
+  dizem isso, e a tela ganhou um cartão com o estado da fonte (trechos, último
+  preparo e erro), com o botão "Preparar de novo" para administradores e
+  gerentes. Nenhuma rota, tabela ou migration nova. Contribuição de @webtecnica
+  (#4357).
+
+- **Em Configurações › Atendimento, cada modo de visibilidade diz também o que ele não esconde** O texto dos modos de visibilidade prometia que o atendente em "Só os seus"
+  "vê apenas o que foi direcionado a ele", sem ressalva. Mas o modo recorta só
+  conversas e negócios: a lista de Contatos continua inteira em qualquer modo, e
+  agenda e tarefas seguem outra opção. Quem lia concluía que ver Contatos era
+  falha de permissão. Agora o texto de cada modo diz o que esconde e o que não
+  esconde. Nenhuma permissão mudou. Contribuição de @webtecnica (#4381).
+
+- **O follow-up cancelado pela trava de repetição diz que foi a trava, e quantas mensagens iguais o número já tinha** Quando um passo de mensagem escrito pela IA era vetado pela trava de repetição
+  (anti-ban), a inscrição era cancelada com "O assistente concluiu este passo sem
+  enviar uma mensagem" — o mesmo texto de um passo que simplesmente não tinha o
+  que dizer. Quem abria o acompanhamento não descobria que houve veto, nem qual
+  trava segurou. Agora o motivo diz que foi a trava de repetição e informa a
+  contagem de mensagens iguais que o número já tinha na janela, com a orientação
+  de variar o texto. As demais causas de cancelamento continuam com o texto de
+  antes. Contribuição de @webtecnica (#4428).
+
+- **A importação mostra quando o vínculo entre pessoa e empresa falha** Se o vínculo falhar, a linha aparece com erro no histórico do lote. Outra linha do mesmo lote para a mesma empresa e pessoa tenta gravar o vínculo usando os registros já criados. Crédito: @samirhvbr.
+
+- **O resultado da importação indica a linha original da planilha** Na prévia de prospecção e no histórico de importação de empresas e pessoas, os números das linhas correspondem aos do CSV ou XLSX mesmo quando há linhas em branco no arquivo. Crédito: @samirhvbr.
+
 ## [1.109.0] — 2026-11-12
 
 ### Adicionado
@@ -15990,7 +16055,8 @@ Primeira versão marcada do DeskcommCRM. O projeto vinha sendo desenvolvido publ
 
 - **Node 22 é obrigatório para desenvolvimento.** A suíte de invariantes instancia o cliente do Supabase, que exige o `WebSocket` global — nativo apenas a partir do Node 22. Isso não afeta quem apenas hospeda: a VPS roda a imagem pronta.
 
-[Não lançado]: https://github.com/melgarafael/DeskcommCRM/compare/v1.109.0...HEAD
+[Não lançado]: https://github.com/melgarafael/DeskcommCRM/compare/v1.110.0...HEAD
+[1.110.0]: https://github.com/melgarafael/DeskcommCRM/compare/v1.109.0...v1.110.0
 [1.109.0]: https://github.com/melgarafael/DeskcommCRM/compare/v1.108.0...v1.109.0
 [1.108.0]: https://github.com/melgarafael/DeskcommCRM/compare/v1.107.0...v1.108.0
 [1.107.0]: https://github.com/melgarafael/DeskcommCRM/compare/v1.106.0...v1.107.0
