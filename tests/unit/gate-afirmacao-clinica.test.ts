@@ -130,7 +130,8 @@ describe("a cadeia REAL barra a afirmação clínica — e só quando armada", (
       code: "clinical_claim",
       detail: { clinical_kinds: "diagnostico,prescricao" },
     });
-    const sql = String(inserts.mock.calls[0]?.[0] ?? "");
+    // A 1ª ida ao pool pode ser a pergunta "o número é de prospecção?" (Linha A, v20): procura-se a gravação do trace.
+    const sql = inserts.mock.calls.map((c) => String(c[0] ?? "")).find((q) => /before_send_traces/.test(q)) ?? "";
     expect(sql).toMatch(/insert into before_send_traces/);
   });
 
