@@ -43,8 +43,8 @@ async function agente(id: string, sessao: string) {
 
 beforeAll(async () => {
   await pool.query(
-    `insert into organizations (id, slug, legal_name, display_name) values ($1, $1::text, 'Org de Prova', 'Org de Prova')`,
-    [ORG],
+    `insert into organizations (id, slug, legal_name, display_name) values ($1::uuid, $2, 'Org de Prova', 'Org de Prova')`,
+    [ORG, `agente-campanha-${ORG.slice(0, 8)}`],
   );
   for (const [id, nome] of [[CHIP, "chip-5286"], [OUTRO, "outro-numero"]] as const) {
     await pool.query(
