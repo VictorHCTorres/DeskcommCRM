@@ -26,6 +26,13 @@ const barra = (body: string, motivo: string, n: ExcecaoFunilA = NEGOCIO): void =
   if (!r.ok) expect(r.motivos).toContain(motivo);
 };
 
+describe("a opção é da camada restricao_comercial", () => {
+  it("o nome da linha começa pelo nome da camada", async () => {
+    const { CAMADA_RESTRICAO_COMERCIAL } = await import("@/lib/agent-engine/guardrails/camadas-da-org");
+    expect(OPCAO_EXCECAO_FUNIL_A).toBe(`${CAMADA_RESTRICAO_COMERCIAL}_excecao_funil_a`);
+  });
+});
+
 describe("normalizarPreco — o campo preco do negócio, em centavos", () => {
   it.each([
     ["R$ 697", 69700],

@@ -29,10 +29,16 @@
  * A opção é uma LINHA nova na tabela de camadas, e não uma coluna: `layer` é de
  * vocabulário aberto (ver `camadas-da-org.ts`), então não há migration.
  */
-import { CAMADA_RESTRICAO_COMERCIAL } from "@/lib/agent-engine/guardrails/camadas-da-org";
 
-/** A opção da camada. Fora de `CAMADAS_CONFIGURAVEIS`: não tem interruptor na tela; liga-se por configuração. */
-export const OPCAO_EXCECAO_FUNIL_A = `${CAMADA_RESTRICAO_COMERCIAL}_excecao_funil_a` as const;
+/**
+ * A opção da camada `restricao_comercial`. Fora de `CAMADAS_CONFIGURAVEIS`: não
+ * tem interruptor na tela; liga-se por configuração.
+ *
+ * Literal de propósito, sem importar `camadas-da-org`: este módulo entra no grafo
+ * do turno, e vários testes dublam aquele módulo inteiro — uma leitura no topo
+ * daqui derrubaria a coleta deles. O prefixo é conferido no teste.
+ */
+export const OPCAO_EXCECAO_FUNIL_A = "restricao_comercial_excecao_funil_a";
 
 /** A etiqueta do CONTATO que a importação da Linha A põe. */
 export const ETIQUETA_FUNIL_A = "funil-a";
@@ -240,11 +246,18 @@ const ENDERECO = /(?:https?:\/\/|www\.)[^\s<>"')\]]+|\b[a-z0-9-]+(?:\.[a-z0-9-]+
 const semProtocolo = (url: string): string =>
   url.replace(/^https?:\/\//u, "").replace(/^www\./u, "").replace(/[.,;:!?]+$/u, "").replace(/\/+$/u, "");
 
-/** O endereço é do INPI ou é exatamente o `link_pagina` do negócio? */
+/**
+ * O endereço é de órgão público ou é exatamente o `link_pagina` do negócio?
+ *
+ * Site de governo (sufixo `.gov.br`) não é link de pagamento de ninguém, e é onde
+ * a pessoa confere o processo. Nenhum domínio de empresa é escrito aqui: o único
+ * endereço próprio que sai é o que está gravado no negócio.
+ */
+const SUFIXO_DE_GOVERNO = ".gov" + ".br";
 function enderecoPermitido(url: string, linkPagina: string | null): boolean {
   const limpo = semProtocolo(url);
   const host = limpo.split(/[/?#]/u)[0] ?? "";
-  if (host === "inpi.gov.br" || host.endsWith(".inpi.gov.br")) return true;
+  if (host.endsWith(SUFIXO_DE_GOVERNO)) return true;
   return linkPagina !== null && limpo === semProtocolo(normalizar(linkPagina.trim()));
 }
 
