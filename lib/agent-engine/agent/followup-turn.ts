@@ -1529,7 +1529,7 @@ async function sendFixedOutbound(
  * retomada (`janelaDeEnvioAberta(agora, knobs, false)`), lida antes do turno
  * para que o adiamento volte ao enrollment (#3103).
  */
-async function aberturaDaJanelaDeDisparo(
+export async function aberturaDaJanelaDeDisparo(
   pool: pg.Pool,
   target: ReentrySendTarget,
   agora: Date,

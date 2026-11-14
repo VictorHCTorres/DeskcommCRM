@@ -11,6 +11,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { sendMessageHandler } from "@/app/api/v1/messages/_handler";
 import type { HandlerCtx } from "@/lib/api/handlers/types";
 import { ApiError } from "@/lib/api/types";
+import { comSaidaDoAgente, novaSaidaDoAgente } from "@/lib/agent-engine/pacing/saida-do-agente";
 import type { SendMessageInput } from "@/lib/schemas";
 import { criarDubleDoHandler } from "@/tests/helpers/duble-do-handler";
 
@@ -40,11 +41,12 @@ const PROSPECCAO = [
 ];
 const KNOBS_8_18 = { window_start_hour: 8, window_end_hour: 18, allow_sunday: false, prospeccao_dias: [1, 2, 3, 4, 5], timezone: "America/Fortaleza" };
 
-function banco(prospeccao = true) {
+function banco(prospeccao = true, contato: Record<string, unknown> = {}) {
   return criarDubleDoHandler({
     conversation: conversa,
     campanhasDoNumero: prospeccao ? PROSPECCAO : [],
     knobsDoNumero: KNOBS_8_18,
+    contatoDoNumero: { is_blocked: false, tags: [], force_human: false, ai_opt_out: false, consent: null, phone_number: null, ...contato },
   });
 }
 const texto: SendMessageInput = { conversation_id: CONV, type: "text", body: "Oi, passando para lembrar." } as SendMessageInput;
@@ -117,6 +119,80 @@ describe("v20 · o número de prospecção no handler", () => {
     noInstante("2026-11-20T13:00:00Z");
     vi.stubEnv("WAHA_API_BASE_URL", "");
     const msg = await sendMessageHandler(banco().supabase, ctxDe(MOTOR), texto);
+    expect(msg.status).toBe("queued");
+  });
+});
+
+describe("v20 · o envio do motor do agente no número de prospecção", () => {
+  const comSaida = <T>(resposta: boolean, envio: () => Promise<T>) =>
+    comSaidaDoAgente(
+      novaSaidaDoAgente(new Date(), 10_000, () => new Date(), { resposta, haRespostaRetidaAntes: async () => false }),
+      envio,
+    );
+
+  it("⭐ o disparo do motor (o retorno, o follow-up) para quem tem a etiqueta `sair`: recusado aqui de novo", async () => {
+    noInstante("2026-11-18T13:00:00Z");
+    vi.stubEnv("WAHA_API_BASE_URL", "");
+    const e = await recusa(comSaida(false, () => sendMessageHandler(banco(true, { tags: ["sair"] }).supabase, ctxDe(MOTOR), texto)));
+    expect(e.status).toBe(403);
+    expect(e.details).toMatchObject({ motivo: "etiqueta_de_parada" });
+  });
+
+  it("⭐ o disparo do motor no feriado não é recusado AQUI pela hora (a cadeia já a conferiu e adiou)", async () => {
+    noInstante("2026-11-20T13:00:00Z");
+    vi.stubEnv("WAHA_API_BASE_URL", "");
+    const msg = await comSaida(false, () => sendMessageHandler(banco().supabase, ctxDe(MOTOR), texto));
+    expect(msg.status).toBe("queued");
+  });
+
+  it("⭐ a RESPOSTA do motor a quem tem a etiqueta `sair` (e escreveu de novo) não passa pela trava", async () => {
+    noInstante("2026-11-18T13:00:00Z");
+    vi.stubEnv("WAHA_API_BASE_URL", "");
+    const msg = await comSaida(true, () => sendMessageHandler(banco(true, { tags: ["sair"] }).supabase, ctxDe(MOTOR), texto));
+    expect(msg.status).toBe("queued");
+  });
+
+  it("⭐ a automação para quem tem a etiqueta `tem-quem-cuide`, dentro da hora: recusada", async () => {
+    noInstante("2026-11-18T13:00:00Z");
+    const d = criarDubleDoHandler({
+      conversation: conversa,
+      campanhasDoNumero: [{ ...PROSPECCAO[0], audience_filter: { sem_tags: ["tem-quem-cuide"] } }],
+      knobsDoNumero: KNOBS_8_18,
+      contatoDoNumero: { is_blocked: false, tags: ["tem-quem-cuide"], force_human: false, ai_opt_out: false, consent: null, phone_number: null },
+    });
+    const e = await recusa(sendMessageHandler(d.supabase, ctxDe(AUTOMACAO), texto));
+    expect(e.details).toMatchObject({ motivo: "etiqueta_de_parada" });
+  });
+
+  it("⭐ a automação com a conversa aberta com um atendente: recusada", async () => {
+    noInstante("2026-11-18T13:00:00Z");
+    const d = criarDubleDoHandler({
+      conversation: conversa,
+      campanhasDoNumero: PROSPECCAO,
+      knobsDoNumero: KNOBS_8_18,
+      contatoDoNumero: { is_blocked: false, tags: [], force_human: false, ai_opt_out: false, consent: null, phone_number: null },
+      conversasDoContato: [{ status: "open", assigned_to_user_id: USER, bot_silenced_until: null }],
+    });
+    const e = await recusa(sendMessageHandler(d.supabase, ctxDe(AUTOMACAO), texto));
+    expect(e.details).toMatchObject({ motivo: "atendimento_humano" });
+  });
+
+  it("controle: a automação dentro da hora, pessoa livre: sai", async () => {
+    noInstante("2026-11-18T13:00:00Z");
+    vi.stubEnv("WAHA_API_BASE_URL", "");
+    const msg = await sendMessageHandler(banco().supabase, ctxDe(AUTOMACAO), texto);
+    expect(msg.status).toBe("queued");
+  });
+
+  it("⭐ o envio da própria campanha (consentimento, ator `campaign:`) no número de prospecção não passa pela trava", async () => {
+    noInstante("2026-11-20T13:00:00Z");
+    vi.stubEnv("WAHA_API_BASE_URL", "");
+    const d = criarDubleDoHandler({
+      conversation: conversa,
+      campanhasDoNumero: [...PROSPECCAO, { id: "c-1", organization_id: ORG, base_legal: "consent", status: "running" }],
+      knobsDoNumero: KNOBS_8_18,
+    });
+    const msg = await sendMessageHandler(d.supabase, ctxDe({ type: "webhook_source", id: "campaign:c-1" } as HandlerCtx["actor"]), texto);
     expect(msg.status).toBe("queued");
   });
 });

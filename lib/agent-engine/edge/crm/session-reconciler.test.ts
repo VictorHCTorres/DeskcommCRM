@@ -837,6 +837,19 @@ describe("v20 · o resgate respeita a campanha cancelada e o número de prospec�
     expect(b.atualizacoes()).toContain("chip_de_prospeccao");
   });
 
+  it("⭐ número de prospecção, a RESPOSTA presa a quem escreveu, no feriado: não passa pela trava do número, e sai", async () => {
+    const b = banco({ prospeccao: true, resposta: true, tags: ["sair"] });
+    const feriado = () => new Date("2026-11-20T13:00:00Z");
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(feriado());
+    try {
+      expect(await redriveQueued(poolDoResgate(b.query), CFG, createLogger(), undefined, feriado)).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(b.query.mock.calls.some(([sql]) => /marca_da_prospeccao/.test(String(sql)))).toBe(false);
+  });
+
   it("controle: número que não é de prospecção, a mesma mensagem sai", async () => {
     const b = banco({ prospeccao: false });
     expect(await redriveQueued(poolDoResgate(b.query), CFG, createLogger(), undefined, NA_JANELA)).toBe(1);

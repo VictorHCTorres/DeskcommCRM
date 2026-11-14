@@ -67,6 +67,9 @@ export interface OpcoesDoDubleDoHandler {
   responsaveisDeNumero?: LinhaDoDuble[];
   /** Linha A, v20: as campanhas do número (`campaigns`), para o handler saber se ele é de prospecção. */
   campanhasDoNumero?: LinhaDoDuble[];
+  /** Linha A, v20: o contato que a trava do número de prospecção lê, e as conversas dele. */
+  contatoDoNumero?: LinhaDoDuble | null;
+  conversasDoContato?: LinhaDoDuble[];
   /** Linha A, v20: a linha de `channel_knobs` do número (`null` = os padrões). */
   knobsDoNumero?: LinhaDoDuble | null;
   /**
@@ -231,6 +234,9 @@ export function criarDubleDoHandler(
                   error: null,
                 };
               },
+              // Linha A, v20: as conversas do contato, que a trava do número de prospecção lê (lista).
+              then: (ok: (v: unknown) => unknown, erro?: (e: unknown) => unknown) =>
+                Promise.resolve({ data: opcoes.conversasDoContato ?? [], error: null }).then(ok, erro),
             };
             return cadeia;
           },
@@ -396,7 +402,13 @@ export function criarDubleDoHandler(
         // de service role, que bypassa RLS). Encadeável SEM LIMITE de propósito:
         // um dublê que fixa a quantidade de `eq` quebra quando a consulta ganha
         // um filtro novo — com um erro que não fala do comportamento sob teste.
+        // Linha A, v20: a trava do número de prospecção lê o contato (`select ... maybeSingle`).
+        const leitura = {
+          eq: () => leitura,
+          maybeSingle: async () => ({ data: opcoes.contatoDoNumero ?? null, error: null }),
+        };
         return {
+          select: () => leitura,
           update: (patch: LinhaDoDuble) => {
             capturas.patches.contacts!.push(patch);
             return cadeiaAguardavel("contacts", capturas);
@@ -642,7 +654,7 @@ export function criarDubleDoHandler(
         return cadeia;
       }
 
-      if (tabela === "campaigns" || tabela === "campaign_channel_sessions") {
+      if (tabela === "campaigns" || tabela === "campaign_channel_sessions" || tabela === "campaign_suppressions") {
         // Linha A, v20: o handler pergunta se o número é de prospecção (`chip-de-prospeccao.ts`). Vazias por
         // padrão: nenhum número é de prospecção, e o envio segue como antes.
         const linhas = tabela === "campaigns" ? opcoes.campanhasDoNumero ?? [] : [];
@@ -654,6 +666,7 @@ export function criarDubleDoHandler(
           select: () => cadeia,
           eq: (coluna: string, valor: unknown) => (filtros.push([coluna, valor]), cadeia),
           in: (coluna: string, valores: unknown[]) => (listas.push([coluna, valores]), cadeia),
+          limit: () => cadeia,
           maybeSingle: async () => ({ data: linhas.find(casa) ?? null, error: null }),
           then: (ok: (v: unknown) => unknown, erro?: (e: unknown) => unknown) =>
             Promise.resolve({ data: linhas.filter(casa), error: null }).then(ok, erro),

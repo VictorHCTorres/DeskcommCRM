@@ -24,6 +24,12 @@ vi.mock("@/lib/followup/turn-bridge", () => ({
 }));
 vi.mock("@/lib/followup/engine", () => ({ createSupabaseAdminClient: () => ({}) }));
 vi.mock("@/lib/logger", () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
+// Linha A, v20: a trava do número de prospecção. Por padrão o número não é de prospecção (`null`), como o
+// dublê do admin já responderia (nenhuma campanha); os casos do número de prospecção a trocam.
+const travaDoChip = vi.fn(async (..._a: unknown[]): Promise<{ motivo: string; proximaAbertura?: Date } | null> => null);
+vi.mock("@/lib/campanhas/chip-de-prospeccao", () => ({
+  travaDoChipPorSupabase: (...a: unknown[]) => travaDoChip(...a),
+}));
 
 import { enviarTextoFixoPendente } from "./enviar-texto-fixo";
 import { StaleServiceBoundaryError } from "@/lib/atendimento/fronteira";
@@ -807,5 +813,58 @@ describe("enviarTextoFixoPendente · opção 'enviar com a conversa atribuída' 
     CONFIG.opcaoComDono.conversas = [conversaComDono];
 
     expect(await enviarTextoFixoPendente(admin())).toBe(0);
+  });
+});
+
+
+/**
+ * Linha A, v20 — o follow-up de texto fixo no NÚMERO DE PROSPECÇÃO (`lib/campanhas/chip-de-prospeccao.ts`). É o
+ * caminho da inscrição `dormente` que acorda (achado 1 do revisor independente 1): ela vira `active` e o passo de
+ * texto fixo sai por aqui. Fora da hora da prospecção (janela, dias, feriado de 20/11), ADIA para a próxima abertura;
+ * pela pessoa (SAIR, etiqueta de parada…), PULA com o motivo; sem conseguir conferir, adia 15 min.
+ */
+describe("enviarTextoFixoPendente · número de prospecção (v20)", () => {
+  it("⭐ feriado 20/11: não envia, adia para a próxima abertura (segunda 23/11, 8h) sem gastar tentativa", async () => {
+    decidir.mockResolvedValue({ permite: true, motivo: "autorizado" });
+    const abertura = new Date("2026-11-23T11:00:00Z");
+    travaDoChip.mockResolvedValueOnce({ motivo: "feriado_nacional", proximaAbertura: abertura });
+    const enviados = await comRelogoEm("2026-11-20T13:00:00Z", () => enviarTextoFixoPendente(admin()));
+    expect(enviados).toBe(0);
+    expect(sendMessageHandler).not.toHaveBeenCalled();
+    expect(travaDoChip.mock.calls[0]![1]).toEqual({ organizationId: "org-1", channelSessionId: "sess-1", contactId: "contact-1" });
+    expect(completeTurnForEnrollment.mock.calls[0]![4]).toEqual({
+      kind: "deferred",
+      until: abertura,
+      reason: "chip_de_prospeccao:feriado_nacional",
+    });
+    const settle = settleCalls.at(-1)!;
+    expect(settle).toMatchObject({ p_done: false, p_retry_at: abertura.toISOString(), p_hold: true });
+  });
+
+  it("⭐ etiqueta de parada: não envia, pula com o motivo e encerra o job", async () => {
+    decidir.mockResolvedValue({ permite: true, motivo: "autorizado" });
+    travaDoChip.mockResolvedValueOnce({ motivo: "etiqueta_de_parada" });
+    const enviados = await comRelogoEm("2026-11-18T13:00:00Z", () => enviarTextoFixoPendente(admin()));
+    expect(enviados).toBe(0);
+    expect(sendMessageHandler).not.toHaveBeenCalled();
+    expect(completeTurnForEnrollment.mock.calls[0]![4]).toEqual({ kind: "skipped", reason: "chip_de_prospeccao:etiqueta_de_parada" });
+    expect(settleCalls.at(-1)).toMatchObject({ p_done: true, p_error: "chip_de_prospeccao:etiqueta_de_parada" });
+  });
+
+  it("⭐ sem conseguir conferir: não envia e adia 15 min", async () => {
+    decidir.mockResolvedValue({ permite: true, motivo: "autorizado" });
+    travaDoChip.mockResolvedValueOnce({ motivo: "sem_leitura" });
+    const enviados = await comRelogoEm("2026-11-18T13:00:00Z", () => enviarTextoFixoPendente(admin()));
+    expect(enviados).toBe(0);
+    expect(sendMessageHandler).not.toHaveBeenCalled();
+    expect(completeTurnForEnrollment.mock.calls[0]![4]).toMatchObject({ kind: "deferred", reason: "chip_de_prospeccao:sem_leitura" });
+    expect(settleCalls.at(-1)).toMatchObject({ p_done: false, p_retry_at: "2026-11-18T13:15:00.000Z", p_hold: true });
+  });
+
+  it("controle: número livre (a trava diz que pode) → envia", async () => {
+    decidir.mockResolvedValue({ permite: true, motivo: "autorizado" });
+    const enviados = await comRelogoEm("2026-11-18T13:00:00Z", () => enviarTextoFixoPendente(admin()));
+    expect(enviados).toBe(1);
+    expect(sendMessageHandler).toHaveBeenCalledOnce();
   });
 });

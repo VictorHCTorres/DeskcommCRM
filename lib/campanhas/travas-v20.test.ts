@@ -76,6 +76,7 @@ vi.mock("@/app/api/v1/messages/_handler", () => ({
 }));
 
 import { ATRASO_MAXIMO_DA_VAGA_DA_CAMPANHA_MS as FOLGA, rodarUmaRodadaDeCampanha } from "@/lib/campanhas/rodada";
+import { recebeuOutraCampanhaNoDia } from "@/lib/campanhas/conferencia";
 
 type Linha = Record<string, unknown>;
 type Tabelas = Record<string, Linha[]> & Record<"campaigns" | "campaign_recipients" | "channel_sessions" | "messages", Linha[]>;
@@ -404,5 +405,30 @@ describe("v20 · a prospecção não sai por transmissão", () => {
     const { tabelas } = await rodarEm(em("2026-11-18", "10:00"), c, pendente("ana"));
     expect(mundo.envios).toHaveLength(0);
     expect(tabelas.campaigns[0]).toMatchObject({ status: "paused", failure_code: "prospeccao_sem_transmissao" });
+  });
+});
+
+describe("v20 · a duplicidade no último passo (a própria reserva não conta)", () => {
+  const alvo = { id: "r-ana", contact_id: "ana", recipient_address: "+5588999990000" } as never;
+  const linha = (mudar: Linha): Linha => ({
+    id: "r-ana", campaign_id: "camp", organization_id: "org-1", contact_id: "ana", recipient_address: "+5588999990000",
+    status: "sending", sending_at: new Date(+em("2026-11-18", "09:59")).toISOString(), sent_at: null, ...mudar,
+  });
+  const ler = (linhas: Linha[]) =>
+    recebeuOutraCampanhaNoDia(fakeAdmin({ campaigns: [], campaign_recipients: linhas, channel_sessions: [], messages: [] } as never), { organization_id: "org-1" }, alvo, em("2026-11-18", "10:00"));
+
+  it("⭐ a própria linha, já reservada (`sending`) na conferência final: não é duplicidade", async () => {
+    expect(await ler([linha({})])).toBe(false);
+  });
+  it("⭐ outra linha do mesmo contato, de outra organização: não conta", async () => {
+    expect(await ler([linha({}), linha({ id: "r-x", campaign_id: "k", organization_id: "org-2", status: "sent", sent_at: new Date(+em("2026-11-18", "08:00")).toISOString() })])).toBe(false);
+  });
+  it("⭐ outra linha do mesmo contato, saída hoje: conta", async () => {
+    expect(await ler([linha({}), linha({ id: "r-x", campaign_id: "k", status: "sent", sent_at: new Date(+em("2026-11-18", "08:00")).toISOString() })])).toBe(true);
+  });
+  it("⭐ a leitura que falha devolve `null` (a trava espera)", async () => {
+    expect(
+      await recebeuOutraCampanhaNoDia(fakeAdmin({ campaigns: [], campaign_recipients: [], channel_sessions: [], messages: [] } as never, { falhas: ["campaign_recipients"] }), { organization_id: "org-1" }, alvo, em("2026-11-18", "10:00")),
+    ).toBeNull();
   });
 });
