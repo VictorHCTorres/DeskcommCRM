@@ -470,6 +470,47 @@ describe("versão 16 — a vaga guarda a hora mais tardia da saída, e todo emis
     expect(await ultimaVaga(f)).toBe(+agora + 3000 + 1000);
   });
 
+  // Linha A, v20 — os dois sobreviventes do arnês de 212 da v19 ("U02 · o registro da IA sem o relógio" e "U02 · o
+  // relógio da IA como se lido antes da espera"). Eles sobreviviam porque, confirmado o transporte, a linha vai para a
+  // hora em que ele voltou, e o teste de cima só lia a linha DEPOIS. Aqui a espera demora mais do que o pedido (o
+  // `sleep` acorda 2,5 s tarde, como num event loop ocupado), e a linha é lida DURANTE o transporte: ela tem de estar
+  // na hora lida depois da espera, mais a folga — e não na hora sob a trava mais a espera pedida (sem o relógio), nem
+  // no relógio menos a espera (como se lido antes dela).
+  it("⭐ v20 · a espera que acorda tarde: durante o transporte, a linha está no relógio de depois da espera, mais a folga", async () => {
+    const f = await fixture();
+    await recordSend(pool, f.org, f.session, new Date(+agora - 1000));
+    let relogio = +agora + 3000;
+    let linhaNoTransporte: number | null = null;
+    const resultado = await runBeforeSend({
+      pool,
+      log,
+      tenantId: f.org,
+      leadId: f.contact,
+      jobId: f.job,
+      channelSessionId: f.session,
+      body: "Resposta fictícia.",
+      optedOutThisTurn: false,
+      crmDailyLimit: 60,
+      now: agora,
+      relogio: () => new Date(relogio),
+      rng: () => 0,
+      sleep: async (ms: number) => {
+        relogio += ms + 2500;
+      },
+      gates: [pacingGate],
+      enforceSpinning: false,
+      resposta: true,
+      send: async () => {
+        linhaNoTransporte = await ultimaVaga(f);
+        return { kind: "sent" as const, idempotencyKey: "ficticio", messageId: "ficticio" };
+      },
+    });
+    expect(resultado.status).toBe("sent");
+    // Pediu 1 s (o intervalo de 5 s conta da última saída, 1 s antes do `now`, e o relógio já marca 3 s), e acordou
+    // em 3,5 s: o relógio de depois da espera é `agora + 6,5 s`.
+    expect(linhaNoTransporte).toBe(+agora + 6500 + FOLGA_DA_IA);
+  });
+
   it("IA → resgate: o resgate seguinte mede o intervalo (mais a folga) da hora em que a IA saiu da espera", async () => {
     const f = await fixture();
     await enfileirar(f);
