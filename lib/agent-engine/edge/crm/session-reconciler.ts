@@ -25,6 +25,7 @@
  * é o WATCHDOG (admin-plane), o único lugar do engine autorizado a falar com o
  * WAHA diretamente (o envio normal segue via sendMessageHandler).
  */
+import { FRASE_DA_TRAVA_DO_CHIP, travaDoChipPorPg } from '@/lib/campanhas/chip-de-prospeccao';
 import type pg from 'pg';
 
 import { canonicalWahaExternalId, chatIdFromWaMessageId, parseWahaMessageId, wahaEchoExternalIds } from '@/lib/waha/message-id';
@@ -696,9 +697,11 @@ async function conferirElegibilidade(
   // bloqueio e o pessoal). A passagem para a equipe cala a IA, não a automação.
   const parada = regraDoStop('c', m.sent_via !== 'ai');
   const { rows: acesso } = await pool.query<
-    { metadata: unknown; phone_number: string | null; operante: boolean } & LinhaDoStop
+    { metadata: unknown; phone_number: string | null; operante: boolean; status_da_campanha?: string | null } & LinhaDoStop
   >(
     `select s.metadata, c.phone_number, public.fn_org_operante(m.organization_id) as operante,
+            (select k.status from campaigns k
+              where k.organization_id = m.organization_id and k.id::text = m.metadata->>'campaign_id') as status_da_campanha,
             ${parada.colunas}
      from messages m
      join channel_sessions s on s.id = m.channel_session_id and s.organization_id = m.organization_id
@@ -785,6 +788,51 @@ async function conferirElegibilidade(
     );
     log.info('watchdog: reenvio bloqueado — mensagem de campanha de prospecção', { message_id: m.id });
     return 'nao_sai';
+  }
+  // A campanha de consentimento CANCELADA não manda mais nada, nem o que já estava na fila física (Linha A, v20): o
+  // cancelamento vale na hora, como na rodada (`conferenciaFinal`). Lida na mesma consulta que decide, no mesmo
+  // instante. A PAUSADA (ou em outro estado que não roda) espera, na fila: retomada, o resgate seguinte a manda;
+  // cancelada depois, vira falha aqui. Concluída segue: a rodada terminou a fila, e a mensagem é dela.
+  if (campanhaId !== null) {
+    const estado = atual.status_da_campanha ?? null;
+    if (estado === 'cancelled' || estado === null) {
+      await pool.query(
+        `update messages set status = 'failed', error_code = 'campanha_cancelada',
+           error_message = 'Não reenviada: a campanha foi cancelada antes de a mensagem sair.'
+         where id = $1 and organization_id = $2 and status = 'queued'`,
+        [m.id, m.organization_id],
+      );
+      log.info('watchdog: reenvio bloqueado — campanha cancelada', { message_id: m.id });
+      return 'nao_sai';
+    }
+    if (estado !== 'running' && estado !== 'completed') {
+      log.info('watchdog: reenvio adiado — a campanha não está rodando', { message_id: m.id, estado });
+      return 'nao_sai';
+    }
+  }
+  // O NÚMERO DE PROSPECÇÃO (Linha A, v20): o que não é resposta a quem escreveu passa pelas travas da prospecção
+  // (`lib/campanhas/chip-de-prospeccao.ts`). Fora da hora (janela, dias, feriado) ou sem conseguir conferir, espera na
+  // fila; pela pessoa (SAIR, etiqueta de parada, atendimento humano, recusa, lista de exclusão), vira falha.
+  if (m.resposta !== true && m.contact_id && m.channel_session_id) {
+    const travaDoChip = await travaDoChipPorPg(
+      pool,
+      { organizationId: m.organization_id, channelSessionId: m.channel_session_id, contactId: m.contact_id },
+      new Date(),
+    );
+    if (signal?.aborted) return 'desligando';
+    if (travaDoChip && (travaDoChip.proximaAbertura || travaDoChip.motivo === 'sem_leitura')) {
+      log.info('watchdog: reenvio adiado — número de prospecção', { message_id: m.id, motivo: travaDoChip.motivo });
+      return 'nao_sai';
+    }
+    if (travaDoChip) {
+      await pool.query(
+        `update messages set status = 'failed', error_code = 'chip_de_prospeccao', error_message = $3
+         where id = $1 and organization_id = $2 and status = 'queued'`,
+        [m.id, m.organization_id, FRASE_DA_TRAVA_DO_CHIP[travaDoChip.motivo]],
+      );
+      log.info('watchdog: reenvio bloqueado — número de prospecção', { message_id: m.id, motivo: travaDoChip.motivo });
+      return 'nao_sai';
+    }
   }
   return 'pode_sair';
 }

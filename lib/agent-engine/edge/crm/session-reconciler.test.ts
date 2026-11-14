@@ -125,7 +125,7 @@ function bancoComFila(fila: LinhaPresa[]) {
       return { rows: fila.filter((l) => vocabulario.includes(l.sent_via)).map((l) => ({ ...l })) };
     }
     if (/select\s+s\.metadata/i.test(sql)) {
-      return { rows: fila.length === 0 ? [] : [{ metadata: {}, phone_number: "+5531999998888", operante: true }] };
+      return { rows: fila.length === 0 ? [] : [{ metadata: {}, phone_number: "+5531999998888", operante: true, status_da_campanha: "running" }] };
     }
     return { rows: [] };
   });
@@ -281,7 +281,7 @@ describe("redrive × ficha com telefone extra (Spec 31 B1)", () => {
       }
       if (/count\(\*\)/i.test(sql)) return { rows: [{ n: "0" }] };
       if (/select\s+s\.metadata/i.test(sql)) {
-        return { rows: [{ metadata: {}, phone_number: "+5527999998888", operante: true }] };
+        return { rows: [{ metadata: {}, phone_number: "+5527999998888", operante: true, status_da_campanha: "running" }] };
       }
       return { rows: [] };
     });
@@ -359,13 +359,15 @@ describe("redrive × campanha de prospecção (F4i)", () => {
         }] };
       }
       if (/count\(\*\)/i.test(sql)) return { rows: [{ n: "0" }] };
-      if (/select\s+s\.metadata/i.test(sql)) return { rows: [{ metadata: {}, phone_number: "+5588999990000", operante: true }] };
+      if (/select\s+s\.metadata/i.test(sql)) return { rows: [{ metadata: {}, phone_number: "+5588999990000", operante: true, status_da_campanha: "running" }] };
       if (/from campaigns/i.test(sql)) return campanha(sql, params);
       return { rows: [] };
     });
     const rodar = () => redriveQueued(poolDoResgate(query), CFG, createLogger(), undefined, NA_JANELA);
     const bloqueio = () => consultas.find((c) => c.sql.includes("error_code = 'campanha_sem_reenvio'"));
-    const leuCampanha = () => consultas.filter((c) => /from campaigns/i.test(c.sql));
+    // A leitura da campanha DA MENSAGEM (a base legal). A v20 lê também o status dela na consulta que decide e a
+    // pergunta "o número é de prospecção?" (`marca_da_prospeccao`), que não são a campanha da mensagem.
+    const leuCampanha = () => consultas.filter((c) => /select k\.base_legal from campaigns/i.test(c.sql));
     return { send, rodar, bloqueio, leuCampanha };
   }
   const daCampanha = { source: "campaign", campaign_id: "camp-1", campaign_recipient_id: "r-1" };
@@ -547,7 +549,7 @@ function bancoQueMudaNaEspera(opcoes: {
     resposta: opcoes.resposta ?? false,
   };
   let leiturasDaCampanha = 0;
-  const livre = { metadata: {}, phone_number: "+5531999998888", operante: true };
+  const livre = { metadata: {}, phone_number: "+5531999998888", operante: true, status_da_campanha: "running" };
   let concedida = false;
   const query = vi.fn(async (sql: string, _params: unknown[] = []) => {
     if (/count\(\*\)/i.test(sql)) return { rows: [{ n: "0" }] };
@@ -559,7 +561,7 @@ function bancoQueMudaNaEspera(opcoes: {
       if (opcoes.depois instanceof Error) throw opcoes.depois;
       return { rows: opcoes.depois === null ? [] : [opcoes.depois] };
     }
-    if (/from campaigns/i.test(sql)) {
+    if (/from campaigns/i.test(sql) && !/marca_da_prospeccao/.test(sql)) {
       leiturasDaCampanha += 1;
       opcoes.aoLerACampanha?.(leiturasDaCampanha);
       return { rows: [{ base_legal: "consent" }] };
@@ -731,5 +733,112 @@ describe("F4q do cxj (Q08) · a resposta presa sai pelo resgate como resposta", 
 
     expect(send).not.toHaveBeenCalled();
     expect(b.gravacoes()).toEqual([]);
+  });
+});
+
+/**
+ * Linha A, v20. O resgate (`redriveQueued`) e as travas que a v20 acrescenta:
+ *  - a campanha de CONSENTIMENTO cancelada não manda o que já estava na fila física; a pausada espera;
+ *  - no NÚMERO DE PROSPECÇÃO, a mensagem que não é resposta (o follow-up, o retorno, a automação) passa pela hora
+ *    (janela, dias, feriado nacional) e pela pessoa (`lib/campanhas/chip-de-prospeccao.ts`).
+ */
+describe("v20 · o resgate respeita a campanha cancelada e o número de prospecção", () => {
+  const CFG = {
+    wahaBaseUrl: "http://127.0.0.1:9999", wahaApiKey: "test-key",
+    intervalMs: 1, redriveMinAgeMs: 0, redriveBatchSize: 10, redriveSpacingMs: 0,
+  };
+  const SESSAO = "00000000-0000-4000-8000-000000005286";
+  function banco(opcoes: {
+    metadata?: unknown;
+    statusDaCampanha?: string | null;
+    prospeccao?: boolean;
+    resposta?: boolean;
+    tags?: string[];
+  }) {
+    const send = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(JSON.stringify({ id: { id: "3EB0NEW" } }), { status: 200 }));
+    const consultas: Array<{ sql: string; params: unknown[] }> = [];
+    const query = vi.fn(async (sql: string, params: unknown[] = []) => {
+      consultas.push({ sql, params });
+      if (/count\(\*\)/i.test(sql)) return { rows: [{ n: "0" }] };
+      if (/select\s+m\.id/i.test(sql)) {
+        return { rows: [{
+          id: "m-1", organization_id: "org-1", conversation_id: "conv-1", contact_id: "00000000-0000-4000-8000-0000000000aa",
+          body: "Olá, voltando como combinamos.", waha_session_name: "default", wa_identity: null, wa_lid: null,
+          phone_number: "+5588999990000", is_group: false, group_chat_id: null, channel_session_id: SESSAO,
+          daily_message_limit: null, provider: "waha", sent_via: "automation", resposta: opcoes.resposta ?? false,
+          ...(/\bm\.metadata\b/.test(sql) ? { metadata: opcoes.metadata ?? {} } : {}),
+        }] };
+      }
+      if (/select\s+s\.metadata/i.test(sql)) {
+        return { rows: [{ metadata: {}, phone_number: "+5588999990000", operante: true, status_da_campanha: opcoes.statusDaCampanha ?? null }] };
+      }
+      if (/from campaigns k where k\.organization_id = \$1 and k\.id::text/i.test(sql)) return { rows: [{ base_legal: "consent" }] };
+      if (/marca_da_prospeccao/.test(sql)) {
+        return { rows: opcoes.prospeccao ? [{ marca_da_prospeccao: "prospeccao", audience_filter: { sem_tags: ["sair"] } }] : [] };
+      }
+      if (/join channel_knobs/.test(sql)) {
+        return { rows: [{ window_start_hour: 8, window_end_hour: 18, allow_sunday: false, prospeccao_dias: [1, 2, 3, 4, 5], timezone: "America/Fortaleza", warmup_daily_caps: null, number_activated_at: null }] };
+      }
+      if (/from contacts where organization_id/.test(sql)) {
+        return { rows: [{ is_blocked: false, tags: opcoes.tags ?? [], force_human: false, ai_opt_out: false, consent: null, phone_number: "+5588999990000" }] };
+      }
+      return { rows: [] };
+    });
+    const atualizacoes = () => consultas.filter((c) => /update messages set status = 'failed'/.test(c.sql)).map((c) => c.sql.match(/error_code = '?([a-z_$0-9]+)/)?.[1]);
+    return { send, query, atualizacoes };
+  }
+  const daCampanha = { source: "campaign", campaign_id: "camp-1", campaign_recipient_id: "r-1" };
+
+  it("⭐ campanha de consentimento CANCELADA: a mensagem da fila física não sai, e vira failed/campanha_cancelada", async () => {
+    const b = banco({ metadata: daCampanha, statusDaCampanha: "cancelled" });
+    expect(await redriveQueued(poolDoResgate(b.query), CFG, createLogger(), undefined, NA_JANELA)).toBe(0);
+    expect(b.send).not.toHaveBeenCalled();
+    expect(b.atualizacoes()).toContain("campanha_cancelada");
+  });
+
+  it("⭐ campanha de consentimento PAUSADA: não sai e fica na fila (nada vira falha)", async () => {
+    const b = banco({ metadata: daCampanha, statusDaCampanha: "paused" });
+    expect(await redriveQueued(poolDoResgate(b.query), CFG, createLogger(), undefined, NA_JANELA)).toBe(0);
+    expect(b.send).not.toHaveBeenCalled();
+    expect(b.atualizacoes()).toEqual([]);
+  });
+
+  it("controle: campanha de consentimento rodando sai pelo resgate", async () => {
+    const b = banco({ metadata: daCampanha, statusDaCampanha: "running" });
+    expect(await redriveQueued(poolDoResgate(b.query), CFG, createLogger(), undefined, NA_JANELA)).toBe(1);
+  });
+
+  it("⭐ número de prospecção, retorno/follow-up preso, no feriado de 20/11 às 10h: não sai e espera na fila", async () => {
+    const b = banco({ prospeccao: true });
+    const feriado = () => new Date("2026-11-20T13:00:00Z");
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(feriado());
+    try {
+      expect(await redriveQueued(poolDoResgate(b.query), CFG, createLogger(), undefined, feriado)).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(b.send).not.toHaveBeenCalled();
+    expect(b.atualizacoes()).toEqual([]);
+  });
+
+  it("⭐ número de prospecção, contato com a etiqueta `sair`: vira failed/chip_de_prospeccao", async () => {
+    const b = banco({ prospeccao: true, tags: ["sair"] });
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NA_JANELA());
+    try {
+      expect(await redriveQueued(poolDoResgate(b.query), CFG, createLogger(), undefined, NA_JANELA)).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(b.send).not.toHaveBeenCalled();
+    expect(b.atualizacoes()).toContain("chip_de_prospeccao");
+  });
+
+  it("controle: número que não é de prospecção, a mesma mensagem sai", async () => {
+    const b = banco({ prospeccao: false });
+    expect(await redriveQueued(poolDoResgate(b.query), CFG, createLogger(), undefined, NA_JANELA)).toBe(1);
   });
 });
