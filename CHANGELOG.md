@@ -8,6 +8,20 @@ Se você roda o DeskcommCRM numa VPS, **leia a seção da versão para a qual es
 
 ## [Não lançado]
 
+## [1.110.2] — 2026-11-14
+
+### Adicionado
+
+- **Exceção da Linha A em "valores e negociação com a equipe", desligada por padrão** A trava "Deixar valores e negociação com a equipe" ganha uma opção, desligada por padrão e sem efeito até ser ligada por configuração (linha `restricao_comercial_excecao_funil_a` em `org_guardrail_layers`). Ligada, ela vale só para o contato com a etiqueta `funil-a` que tem exatamente um negócio aberto no funil Prospecção com o campo `preco` preenchido: a pergunta dele sobre preço, valor, Pix ou desconto deixa de ir direto para uma pessoa e segue para o agente, e a resposta do agente só sai se todo valor em dinheiro for igual ao `preco` do negócio, sem desconto, parcelamento, cartão, boleto, porcentagem, chave Pix, copia-e-cola, link de pagamento nem promessa de resultado, e com a referência `funilA:` seguida do código do negócio quando houver referência. Resposta barrada não sai, e a conversa vai para a Central, como já acontecia. Para todos os outros contatos, e para toda organização que não ligar a opção, o comportamento é o de antes. Não há migração. Crédito: @VictorHCTorres.
+
+- **A frase do aviso de passagem pode ganhar um complemento fora do horário de atendimento** O agente que tem frase própria para o aviso de passagem (Agente › Configuração › "Frase do aviso de passagem") pode ter uma segunda frase, acrescentada só fora do horário de atendimento humano, por exemplo "Ele te responde no próximo dia útil, a partir das 8h." Ela fica em `aviso_de_handoff_fora_do_horario`, na configuração do agente, e o horário em `aviso_de_handoff_expediente` (fuso, dias, início e fim); sem o horário, vale segunda a sexta, das 8h às 18h, no fuso de São Paulo. Feriado não é considerado. Ainda não há campo na tela: grava-se pela API do agente. Sem a chave, nada muda. Não há migração. Crédito: @VictorHCTorres.
+
+- **Etiqueta pix-pedido em contato da Linha A pode abrir um aviso crítico na Central** Opção nova, desligada por padrão e sem efeito até ser ligada por configuração (linha `linha_a_pix_pedido_na_central` em `org_guardrail_layers`). Ligada, quando um contato com a etiqueta `funil-a` e um negócio aberto no funil Prospecção ganha a etiqueta `pix-pedido` (pelo agente, pela tela ou por automação), a Central recebe um aviso crítico ligado ao negócio, com o serviço, o preço, o código e a referência `funilA:` seguida do código, para a equipe gerar a cobrança. O aviso não transfere a conversa, não cala o agente, não move o negócio de etapa e não envia mensagem; há um aviso aberto por negócio. Não há migração. Crédito: @VictorHCTorres.
+
+### Corrigido
+
+- **O botão "Parar mensagens" do modelo oficial passa a bloquear o contato** O toque no botão "Parar mensagens" de um modelo da API oficial chega como texto, com o rótulo do botão, e esse rótulo não era reconhecido como pedido de saída: quem tocava seguia recebendo. Agora "parar mensagens" (também "parar as mensagens", "parem com as mensagens", "não mande mais mensagem", "não envie mais mensagens", "cancelar mensagens" e "não me mande mais", com ou sem acento e em maiúsculas) bloqueia o contato na entrada, como "PARAR" e "SAIR" já bloqueavam, inclusive quando o botão chega só com o código interno (PARAR_MENSAGENS). O objeto continua obrigatório: "não quero parar o processo", "para mensagens de voz eu não consigo ouvir" e "como cancelar mensagens agendadas?" não bloqueiam. Não há migração. Crédito: @VictorHCTorres.
+
 ## [1.110.1] — 2026-11-14
 
 ### Corrigido
@@ -16063,7 +16077,8 @@ Primeira versão marcada do DeskcommCRM. O projeto vinha sendo desenvolvido publ
 
 - **Node 22 é obrigatório para desenvolvimento.** A suíte de invariantes instancia o cliente do Supabase, que exige o `WebSocket` global — nativo apenas a partir do Node 22. Isso não afeta quem apenas hospeda: a VPS roda a imagem pronta.
 
-[Não lançado]: https://github.com/melgarafael/DeskcommCRM/compare/v1.110.1...HEAD
+[Não lançado]: https://github.com/melgarafael/DeskcommCRM/compare/v1.110.2...HEAD
+[1.110.2]: https://github.com/melgarafael/DeskcommCRM/compare/v1.110.1...v1.110.2
 [1.110.1]: https://github.com/melgarafael/DeskcommCRM/compare/v1.110.0...v1.110.1
 [1.110.0]: https://github.com/melgarafael/DeskcommCRM/compare/v1.109.0...v1.110.0
 [1.109.0]: https://github.com/melgarafael/DeskcommCRM/compare/v1.108.0...v1.109.0
