@@ -46,6 +46,7 @@ import { followupGatilhoRetornoHandler } from "@/lib/followup/gatilho-retorno.ha
 import { followupReactivityHandler } from "@/lib/followup/reactivity.handler";
 import { followupSaidaDaEtapaHandler } from "@/lib/followup/saida-da-etapa.handler";
 import { avisoDeEtapaHandler } from "@/lib/leads/aviso-de-etapa.handler";
+import { pixPedidoNaCentralHandler } from "@/lib/linha-a/pix-pedido-na-central.handler";
 import { avisoAoDonoDaCarteira } from "@/lib/carteira/aviso-ao-dono";
 import { comandaDoGanhoHandler } from "@/lib/financeiro/comanda-do-ganho.handler";
 import { webPushInboundHandler } from "@/lib/notifications/push.handler";
@@ -63,6 +64,8 @@ const RODA: EventHandler[] = [
   followupReactivityHandler,
   campanhaRespostaHandler,
   avisoDeEtapaHandler,
+  // Linha A: um item na Central, escrita interna (1.110.2).
+  pixPedidoNaCentralHandler,
   casoNaCentralHandler,
   comandaDoGanhoHandler,
   mediaPersistHandler,

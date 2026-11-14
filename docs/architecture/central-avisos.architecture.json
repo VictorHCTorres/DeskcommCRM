@@ -93,6 +93,20 @@
       "label": "leads.aviso-de-etapa: lead.stage_changed → aviso other/lead"
     },
     {
+      "id": "etiqueta_pix_pedido",
+      "lane": "app",
+      "col": 0,
+      "type": "service",
+      "label": "contact.tag_added com pix-pedido (crm_manage_tags do agente, tela ou automação)"
+    },
+    {
+      "id": "pix_pedido_na_central",
+      "lane": "app",
+      "col": 0,
+      "type": "service",
+      "label": "linha-a.pix-pedido-na-central: aviso crítico other/lead, só com a opção linha_a_pix_pedido_na_central ligada"
+    },
+    {
       "id": "campainha",
       "lane": "humano",
       "col": 5,
@@ -197,6 +211,16 @@
       "from": "aviso_de_etapa",
       "to": "produtores",
       "label": "um aviso por negócio e etapa, só o nome da etapa no texto"
+    },
+    {
+      "from": "etiqueta_pix_pedido",
+      "to": "pix_pedido_na_central",
+      "label": "só contato funil-a com negócio aberto no funil Prospecção"
+    },
+    {
+      "from": "pix_pedido_na_central",
+      "to": "produtores",
+      "label": "um aviso aberto por negócio: serviço, preço, código e funilA:<codigo>; não transfere, não cala a IA"
     },
     {
       "from": "central",

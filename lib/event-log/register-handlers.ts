@@ -35,6 +35,7 @@ import { avisoAoDonoDaCarteira } from "@/lib/carteira/aviso-ao-dono";
 import { comandaDoGanhoHandler } from "@/lib/financeiro/comanda-do-ganho.handler";
 import { avisoDeCasoAoSuporteHandler } from "@/lib/escalacao/aviso-ao-suporte.handler";
 import { avisoDeHandoffHandler } from "@/lib/escalacao/aviso-de-handoff.handler";
+import { pixPedidoNaCentralHandler } from "@/lib/linha-a/pix-pedido-na-central.handler";
 import { avisoDePropostaNoWhatsAppHandler } from "@/lib/propostas/aviso-no-whatsapp.handler";
 import { avisoDeAgendamentoNoWhatsAppHandler } from "@/lib/agenda/aviso-de-agendamento.handler";
 import { cobrancaSinalHandler } from "@/lib/cobranca/sinal.handler";
@@ -75,6 +76,9 @@ export function ensureHandlersRegistered(): void {
   // Escrita curta no banco (um item na Central), vizinha do gatilho de etapa
   // que consome o mesmo evento.
   registerHandler(avisoDeEtapaHandler);
+  // Linha A: a etiqueta `pix-pedido` no contato abre um aviso crítico na Central
+  // (escrita curta no banco). Só age na organização que ligou a opção.
+  registerHandler(pixPedidoNaCentralHandler);
   // Aviso ao vendedor dono (#2591): escrita curta no banco (uma tarefa com
   // push ao responsável), ao lado do outro consumidor que só escreve, e antes
   // de tudo que sai por rede de terceiro.

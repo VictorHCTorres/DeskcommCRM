@@ -47,7 +47,7 @@ describe("com o complemento: segunda a sexta, 8h às 18h, por padrão", () => {
   });
   it("é o texto que o cliente lê, inteiro, e o opt-out continua com a confirmação de saída", () => {
     const fora = lerFraseDoAvisoConfigurada(CONFIG, SABADO_10H);
-    expect(textoDoAviso("pedido_de_humano", null, "lead-1", "pt-BR", fora)).toBe(`${FRASE} ${COMPLEMENTO}`);
+    expect(textoDoAviso("pediu_humano", null, "lead-1", "pt-BR", fora)).toBe(`${FRASE} ${COMPLEMENTO}`);
     expect(textoDoAviso("suspeita_de_opt_out", null, "lead-1", "pt-BR", fora)).not.toContain("Victor");
   });
   it("as duas juntas acima do teto: sai só a frase", () => {
