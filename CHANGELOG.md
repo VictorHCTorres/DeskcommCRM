@@ -8,6 +8,12 @@ Se você roda o DeskcommCRM numa VPS, **leia a seção da versão para a qual es
 
 ## [Não lançado]
 
+## [1.110.3] — 2026-11-14
+
+### Adicionado
+
+- **Linha A pode citar parcelamento em até 6x no cartão, desligado por padrão** Segunda opção da exceção da Linha A na trava "Deixar valores e negociação com a equipe", sem efeito até ser ligada por configuração (linha `restricao_comercial_excecao_funil_a_parcelamento` em `org_guardrail_layers`). Ligada, junto com a exceção da Linha A, a resposta do agente para o contato da Linha A pode citar parcelamento, "N vezes"/"Nx", cartão de crédito, "sem juros" e a expressão "link de pagamento"; passa a ser barrada a resposta com mais de 6 parcelas (em dígito ou por extenso), com "juros" que não seja "sem juros" ou com "débito". Continuam barrados qualquer valor em dinheiro diferente do `preco` do negócio (logo, valor de parcela), boleto, desconto, porcentagem, promessa de resultado, chave Pix, QR code, copia-e-cola e endereços. A opção é lida na mesma consulta do contato, sem consulta extra. Para todos os outros contatos, e para toda organização que não ligar a opção, o comportamento é o da 1.110.2. Não há migração. Crédito: @VictorHCTorres.
+
 ## [1.110.2] — 2026-11-14
 
 ### Adicionado
@@ -16077,7 +16083,8 @@ Primeira versão marcada do DeskcommCRM. O projeto vinha sendo desenvolvido publ
 
 - **Node 22 é obrigatório para desenvolvimento.** A suíte de invariantes instancia o cliente do Supabase, que exige o `WebSocket` global — nativo apenas a partir do Node 22. Isso não afeta quem apenas hospeda: a VPS roda a imagem pronta.
 
-[Não lançado]: https://github.com/melgarafael/DeskcommCRM/compare/v1.110.2...HEAD
+[Não lançado]: https://github.com/melgarafael/DeskcommCRM/compare/v1.110.3...HEAD
+[1.110.3]: https://github.com/melgarafael/DeskcommCRM/compare/v1.110.2...v1.110.3
 [1.110.2]: https://github.com/melgarafael/DeskcommCRM/compare/v1.110.1...v1.110.2
 [1.110.1]: https://github.com/melgarafael/DeskcommCRM/compare/v1.110.0...v1.110.1
 [1.110.0]: https://github.com/melgarafael/DeskcommCRM/compare/v1.109.0...v1.110.0
