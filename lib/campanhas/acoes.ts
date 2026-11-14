@@ -20,6 +20,7 @@ import type { ApiErrorCode } from "@/lib/api/errors";
 import { sendMessageHandler } from "@/app/api/v1/messages/_handler";
 import { PACING_DEFAULTS } from "@/lib/agent-engine/pacing/defaults";
 import { beginServiceAtOrigin } from "@/lib/atendimento/origem";
+import { logger } from "@/lib/logger";
 
 import { baloesDaCampanha, enviarEmBaloes, pausaEntreBaloes } from "./baloes";
 import { baseLegalValida, motivoParaExcluir, recusouMarketing } from "./elegibilidade";
@@ -422,17 +423,31 @@ export async function cancelarAcao(
 ): Promise<Desfecho<{ cancelados: number }>> {
   const recusa = recusaDeTransicao(c.status, "cancelled");
   if (recusa) return recusa;
+
+  // A CAMPANHA cai primeiro, e só depois a fila. A reserva da rodada
+  // (`reservarDestinatario`) relê a campanha DEPOIS de reservar: toda reserva
+  // feita depois desta escrita vê `cancelled` e se desfaz — inclusive a do
+  // worker que escolheu o pendente antes, e a do destinatário que um 429 devolveu
+  // à fila no meio. Cancelar a fila primeiro (a 1ª versão) não fechava esses dois.
+  // Quem já estava `sending` antes daqui está na borda e segue (prometer desfazer
+  // o que saiu é mentir).
   const { data } = await admin
     .from("campaigns")
     .update({ status: "cancelled", cancelled_at: agora.toISOString() })
     .eq("id", c.id)
     .eq("status", c.status)
     .select("id");
-  if ((data ?? []).length === 0) return conflitoDeCorrida();
+  if ((data ?? []).length === 0) {
+    // Zero linhas: o estado mudou no meio. Se a rodada concluiu a campanha ou
+    // outro pedido já a cancelou, o que se queria está feito, e a varredura
+    // abaixo limpa a sobra. Outro estado (pausada, por exemplo) é corrida de
+    // verdade: conflito, e a fila fica como está, para quem decidir.
+    const { data: depois } = await admin.from("campaigns").select("status").eq("id", c.id).maybeSingle();
+    const estado = (depois as { status?: string } | null)?.status;
+    if (estado !== "completed" && estado !== "cancelled") return conflitoDeCorrida();
+  }
 
-  // A campanha já está cancelada quando esta linha roda: a rodada não escolhe
-  // mais esta campanha, então não há corrida com o worker por estes pendentes.
-  const { data: cancelados } = await admin
+  const { data: cancelados, error } = await admin
     .from("campaign_recipients")
     .update({ status: "cancelled", cancelled_at: agora.toISOString() })
     .eq("campaign_id", c.id)
@@ -441,8 +456,20 @@ export async function cancelarAcao(
   // Por broadcast, a lista está com o provedor: cancelar lá o que ainda não
   // saiu, trazer o último retrato e fechar quem ficou `sending` (migration 0712).
   // Numa transmissão todo mundo está `sending` — sem somar estes, o operador
-  // via «0 cancelados» com o cancelamento feito.
+  // via «0 cancelados» com o cancelamento feito. Vem antes da conferência do
+  // erro da fila: o cancelamento no provedor não pode depender dela.
   const fechadosNaTransmissao = await encerrarTransmissao(admin, c, agora);
+  if (error) {
+    // A campanha já caiu, e nenhuma reserva nova passa (ver acima); mas a fila
+    // não foi marcada, e responder sucesso seria dizer o que não aconteceu.
+    logger.warn("[campanha] cancelada, mas a fila não foi marcada", { campanha: c.id, motivo: error.message });
+    return {
+      ok: false,
+      codigo: "internal_error",
+      mensagem: "A campanha foi cancelada e não envia mais nada, mas a fila não foi marcada como cancelada.",
+      status: 500,
+    };
+  }
   return { ok: true, cancelados: (cancelados ?? []).length + fechadosNaTransmissao };
 }
 

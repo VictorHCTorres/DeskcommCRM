@@ -1,4 +1,15 @@
 import { assertProspectingDelivery } from "@/lib/prospecting/guard";
+import { assertCampaignDelivery, assertCampaignSlot, entregaPeloAtor, VetoDaCampanhaError } from "@/lib/campanhas/entrega";
+import {
+  MARCA_DE_RESPOSTA_RETIDA,
+  MOTIVO_DA_SAIDA_ATRAS_DE_RETIDA,
+  MOTIVO_DA_SAIDA_VENCIDA,
+  SaidaAtrasDeRespostaRetidaError,
+  SaidaDoAgenteVencidaError,
+  conferirSaidaDoAgente,
+  saidaDoAgenteNoEscopo,
+  tomarSaidaDoAgente,
+} from "@/lib/agent-engine/pacing/saida-do-agente";
 import { assertAgentOperationSupabase, mesmaOperacao } from "@/lib/ai/agents/operation";
 import {
   assertApprovedReplySupabase,
@@ -491,6 +502,15 @@ export async function sendMessageHandler(
   // gate antes da suspensão. O erro é terminal (`terminal: true`).
   await assertOrgOperante(supabase, ctx.organization_id);
   if (ctx.prospectingDelivery) await assertProspectingDelivery(supabase, ctx.prospectingDelivery);
+  // O envio de campanha que chegar sem a entrega (um chamador que a esquecesse)
+  // a ganha aqui, pelo ator que só a rodada cria (F4i, H06/H07 do cxj).
+  if (!ctx.campaignDelivery) {
+    const montada = await entregaPeloAtor(supabase, ctx, input.metadata);
+    if (montada) ctx = { ...ctx, campaignDelivery: montada };
+  }
+  // A campanha de prospecção confere a pessoa de novo aqui e no `checkBoundary`
+  // (F4g, A3): o veto sobe como `VetoDaCampanhaError`, e a rodada o aplica.
+  if (ctx.campaignDelivery) await assertCampaignDelivery(supabase, ctx.campaignDelivery);
   if (ctx.meetingDelivery) await assertMeetingDeliverySupabase(supabase, ctx.meetingDelivery);
   if (ctx.approvedReply) await assertApprovedReplySupabase(supabase, ctx.approvedReply);
   if (ctx.agentOperation) await assertAgentOperationSupabase(supabase, ctx.agentOperation);
@@ -1009,6 +1029,20 @@ export async function sendMessageHandler(
           language: input.template_language ?? "",
         })
       : [];
+  // ─── A marca de resposta nasce com a mensagem (versão 19, F4x do cxj, X01 e X08) ───
+  //
+  // A resposta de texto do agente não é ultrapassada enquanto está na fila (a ordem, mais abaixo, e
+  // `lib/agent-engine/pacing/resposta-retida.ts`), e o que a identifica é esta marca. Na versão 18 ela era gravada só
+  // na retenção, junto com o motivo, num UPDATE cujo erro era ignorado: se ele falhasse, a linha ficava na fila sem a
+  // marca, fora da ordem, e a resposta seguinte passava na frente (X01). Agora a linha já nasce com ela, no mesmo
+  // INSERT: não há instante em que a resposta esteja na fila sem a marca. Só a resposta (o envio que não responde a
+  // ninguém não segura as seguintes), e só o texto (o resgate só manda texto). Fora do escopo do agente, ou sem a ordem
+  // nele, nada muda.
+  //
+  // A marca é do handler: a que vier no `metadata` de quem chama não é gravada.
+  const respostaDoAgente = input.type === "text" && saidaDoAgenteNoEscopo()?.ordem?.resposta === true;
+  const metadataDeQuemChama: Record<string, unknown> = { ...metadataDeEntrada };
+  delete metadataDeQuemChama[MARCA_DE_RESPOSTA_RETIDA];
 
   const insertRow = {
     ...(ctx.internalMessageId ? { id: ctx.internalMessageId } : {}),
@@ -1044,7 +1078,8 @@ export async function sendMessageHandler(
       // As chaves da derivação de mídia (âncora do dreno, marca de foto adiada)
       // são do servidor: o dreno converte a âncora em data e o cron pede visão
       // paga pela marca. O cliente não as forja — ver `CHAVES_DA_DERIVACAO`.
-      ...semChavesDaDerivacao(metadataDeEntrada),
+      // A marca de resposta retida também é do handler (ver acima).
+      ...semChavesDaDerivacao(metadataDeQuemChama),
       ...(ctx.actor.type === "ai_agent" ? { ai_actor_id: ctx.actor.id } : {}),
       ...(origemDoEmissor === "ai" ? { ai_actor_name: nomeDoAgente } : {}),
       ...(botoesDoModeloEnviado.length > 0 ? { [CHAVE_DOS_BOTOES_DO_MODELO]: botoesDoModeloEnviado } : {}),
@@ -1061,6 +1096,7 @@ export async function sendMessageHandler(
             },
           }
         : {}),
+      ...(respostaDoAgente ? { [MARCA_DE_RESPOSTA_RETIDA]: true } : {}),
     },
   };
 
@@ -1088,6 +1124,26 @@ export async function sendMessageHandler(
       )
     )
       return created as unknown as Message;
+    // A linha que já existia (a nova tentativa do job) e nasceu sem a marca de resposta — antes da versão 19, ou fora
+    // do escopo da ordem — a ganha aqui, antes de qualquer saída que a deixe na fila. Se a gravação falhar (duas
+    // tentativas), ou a linha não for mais achada, nada sai e o erro sobe: a linha segue como estava, e o job tenta de
+    // novo.
+    const existente = created as unknown as Message;
+    if (respostaDoAgente && (existente.metadata ?? {})[MARCA_DE_RESPOSTA_RETIDA] !== true) {
+      const marcar = () =>
+        supabase
+          .from("messages")
+          .update({ metadata: { ...(existente.metadata ?? {}), [MARCA_DE_RESPOSTA_RETIDA]: true } })
+          .eq("id", existente.id)
+          .eq("organization_id", ctx.organization_id)
+          .select(MSG_COLS)
+          .maybeSingle();
+      let marcada = await marcar();
+      if (marcada.error) marcada = await marcar();
+      if (marcada.error || !marcada.data)
+        throw new ApiError(500, "internal_error", undefined, ctx.requestId, "marca_de_resposta_nao_gravada");
+      created = marcada.data;
+    }
   }
   if (insErr || !created) {
     throw new ApiError(
@@ -1108,21 +1164,37 @@ export async function sendMessageHandler(
   // Ficha com telefone extra: a resposta volta pelo número que a pessoa escreveu.
   // A porta de canal decide quem tem isso. A organização vem de `ctx` (fonte
   // confiável), não do corpo.
-  const ultimoRecebidoChatId = await enderecoDaUltimaRecebida(supabase, {
-    provider: c.channel_sessions?.provider,
-    isGroup: c.is_group,
-    organizationId: ctx.organization_id,
-    conversationId: c.id,
-    contactId: c.contact_id,
-  });
-  const chatId = adapter.resolveRecipient({
-    isGroup: c.is_group,
-    groupChatId: c.group_chat_id,
-    phoneNumber: c.contacts?.phone_number,
-    waIdentity: c.contacts?.wa_identity,
-    waLid: c.contacts?.wa_lid,
-    ultimoRecebidoChatId,
-  });
+  //
+  // A campanha de prospecção é a exceção (F4g, A5): a preparação conferiu UM
+  // número, e é só para ele que a mensagem fria sai — nem o LID, nem o telefone
+  // extra por onde a pessoa escreveu um dia, que ninguém conferiu.
+  const destinoAprovado = ctx.campaignDelivery?.destinoAprovado.trim() || null;
+  const ultimoRecebidoChatId = destinoAprovado
+    ? null
+    : await enderecoDaUltimaRecebida(supabase, {
+        provider: c.channel_sessions?.provider,
+        isGroup: c.is_group,
+        organizationId: ctx.organization_id,
+        conversationId: c.id,
+        contactId: c.contact_id,
+      });
+  const chatId = destinoAprovado
+    ? adapter.resolveRecipient({
+        isGroup: false,
+        groupChatId: null,
+        phoneNumber: destinoAprovado,
+        waIdentity: null,
+        waLid: null,
+        ultimoRecebidoChatId: null,
+      })
+    : adapter.resolveRecipient({
+        isGroup: c.is_group,
+        groupChatId: c.group_chat_id,
+        phoneNumber: c.contacts?.phone_number,
+        waIdentity: c.contacts?.wa_identity,
+        waLid: c.contacts?.wa_lid,
+        ultimoRecebidoChatId,
+      });
 
   // Releitura no sink: o operador pode ter fechado o canal enquanto o modelo
   // gerava a resposta. Envio humano não passa por esta restrição da IA.
@@ -1223,10 +1295,19 @@ export async function sendMessageHandler(
       // sendo a única conferência e segue aqui.
       const fronteiraJaConferida = mesmaFronteira(currentExecutionBoundary(), ctx.serviceBoundary ?? null);
       const operacaoJaConferida = mesmaOperacao(currentExecutionAgentOperation(), ctx.agentOperation);
+      // A saída do agente que este transporte carrega no escopo (versão 17, F4v do cxj, V01): só a 1ª mensagem física
+      // do envio a toma. Fora da cadeia do agente, `null`.
+      //
+      // A ordem (versão 18, F4w do cxj, W02) é lida antes da tomada, e vale para toda mensagem de TEXTO do envio, a 1ª
+      // e as bolhas seguintes: o texto do agente não sai na frente de uma resposta retida e mais antiga da conversa. A
+      // mídia fica fora: o resgate, que manda a retida, só manda texto.
+      const ordemDoAgente = input.type === "text" ? (saidaDoAgenteNoEscopo()?.ordem ?? null) : null;
+      const saidaDoAgente = tomarSaidaDoAgente();
       const checkBoundary = async () => {
         await guardServiceEffect();
         await guardAgendaEffect();
         if (ctx.prospectingDelivery) await assertProspectingDelivery(supabase, ctx.prospectingDelivery);
+        if (ctx.campaignDelivery) await assertCampaignDelivery(supabase, ctx.campaignDelivery);
         if (ctx.meetingDelivery) await assertMeetingDeliverySupabase(supabase, ctx.meetingDelivery);
         if (ctx.proactiveContext) await assertAgendaEffectSupabase(supabase, ctx.proactiveContext);
         if (ctx.serviceBoundary && !fronteiraJaConferida)
@@ -1234,6 +1315,21 @@ export async function sendMessageHandler(
         if (ctx.approvedReply) await prepareApprovedReplySupabase(supabase, ctx.approvedReply);
         if (ctx.agentOperation && !operacaoJaConferida)
           await assertAgentOperationSupabase(supabase, ctx.agentOperation);
+        // A ordem (versão 18, F4w do cxj, W02): havendo na conversa uma resposta do agente retida e mais antiga do que
+        // esta mensagem, ela não sai agora. A pergunta lê o banco, e por isso vem antes das contas de hora, que seguem
+        // sendo as últimas antes do provedor; se a leitura falhar, o erro sobe, e a mensagem não sai.
+        if (
+          ordemDoAgente &&
+          (await ordemDoAgente.haRespostaRetidaAntes({ conversationId: c.id, messageId: message.id }))
+        )
+          throw new SaidaAtrasDeRespostaRetidaError();
+        // A hora da vaga da campanha, por último (F4t do cxj, T01 a T03): as conferências de cima esperam o banco, e
+        // nessa espera a janela da campanha pode fechar e a vaga, envelhecer. É a conta mais perto do provedor, sem
+        // espera nenhuma entre ela e ele.
+        if (ctx.campaignSlot) assertCampaignSlot(ctx.campaignSlot);
+        // E a idade da saída do agente, pela mesma razão (F4v do cxj, V01): o registro dela no limite do número foi
+        // gravado antes de o handler começar, e quem mede o intervalo conta com a mensagem saindo até a folga depois.
+        if (saidaDoAgente) conferirSaidaDoAgente(saidaDoAgente);
       };
       // O que separa mídia de texto é a presença de `media` no envelope — o
       // adapter preserva o mesmo branch (e a mesma mensagem de erro de cada
@@ -1469,6 +1565,79 @@ export async function sendMessageHandler(
       if (updated) message = updated as unknown as Message;
       }
     } catch (err) {
+      if (err instanceof SaidaDoAgenteVencidaError || err instanceof SaidaAtrasDeRespostaRetidaError) {
+        // A saída do agente envelheceu no caminho até o provedor (versão 17, F4v do cxj, V01): a conferência do último
+        // passo lançou antes de chamá-lo, e nada saiu. A linha fica em `queued`, com o motivo, como no canal fora do
+        // ar. Quem a manda depois é o resgate do watchdog, quando o job dela termina (o turno de resposta segue: o
+        // `queued` não reagenda o job); se o job falhar por outra razão e voltar à fila, a nova tentativa a manda pelo
+        // mesmo id. Cada um com o próprio registro no limite do número. Não é falha de entrega: nada de
+        // `emitirFalhaDeEntrega`.
+        //
+        // Ou há na conversa uma resposta do agente mais antiga e ainda na fila (versão 18, F4w do cxj, W02): a
+        // conferência da ordem lançou antes do provedor, e a linha fica em `queued` do mesmo jeito, com o motivo dela,
+        // para sair depois da mais antiga.
+        //
+        // O que segura as seguintes da conversa é a marca de resposta, e ela nasceu com a linha (versão 19, F4x do
+        // cxj, X01): aqui se grava só o motivo, que informa a tela e quem opera, e não decide a ordem. O erro deste
+        // UPDATE era ignorado; agora uma 2ª tentativa cobre a queda passageira, e, sem ela, o log diz qual mensagem
+        // ficou na fila sem o motivo. Com ou sem ele, a linha segue na fila com a marca, e nada passa na frente dela.
+        const motivoDaRetencao =
+          err instanceof SaidaDoAgenteVencidaError ? MOTIVO_DA_SAIDA_VENCIDA : MOTIVO_DA_SAIDA_ATRAS_DE_RETIDA;
+        const gravarOMotivo = () =>
+          supabase
+            .from("messages")
+            .update({ metadata: { ...(message.metadata ?? {}), queued_reason: motivoDaRetencao } })
+            .eq("id", message.id)
+            .eq("organization_id", ctx.organization_id)
+            .select(MSG_COLS)
+            .maybeSingle();
+        let { data: emFila, error: erroAoGravar } = await gravarOMotivo();
+        if (erroAoGravar) ({ data: emFila, error: erroAoGravar } = await gravarOMotivo());
+        if (erroAoGravar) {
+          logger.error("messages.send.retencao_sem_motivo", {
+            message_id: message.id,
+            organization_id: ctx.organization_id,
+            motivo: motivoDaRetencao,
+            erro: erroAoGravar.message,
+          });
+        }
+        if (emFila) message = emFila as unknown as Message;
+        return message;
+      }
+      if (err instanceof VetoDaCampanhaError) {
+        // O veto da conferência final da campanha no instante do efeito (F4g,
+        // A3), DEPOIS do INSERT: a linha sai de `queued`, só se ainda estiver
+        // lá, e o erro sobe para a rodada aplicar o veto ao destinatário. Não é
+        // falha de entrega: nada de `emitirFalhaDeEntrega`.
+        //
+        // F4i (H08 do cxj): o erro deste UPDATE era descartado, e a linha ficava
+        // na fila física. Uma 2ª tentativa cobre a queda passageira; sem ela, o
+        // log diz qual mensagem ficou, e o resgate do watchdog não manda
+        // mensagem de campanha de prospecção (`session-reconciler.ts`).
+        const tirarDaFila = () =>
+          supabase
+            .from("messages")
+            .update({
+              status: "failed",
+              error_code: "campanha_vetada",
+              error_message: "Não enviada: a conferência final da campanha vetou o envio.",
+            })
+            .eq("id", message.id)
+            .eq("organization_id", ctx.organization_id)
+            .eq("status", "queued")
+            .select("id")
+            .maybeSingle();
+        let { error: erroAoTirar } = await tirarDaFila();
+        if (erroAoTirar) ({ error: erroAoTirar } = await tirarDaFila());
+        if (erroAoTirar) {
+          logger.error("messages.send.campanha_vetada_sem_registro", {
+            message_id: message.id,
+            organization_id: ctx.organization_id,
+            erro: erroAoTirar.message,
+          });
+        }
+        throw err;
+      }
       if (err instanceof AgendaPuladoError) {
         // O pulo por compromisso chega aqui pelo recheck do corte, DEPOIS do
         // INSERT: relançar com a linha em `queued` deixava o redrive do

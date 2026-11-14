@@ -38,8 +38,20 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 
 import { sendMessageHandler } from "@/app/api/v1/messages/_handler";
 import { getRequestPool } from "@/lib/agent-engine/db/request-pool";
-import { decidePacing } from "@/lib/agent-engine/pacing/engine";
-import { loadChannelKnobs, loadPacingState, recordSend } from "@/lib/agent-engine/pacing/store";
+import {
+  decidePacing,
+  dayStartInTz,
+  janelaDeEnvioAberta,
+  janelaDeProspeccaoAberta,
+  tetoDoDia,
+} from "@/lib/agent-engine/pacing/engine";
+import {
+  loadChannelKnobs,
+  loadPacingState,
+  reservarVaga,
+  undoSend,
+  type ReservaDaVaga,
+} from "@/lib/agent-engine/pacing/store";
 import { beginServiceAtOrigin } from "@/lib/atendimento/origem";
 import { canalTemRiscoDeBanimento } from "@/lib/channels/capabilities";
 import {
@@ -48,16 +60,28 @@ import {
   falhaDoEnvioInteiro,
   fraseDaFalha,
 } from "@/lib/channels/erro-da-plataforma";
+import { feriadosDoBrasilDoAno } from "@/lib/lgpd/holidays-br";
 import { logger } from "@/lib/logger";
 import { OrgNaoOperanteError, STATUS_OPERANTE, ehOperante, statusDaOrgEmbutida } from "@/lib/organizacao/operante";
+import type { Message } from "@/lib/types/messaging";
 
 import { baloesDaCampanha, enviarEmBaloes, pausaEntreBaloes } from "./baloes";
-import { motivoParaExcluir, recusouMarketing, statusDaSaida } from "./elegibilidade";
+import {
+  COLUNAS_DO_DESTINATARIO,
+  ESTADOS_DE_QUEM_RECEBEU,
+  aplicarVeto,
+  conferenciaFinal,
+  ehProspeccao,
+  travaDaProspeccao,
+  vetosDaPessoa,
+  type DestinatarioRow,
+} from "./conferencia";
+import { statusDaSaida } from "./elegibilidade";
 import { estadoDeEnvio } from "./estado-de-envio";
-import { hashDoEndereco } from "./exclusoes";
+import { VetoDaCampanhaError, type MotivoDaHora, type VetoDaCampanha } from "./entrega";
 import type { ConteudoDoEnvio } from "./modelo";
 import { renderizar } from "./renderizador";
-import { RAJADA, rodarEmRajada } from "./rajada";
+import { RAJADA, RajadaInterrompida, rodarEmRajada } from "./rajada";
 import { rodarCampanhaEmTransmissao } from "./transmissao";
 import { escolherNumero, poolDaCampanha, type NumeroDisponivel } from "./rodizio";
 import { podeMandarAgora, proximaTentativa, type RitmoDaCampanha } from "./ritmo";
@@ -116,13 +140,19 @@ interface CampanhaRow {
   split_messages: boolean;
   started_at: string | null;
   paused_at: string | null;
+  /** `legitimate_interest` = prospecção: abordagem fria, apoiada na avaliação de legítimo interesse (LIA). */
+  base_legal: string | null;
+  /** O instante da fotografia da audiência: o que mudou depois, a preparação não viu. */
+  prepared_at: string | null;
+  /** O filtro da audiência (`audiencia.ts`); a rodada só lê `sem_tags`, e só na prospecção. */
+  audience_filter: unknown;
 }
 
 const COLUNAS_DA_CAMPANHA =
   "id, organization_id, channel_session_id, name, message_body, content_version, " +
   "intervalo_segundos, janela_inicio_hora, janela_fim_hora, teto_diario, teto_horario, " +
   "message_mode, provider_template_name, provider_template_language, velocidade, started_at, paused_at, " +
-  "provider_template_variables, provider_broadcast_id, split_messages";
+  "provider_template_variables, provider_broadcast_id, split_messages, base_legal, prepared_at, audience_filter";
 
 /**
  * O status da organização embutido com `!inner` no `select`, e filtrado na
@@ -138,6 +168,9 @@ export async function rodarUmaRodadaDeCampanha(
   admin: SupabaseClient,
   agora: Date = new Date(),
 ): Promise<ResultadoDaRodada> {
+  // O relógio da rodada (F4t do cxj, T02): o `agora` dela andando com o relógio do processo. As campanhas da rodada
+  // recebem o mesmo `agora`, a anterior pode ter levado segundos, e a vaga de cada uma leva a hora de verdade.
+  const relogio = relogioDesde(agora);
   // Organização que não OPERA (suspensa, redigida ou arquivada) não dispara
   // campanha: disparo em massa custa ao dono da instalação e sai para fora. A
   // régua é a única do produto, `lib/organizacao/operante.ts`. O comentário que
@@ -180,6 +213,11 @@ export async function rodarUmaRodadaDeCampanha(
   const numerosQueFalaram = new Set<string>();
   const total: ResultadoDaRodada = { ...VAZIA, promovidas, detalhe: "" };
   const detalhes: string[] = [];
+  const somarAoTotal = (r: { enviadas: number; pulados: number; concluidas: number }) => {
+    total.enviadas += r.enviadas;
+    total.pulados += r.pulados;
+    total.concluidas += r.concluidas;
+  };
 
   for (const campanha of emExecucao) {
     // Um número, uma mensagem por rodada. A campanha mais antiga do número ganha
@@ -196,10 +234,8 @@ export async function rodarUmaRodadaDeCampanha(
         ? await rodarCampanhaEmTransmissao(admin, campanha, agora)
         : emRajada(campanha)
           ? await rodarCampanhaEmRajada(admin, campanha, numerosQueFalaram)
-          : await rodarUmaCampanha(admin, campanha, agora, numerosQueFalaram);
-      total.enviadas += r.enviadas;
-      total.pulados += r.pulados;
-      total.concluidas += r.concluidas;
+          : await rodarUmaCampanha(admin, campanha, agora, numerosQueFalaram, undefined, relogio);
+      somarAoTotal(r);
       detalhes.push(`${campanha.id.slice(0, 8)}:${r.detalhe}`);
       if (ocupaONumero(r)) principaisOcupados.add(campanha.channel_session_id);
       // O número que FALOU nesta rodada, que no rodízio pode não ser o principal
@@ -209,9 +245,21 @@ export async function rodarUmaRodadaDeCampanha(
       for (const numero of numerosQueAFalaUsou(r)) numerosQueFalaram.add(numero);
     } catch (err) {
       const motivo = err instanceof Error ? err.message : String(err);
-      logger.warn("[campanha] rodada falhou", { campanha: campanha.id, motivo });
+      // A rajada que parou por erro traz o que já tinha feito (F4k, K08 do cxj):
+      // os envios entram na conta, e os números por onde ela falou ficam fora do
+      // rodízio das campanhas seguintes desta rodada, como no desfecho normal.
+      const parcial = err instanceof RajadaInterrompida ? err.parcial : null;
+      logger.warn("[campanha] rodada falhou", {
+        campanha: campanha.id,
+        motivo,
+        ...(parcial ? { parcial: parcial.detalhe } : {}),
+      });
       detalhes.push(`${campanha.id.slice(0, 8)}:erro`);
       principaisOcupados.add(campanha.channel_session_id);
+      if (parcial) {
+        somarAoTotal(parcial);
+        for (const numero of numerosQueAFalaUsou(parcial)) numerosQueFalaram.add(numero);
+      }
     }
   }
 
@@ -259,25 +307,6 @@ async function promoverAgendadas(
   return (data ?? []).length;
 }
 
-interface DestinatarioRow {
-  id: string;
-  contact_id: string;
-  recipient_address: string | null;
-  rendered_body: string | null;
-  /** `{ nome, modelo? }` — com modelo, os valores congelados na preparação. */
-  variables: unknown;
-  contacts: {
-    id: string;
-    name: string | null;
-    display_name: string | null;
-    phone_number: string | null;
-    is_blocked: boolean;
-    is_personal: boolean;
-    is_anonymized: boolean;
-    consent: unknown;
-  } | null;
-}
-
 /**
  * A campanha avaliada nesta rodada ocupa o número para as seguintes?
  *
@@ -311,23 +340,82 @@ async function pendentesDaCampanha(
   agora: Date,
   quantos: number,
 ): Promise<DestinatarioRow[]> {
-  const { data } = await admin
+  const { data, error } = await admin
     .from("campaign_recipients")
-    .select(
-      "id, contact_id, recipient_address, rendered_body, variables, " +
-        "contacts(id, name, display_name, phone_number, is_blocked, is_personal, is_anonymized, consent)",
-    )
+    .select(COLUNAS_DO_DESTINATARIO)
     .eq("campaign_id", campanhaId)
     .eq("status", "pending")
     .or(`next_attempt_at.is.null,next_attempt_at.lte.${agora.toISOString()}`)
     .order("created_at", { ascending: true })
     .limit(quantos);
+  // Sem conseguir ler a fila, ninguém sabe se ela acabou (F4j, J11 do cxj): lida
+  // como vazia, a campanha era concluída com gente pendente, e a vigia deixava de
+  // vê-la. A exceção sobe ao laço da rodada, que registra e segue com a campanha
+  // em andamento; a rajada para no mesmo laço.
+  if (error) throw new Error(`a fila da campanha não foi lida: ${error.message}`);
   return (data ?? []) as unknown as DestinatarioRow[];
 }
 
 /** Velocidade rápida só com modelo: o CHECK da 0711 garante, e o despacho confere de novo. */
 function emRajada(campanha: CampanhaRow): boolean {
   return campanha.velocidade === "rapida" && campanha.message_mode === "template";
+}
+
+/** O resultado da rodada para um veto já aplicado ao destinatário: só o `pular` conta como pulado. */
+function desfechoDoVeto(
+  veto: VetoDaCampanha,
+  detalhe: string,
+): { enviadas: 0; pulados: 0 | 1; concluidas: 0; detalhe: string } {
+  return { enviadas: 0, pulados: "pular" in veto ? 1 : 0, concluidas: 0, detalhe };
+}
+
+/** O dia de `agora`, no fuso dado, é um dos feriados nacionais de `lib/lgpd/holidays-br.ts`? */
+function ehFeriadoNacional(agora: Date, fuso: string): boolean {
+  const dia = new Intl.DateTimeFormat("sv-SE", {
+    timeZone: fuso,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(agora);
+  return feriadosDoBrasilDoAno(Number(dia.slice(0, 4))).includes(dia);
+}
+
+/** A meia-noite LOCAL seguinte: 36 h depois da de hoje cai sempre no dia seguinte, com ou sem horário de verão. */
+function meiaNoiteSeguinte(agora: Date, fuso: string): Date {
+  return dayStartInTz(new Date(dayStartInTz(agora, fuso).getTime() + 36 * 3_600_000), fuso);
+}
+
+/**
+ * A folga da vaga da campanha (F4t do cxj, T03): quanto o balão pode sair depois da hora gravada na vaga. A vaga leva
+ * a hora lida sob a trava do número, e o balão sai depois da espera do handler, que confere a pessoa no banco antes
+ * do provedor (várias leituras, pela REST). Com o handler lento, a vaga ficava mais velha que o envio, e a reserva
+ * seguinte do número, conferida contra ela, passava no intervalo com o envio de verdade mais perto do anterior. Agora a
+ * vaga mais velha que a folga não sai (volta, e a pessoa espera a rodada seguinte), e o 1º balão reserva com o
+ * intervalo do número mais a folga: com cada balão saindo até a folga depois da vaga dele, o envio seguinte nunca sai a
+ * menos do intervalo. 10 s é folga para o handler lento; no envio gradual, a rodada manda uma pessoa por número a cada
+ * minuto, e o intervalo do número (o padrão é 1,2 s) mais a folga segue abaixo disso. Sem intervalo no número (o canal
+ * oficial, que não tem risco de banimento), não há folga a somar.
+ *
+ * Versão 16 (F4u do cxj, U02): a garantia acima valia entre duas vagas da campanha. A resposta da IA media o intervalo a
+ * partir da hora gravada na vaga, e saía a menos do intervalo do balão que ainda não tinha saído. Agora cada vaga grava
+ * a hora mais tardia do balão, o instante mais a folga (`RegraDaVaga.folgaMs`), e todo emissor do número mede o
+ * intervalo dela. O 1º balão segue reservando com o intervalo mais a folga: a cadeia da IA grava o registro antes do
+ * transporte, e a margem cobre o tempo entre o registro dela e a saída. Entre duas vagas da campanha, o intervalo
+ * efetivo passa a ser o do número mais duas folgas (21,2 s no padrão), ainda abaixo do minuto do envio gradual.
+ *
+ * Versão 17 (F4v do cxj, V01): o registro da IA também passou a guardar a hora mais tardia da saída enquanto o
+ * transporte está em curso, com a idade conferida no último passo do handler (`pacing/saida-do-agente.ts`); a margem da
+ * reserva deixou de ser a única cobertura desse tempo, e foi mantida.
+ */
+export const ATRASO_MAXIMO_DA_VAGA_DA_CAMPANHA_MS = 10_000;
+
+/**
+ * O relógio de quem recebeu `agora`: `agora` andando com o relógio do processo. Em produção, `agora` é a hora em que a
+ * rodada começou, e o relógio dá a hora de agora; nos testes, segue o `agora` que o teste deu.
+ */
+function relogioDesde(agora: Date): () => Date {
+  const base = Date.now();
+  return () => new Date(agora.getTime() + (Date.now() - base));
 }
 
 /**
@@ -357,7 +445,11 @@ async function rodarCampanhaEmRajada(
       buscarLote: (quantos) => pendentesDaCampanha(admin, campanha.id, new Date(), quantos),
       enviarUm: (alvo) => rodarUmaCampanha(admin, campanha, new Date(), numerosJaUsados, alvo),
       aindaEmAndamento: async () => {
-        const { data } = await admin.from("campaigns").select("status").eq("id", campanha.id).maybeSingle();
+        const { data, error } = await admin.from("campaigns").select("status").eq("id", campanha.id).maybeSingle();
+        // Sem ler, ninguém sabe se a campanha parou (F4l, L01 do cxj): o erro lido
+        // como “parou” encerrava a rajada calado, e a campanha seguia `running` sem
+        // aviso. Lança, e a rodada registra o erro com o que a rajada já tinha feito.
+        if (error) throw new Error(`o andamento da campanha não foi lido: ${error.message}`);
         return (data as { status?: string } | null)?.status === "running";
       },
       concluirSeAcabou: () => rodarUmaCampanha(admin, campanha, new Date(), numerosJaUsados),
@@ -375,6 +467,8 @@ async function rodarUmaCampanha(
   numerosJaUsados: ReadonlySet<string>,
   /** A rajada escolhe o destinatário do lote; sem ele, o primeiro da fila. */
   escolhido?: DestinatarioRow,
+  /** O relógio da rodada; sem ele, o de `agora`, que a rajada pega na hora de cada envio. */
+  relogio: () => Date = relogioDesde(agora),
 ): Promise<{ enviadas: number; pulados: number; concluidas: number; detalhe: string; numero?: string }> {
   // Campanha com modelo: uma falha que vale para o ENVIO INTEIRO (modelo
   // pausado, número restringido, pagamento) chega pelo webhook, depois do envio.
@@ -393,12 +487,16 @@ async function rodarUmaCampanha(
   if (!alvo) {
     // Nada pendente AGORA não é o mesmo que nada pendente: pode haver gente
     // esperando `next_attempt_at`. Só conclui quem não tem mais nenhum em voo.
-    const { count } = await admin
+    const { count, error } = await admin
       .from("campaign_recipients")
       .select("id", { count: "exact", head: true })
       .eq("campaign_id", campanha.id)
       .in("status", ["pending", "queued", "sending"]);
-    if ((count ?? 0) > 0) return { enviadas: 0, pulados: 0, concluidas: 0, detalhe: "aguardando" };
+    // Só a contagem LIDA conclui: o erro, ou a contagem que não veio, não é zero (F4j, J11).
+    if (error || typeof count !== "number") {
+      throw new Error(`a contagem da fila da campanha não foi lida: ${error?.message ?? "sem contagem"}`);
+    }
+    if (count > 0) return { enviadas: 0, pulados: 0, concluidas: 0, detalhe: "aguardando" };
 
     const { data } = await admin
       .from("campaigns")
@@ -419,16 +517,17 @@ async function rodarUmaCampanha(
   // cheia de bloqueados não pode consumir o teto diário do número. E são
   // revalidados porque entre a preparação e agora a pessoa pode ter pedido para
   // parar — honrar o pedido com um dia de atraso é o mesmo que não honrar.
+  // A lista de exclusão da operação entra aqui também, e não só na preparação:
+  // ela pode ter crescido depois do snapshot, e o ponto dela é impedir o envio.
+  // Sem conseguir lê-la, não manda agora (F4g, A2): o erro era lido como "não
+  // está na lista".
   const contato = alvo.contacts;
-  const motivo = motivoParaExcluir({
-    contactId: alvo.contact_id,
-    telefone: contato?.phone_number ?? alvo.recipient_address,
-    bloqueado: !!contato?.is_blocked,
-    pessoal: !!contato?.is_personal,
-    anonimizado: !!contato?.is_anonymized,
-    recusouMarketing: recusouMarketing(contato?.consent),
-  });
-  if (motivo) {
+  const daPessoa = await vetosDaPessoa(admin, campanha, alvo);
+  if (daPessoa && "esperar" in daPessoa) {
+    return { enviadas: 0, pulados: 0, concluidas: 0, detalhe: `trava:${daPessoa.esperar}` };
+  }
+  if (daPessoa) {
+    const motivo = daPessoa.pular;
     await admin
       .from("campaign_recipients")
       .update({
@@ -442,27 +541,21 @@ async function rodarUmaCampanha(
     return { enviadas: 0, pulados: 1, concluidas: 0, detalhe: `pulado:${motivo}` };
   }
 
-  // A lista de exclusão da operação, revalidada AQUI e não só na preparação:
-  // ela pode ter crescido depois do snapshot, e o ponto dela é impedir o envio.
-  const enderecoAtual = (contato?.phone_number ?? alvo.recipient_address ?? "").trim();
-  if (enderecoAtual !== "") {
-    const { data: suprimido } = await admin
-      .from("campaign_suppressions")
-      .select("id")
-      .eq("organization_id", campanha.organization_id)
-      .eq("recipient_address_hash", hashDoEndereco(enderecoAtual))
-      .maybeSingle();
-    if (suprimido) {
+  // ─── A fotografia da PROSPECÇÃO, revalidada (ver `travaDaProspeccao`) ───
+  if (ehProspeccao(campanha)) {
+    const trava = await travaDaProspeccao(admin, campanha, alvo, agora);
+    if (trava && "esperar" in trava) {
+      // Sem a leitura (ou sem o corte) não há como saber se a pessoa respondeu:
+      // não manda agora, e o destinatário fica pendente para o próximo tique.
+      return { enviadas: 0, pulados: 0, concluidas: 0, detalhe: `trava:${trava.esperar}` };
+    }
+    if (trava) {
       await admin
         .from("campaign_recipients")
-        .update({
-          status: "skipped",
-          eligibility_status: "excluded",
-          exclusion_reason: "suprimido",
-        })
+        .update({ status: "skipped", eligibility_status: "excluded", exclusion_reason: trava.pular })
         .eq("id", alvo.id)
         .eq("status", "pending");
-      return { enviadas: 0, pulados: 1, concluidas: 0, detalhe: "pulado:suprimido" };
+      return { enviadas: 0, pulados: 1, concluidas: 0, detalhe: `pulado:${trava.pular}` };
     }
   }
 
@@ -487,6 +580,19 @@ async function rodarUmaCampanha(
   // campanha, e precisa de um relógio só — três números em fusos diferentes
   // fariam a mesma campanha abrir e fechar a janela três vezes.
   const knobsDoPrincipal = await loadChannelKnobs(pool, campanha.organization_id, campanha.channel_session_id);
+  // Prospecção não sai em feriado nacional. O motor sabe os DIAS da semana do
+  // número (`prospeccaoDias`, logo abaixo), não o calendário: a sobra de quinta
+  // saía no feriado de sexta, na abertura da janela. Espera, não exclui: o
+  // destinatário volta à fila à meia-noite seguinte, no fuso do principal. É
+  // `ritmo:` para não ocupar o número — a campanha de consentimento segue.
+  if (ehProspeccao(campanha) && ehFeriadoNacional(agora, knobsDoPrincipal.knobs.timezone)) {
+    await admin
+      .from("campaign_recipients")
+      .update({ next_attempt_at: meiaNoiteSeguinte(agora, knobsDoPrincipal.knobs.timezone).toISOString() })
+      .eq("id", alvo.id)
+      .eq("status", "pending");
+    return { enviadas: 0, pulados: 0, concluidas: 0, detalhe: "ritmo:feriado" };
+  }
   // ⚠️ O estado do ritmo é lido DEPOIS dos knobs porque precisa do MESMO fuso
   // que a janela usa. Com `setUTCHours`, o "dia" virava 21h no horário de
   // Brasília — DENTRO da janela de envio —, e uma campanha que já tinha batido
@@ -523,6 +629,9 @@ async function rodarUmaCampanha(
   // ─── O RODÍZIO: qual número fala com esta pessoa ───
   const disponiveis: NumeroDisponivel[] = [];
   const knobsPorNumero = new Map<string, Awaited<ReturnType<typeof loadChannelKnobs>>>();
+  // A regra da vaga de cada número, a mesma do `decidePacing` abaixo: o teto do dia
+  // e o intervalo. A reserva a confere de novo, sob a trava do número (F4n, N12).
+  const regraPorNumero = new Map<string, { limite: number | null; intervaloMs: number }>();
   for (const sessionId of numeros) {
     const k =
       sessionId === campanha.channel_session_id
@@ -546,6 +655,20 @@ async function rodarUmaCampanha(
       timezone: k.knobs.timezone,
       numberActivatedAt: k.numberActivatedAt,
     });
+    // Aquecimento, teto e intervalo anti-ban são do número por QR. O oficial não é banido
+    // por volume — quem limita ali é a plataforma (nível de mensagens) —, e o ritmo
+    // próprio da campanha (intervalo, janela, tetos) continua valendo.
+    const banRisk = canalTemRiscoDeBanimento(linha.provider);
+    regraPorNumero.set(sessionId, {
+      limite: tetoDoDia({
+        now: agora,
+        knobs: k.knobs,
+        numberActivatedAt: k.numberActivatedAt,
+        crmDailyLimit: linha.daily_message_limit ?? null,
+        banRisk,
+      }),
+      intervaloMs: banRisk ? k.knobs.throttleMs : 0,
+    });
     const decisao = decidePacing({
       now: agora,
       knobs: k.knobs,
@@ -553,10 +676,10 @@ async function rodarUmaCampanha(
       // tivessem saído. Com um balão só, é o estado de sempre.
       state: { ...estadoDoNumero, sentToday: estadoDoNumero.sentToday + baloesPrevistos - 1 },
       crmDailyLimit: linha.daily_message_limit ?? null,
-      // Aquecimento e teto anti-ban são do número por QR. O oficial não é banido
-      // por volume — quem limita ali é a plataforma (nível de mensagens) —, e o
-      // ritmo próprio da campanha (intervalo, janela, tetos) continua valendo.
-      banRisk: canalTemRiscoDeBanimento(linha.provider),
+      banRisk,
+      // Prospecção lê os dias próprios do número (`prospeccaoDias`, 0642), como
+      // o worker de prospecção já faz. Sem isto a campanha fria saía no sábado.
+      prospeccao: ehProspeccao(campanha),
     });
     disponiveis.push({
       sessionId,
@@ -581,6 +704,7 @@ async function rodarUmaCampanha(
   }
   const sessionEscolhida = escolha.sessionId;
   const knobs = knobsPorNumero.get(sessionEscolhida)!.knobs;
+  const regraDoNumero = regraPorNumero.get(sessionEscolhida)!;
 
   // ─── O envio ───
   // O id da mensagem nasce AQUI, e não do insert: com ele, o destinatário já
@@ -594,9 +718,26 @@ async function rodarUmaCampanha(
       enviadas: 0,
       pulados: 0,
       concluidas: 0,
-      detalhe: reserva.erro ? `erro_na_reserva:${reserva.erro.slice(0, 40)}` : "ja_reservado",
+      detalhe: reserva.erro
+        ? `erro_na_reserva:${reserva.erro.slice(0, 40)}`
+        : reserva.parou
+          ? "campanha_parou"
+          : "ja_reservado",
     };
   }
+  // ─── A conferência final (prospecção), relida do banco depois da reserva ───
+  // A 1ª conferência roda antes do ritmo e do rodízio, e na rajada sobre o lote
+  // buscado segundos antes: o que chegar nesse meio-tempo passava. Depois da
+  // reserva nenhuma outra rodada pega a pessoa. Roda de novo logo antes do 1º
+  // balão, no handler e antes de cada balão seguinte (`conferencia.ts`).
+  const entrega = { organizationId: campanha.organization_id, campaignId: campanha.id, recipientId: alvo.id };
+  const conferirAntesDoEnvio = async () => {
+    if (!ehProspeccao(campanha)) return null;
+    const veto = await conferenciaFinal(admin, entrega, agora, ["sending"]);
+    return veto ? desfechoDoVeto(veto, await aplicarVeto(admin, alvo.id, veto, agora)) : null;
+  };
+  const depoisDaReserva = await conferirAntesDoEnvio();
+  if (depoisDaReserva) return depoisDaReserva;
 
   // O corpo é montado DEPOIS do ritmo: a saudação ("bom dia" × "boa tarde") tem
   // de ser a do instante em que a mensagem SAI, no fuso do canal. Montá-la na
@@ -607,11 +748,7 @@ async function rodarUmaCampanha(
   // congelados na preparação, e é ele que fica na conversa para o agente ler.
   const valoresDoModelo = comModelo ? valoresCongelados(alvo.variables) : null;
   if (comModelo && valoresDoModelo === null) {
-    await admin
-      .from("campaign_recipients")
-      .update({ status: "failed", last_error_code: "modelo_sem_valores", sending_at: null })
-      .eq("id", alvo.id)
-      .eq("status", "sending");
+    await gravarDesfecho(admin, alvo.id, { status: "failed", last_error_code: "modelo_sem_valores", sending_at: null });
     return { enviadas: 0, pulados: 0, concluidas: 0, detalhe: "falha:modelo_sem_valores" };
   }
   const corpo = comModelo
@@ -638,53 +775,225 @@ async function rodarUmaCampanha(
       .from("campaign_recipients")
       .update({ conversation_id: boundary.conversation_id, channel_session_id: sessionEscolhida })
       .eq("id", alvo.id);
+    // Abrir a conversa leva tempo, e a resposta, o comando humano ou o
+    // cancelamento que chegarem nesse meio-tempo passavam (F4g, A3).
+    const antesDoPrimeiroBalao = await conferirAntesDoEnvio();
+    if (antesDoPrimeiroBalao) return antesDoPrimeiroBalao;
 
     // O 1º balão leva as chaves de sempre (id da mensagem, requestId,
     // idempotência): com a divisão desligada o envio é byte a byte o de antes.
     // Os seguintes ganham o índice nas chaves, para uma repetição não os fundir.
     // `maxBaloes = baloesPrevistos`: o teto foi conferido para esse número.
     const baloes = comModelo ? [corpo] : baloesDaCampanha(corpo, dividir, baloesPrevistos);
-    const relogioDosBaloes = Date.now();
-    const { primeira, desfecho: mensagem, indiceDoDesfecho } = await enviarEmBaloes(baloes, {
-      enviar: (texto, i) =>
-        sendMessageHandler(
-          admin,
-          {
-            organization_id: campanha.organization_id,
-            serviceBoundary: boundary,
-            proactiveContext: { organizationId: campanha.organization_id, contactId: alvo.contact_id },
-            actor: { type: "webhook_source", id: `campaign:${campanha.id}` },
-            requestId: i === 0 ? `campaign:${campanha.id}:${alvo.id}` : `campaign:${campanha.id}:${alvo.id}:${i}`,
-            internalMessageId: i === 0 ? messageId : randomUUID(),
-          } as Parameters<typeof sendMessageHandler>[1],
-          {
-            conversation_id: boundary.conversation_id,
-            ...conteudo,
-            ...(conteudo.type === "text" ? { body: texto } : {}),
-            metadata: {
-              source: "campaign",
-              campaign_id: campanha.id,
-              campaign_recipient_id: alvo.id,
-              campaign_content_version: campanha.content_version,
-              idempotency_key: i === 0 ? `campaign:${alvo.id}` : `campaign:${alvo.id}:${i}`,
-            },
-          } as Parameters<typeof sendMessageHandler>[2],
-        ),
-      // Cada balão entra no ledger no instante em que SAIU: o throttle do próximo
-      // envio do número conta a partir do último registro, e gravar todos com o
-      // `agora` da rodada deixava o destinatário seguinte sair a menos de
-      // `throttleMs` do último balão (medido na prova de tela: 941 ms). O 1º
-      // balão segue com `agora`, como o envio único de antes.
-      registrar: (i) =>
-        recordSend(
-          pool,
-          campanha.organization_id,
-          sessionEscolhida,
-          i === 0 ? agora : new Date(agora.getTime() + (Date.now() - relogioDosBaloes)),
-        ),
+    // A vaga de cada balão entra no ledger do número ANTES de ele sair (F4m, M01
+    // do cxj). Registrada depois, a recusa do banco deixava uma mensagem fora do
+    // teto do dia, e segurar o número dependia de uma pausa que o mesmo banco
+    // podia recusar: com 59 de 60, saíam mais duas, e com a recusa persistente,
+    // uma por rodada. Agora, sem a vaga registrada, o balão não sai.
+    // E a vaga só entra se ainda couber (F4n, N12 do cxj): o saldo lido no rodízio
+    // pode estar velho. Duas rodadas sobrepostas (o agendador chama a cada minuto, e
+    // nada impede uma de começar com a outra no meio) liam o mesmo 59 de 60 e
+    // mandavam as duas. `reservarVaga` confere o teto do dia e o intervalo de novo e
+    // grava, numa transação só, sob a trava do número que a cadeia do agente também
+    // usa. No 1º balão, têm de caber todos os balões da mensagem, e o intervalo vale;
+    // nos seguintes, só a vaga de cada um.
+    const desde = dayStartInTz(agora, knobs.timezone);
+    // Cada vaga leva o instante em que o balão sai, lido pela reserva SOB a trava do
+    // número (F4t do cxj, T02): o throttle do próximo envio do número conta a partir
+    // do último registro, e gravar todos com o `agora` da rodada deixava o
+    // destinatário seguinte sair a menos de `throttleMs` do último balão (medido na
+    // prova de tela: 941 ms). Lido antes da espera pela trava, o instante também
+    // ficava para trás, e a vaga, gravada antes da saída de verdade.
+    //
+    // A hora do envio, conferida logo depois da reserva e de novo no último passo do
+    // handler (`campaignSlot`; F4t do cxj, T01 a T03): a janela que a rodada conferiu
+    // antes de reservar (a do número, com os dias da prospecção, o feriado e a da
+    // campanha) e a idade da vaga. A reserva espera a trava, e o handler espera o
+    // banco: com a espera atravessando as 18h, a mensagem saía fora da janela. A
+    // janela vale só para o 1º balão: a mensagem que começou dentro dela vai inteira.
+    const fuso = knobsDoPrincipal.knobs.timezone;
+    const soAJanela: RitmoDaCampanha = { ...ritmo, intervaloSegundos: null, tetoDiario: null, tetoHorario: null };
+    const aindaNaJanela = (t: Date) =>
+      (ehProspeccao(campanha)
+        ? janelaDeProspeccaoAberta(t, knobs) && !ehFeriadoNacional(t, fuso)
+        : janelaDeEnvioAberta(t, knobs, false)) &&
+      podeMandarAgora(soAJanela, { ultimoEnvio: null, enviadasHoje: 0, enviadasNaUltimaHora: 0 }, t, fuso).pode;
+    const foraDaHora = (vaga: Date, i: number): MotivoDaHora | null => {
+      const t = relogio();
+      if (i === 0 && !aindaNaJanela(t)) return "janela_fechou";
+      return t.getTime() - vaga.getTime() > ATRASO_MAXIMO_DA_VAGA_DA_CAMPANHA_MS ? "vaga_vencida" : null;
+    };
+    const ondeFoi = { campanha: campanha.id, destinatario: alvo.id, numero: sessionEscolhida };
+    // A vaga do balão que certamente não saiu volta ao ledger: o handler vetou, a
+    // organização parou, ou o canal segurou a prospecção sem chamar o provedor
+    // (F4i, A1; contá-la gastava o teto do dia com uma tentativa que não falou com
+    // ninguém, F4j, J05/J09 do cxj). A incerta fica: pode ter saído. Se o banco
+    // recusar a devolução, a vaga fica também — o teto conta uma a mais, o lado
+    // seguro —, e o erro vai ao log.
+    // A folga da vaga (versão 16, F4u do cxj, U02): com intervalo no número, a linha de cada balão leva o instante mais a
+    // folga, a hora mais tardia em que ele sai (a idade conferida em `foraDaHora`), e a devolução a procura com ela.
+    const folgaDaVaga = regraDoNumero.intervaloMs > 0 ? ATRASO_MAXIMO_DA_VAGA_DA_CAMPANHA_MS : 0;
+    const devolverVaga = async (quando: Date) => {
+      try {
+        await undoSend(pool, campanha.organization_id, sessionEscolhida, quando, { folgaMs: folgaDaVaga });
+      } catch (err) {
+        logger.error("[campanha] a vaga de um envio que não saiu ficou no teto do número", {
+          ...ondeFoi,
+          motivo: err instanceof Error ? err.message : String(err),
+        });
+      }
+    };
+    // O tipo vai explícito: com o `parar` lendo o desfecho, o compilador não o
+    // tira mais do retorno do `enviar`.
+    const { primeira, desfecho: mensagem, indiceDoDesfecho } = await enviarEmBaloes<Message>(baloes, {
+      enviar: async (texto, i) => {
+        // O instante da vaga é lido pela reserva, sob a trava, e guardado: é por ele que a
+        // hora do envio é conferida, e que a devolução acha a linha gravada.
+        let lido: Date | undefined;
+        const instanteDaVaga = () => (lido ??= relogio());
+        let reserva: ReservaDaVaga;
+        try {
+          reserva = await reservarVaga(pool, campanha.organization_id, sessionEscolhida, instanteDaVaga, {
+            limite: regraDoNumero.limite,
+            desde,
+            vagas: i === 0 ? baloes.length : 1,
+            // Com a folga da vaga (F4t do cxj, T03): ver `ATRASO_MAXIMO_DA_VAGA_DA_CAMPANHA_MS`.
+            intervaloMs:
+              i === 0 && regraDoNumero.intervaloMs > 0
+                ? regraDoNumero.intervaloMs + ATRASO_MAXIMO_DA_VAGA_DA_CAMPANHA_MS
+                : 0,
+            // E a linha de todo balão leva a hora mais tardia em que ele sai (versão 16, F4u do cxj, U02).
+            folgaMs: folgaDaVaga,
+          });
+        } catch (err) {
+          const motivo = err instanceof Error ? err.message : String(err);
+          // No 1º balão nada saiu: a pessoa volta à fila, e a rajada para (`erro_no_teto`).
+          if (i === 0) {
+            logger.error("[campanha] o envio não saiu: o teto do número não registrou a vaga", {
+              ...ondeFoi,
+              motivo,
+            });
+            throw new VagaNaoRegistradaError(motivo);
+          }
+          // Num seguinte, o começo saiu e conta, e o resto não vai — o mesmo
+          // desfecho do veto de um balão seguinte.
+          logger.error("[campanha] o balão seguinte não saiu: o teto do número não registrou a vaga", {
+            ...ondeFoi,
+            balao: i,
+            motivo,
+          });
+          return null;
+        }
+        // Sem vaga: outro envio do número a levou depois da leitura do rodízio (outra
+        // rodada, a rajada, o agente). Não é erro do banco: nada saiu, e é só a vez.
+        if (reserva !== "reservada") {
+          // No 1º balão, a pessoa volta à fila, e a rajada para (`canal:`).
+          if (i === 0) {
+            logger.warn("[campanha] o envio não saiu: a vaga do número já foi ocupada", {
+              ...ondeFoi,
+              motivo: reserva,
+            });
+            throw new VagaOcupadaError(reserva);
+          }
+          // Num seguinte, o começo saiu e conta, e o resto não vai.
+          logger.warn("[campanha] o balão seguinte não saiu: a vaga do número já foi ocupada", {
+            ...ondeFoi,
+            balao: i,
+            motivo: reserva,
+          });
+          return null;
+        }
+        const quando = instanteDaVaga();
+        // A hora do envio, logo depois da reserva (F4t do cxj, T01): a espera pela trava
+        // pode ter atravessado o fim da janela. A vaga volta, e nada sai: no 1º balão, a
+        // pessoa volta à fila pelo veto (`trava:`), como no da conferência final; num
+        // seguinte, o começo saiu e conta, e o resto não vai.
+        const motivoDaHora = foraDaHora(quando, i);
+        if (motivoDaHora) {
+          await devolverVaga(quando);
+          if (i === 0) throw new VetoDaCampanhaError({ esperar: motivoDaHora });
+          logger.warn("[campanha] o balão seguinte não saiu: a vaga envelheceu antes do envio", {
+            ...ondeFoi,
+            balao: i,
+            motivo: motivoDaHora,
+          });
+          return null;
+        }
+        let resultado: Message;
+        try {
+          resultado = await sendMessageHandler(
+            admin,
+            {
+              organization_id: campanha.organization_id,
+              serviceBoundary: boundary,
+              proactiveContext: { organizationId: campanha.organization_id, contactId: alvo.contact_id },
+              actor: { type: "webhook_source", id: `campaign:${campanha.id}` },
+              // A hora da vaga, conferida de novo no último passo antes do provedor
+              // (`checkBoundary`), depois de toda a espera do handler.
+              campaignSlot: { conferir: () => foraDaHora(quando, i) },
+              requestId: i === 0 ? `campaign:${campanha.id}:${alvo.id}` : `campaign:${campanha.id}:${alvo.id}:${i}`,
+              internalMessageId: i === 0 ? messageId : randomUUID(),
+              // Na prospecção, TODO balão leva a entrega (F4i, I01): a conferência
+              // final dentro do handler e o destino congelado na preparação (F4g,
+              // A5). O 1º segue byte a byte o de antes (só o destinatário
+              // reservado); os seguintes aceitam o que o ack do 1º já avançou.
+              ...(ehProspeccao(campanha)
+                ? {
+                    campaignDelivery: {
+                      ...entrega,
+                      destinoAprovado: (alvo.recipient_address ?? "").trim(),
+                      ...(i > 0 ? { estadosAceitos: ESTADOS_DE_QUEM_RECEBEU } : {}),
+                    },
+                  }
+                : {}),
+            } as Parameters<typeof sendMessageHandler>[1],
+            {
+              conversation_id: boundary.conversation_id,
+              ...conteudo,
+              ...(conteudo.type === "text" ? { body: texto } : {}),
+              metadata: {
+                source: "campaign",
+                campaign_id: campanha.id,
+                campaign_recipient_id: alvo.id,
+                campaign_content_version: campanha.content_version,
+                idempotency_key: i === 0 ? `campaign:${alvo.id}` : `campaign:${alvo.id}:${i}`,
+              },
+            } as Parameters<typeof sendMessageHandler>[2],
+          );
+        } catch (err) {
+          // O veto da conferência final e a organização parada vêm antes de o
+          // handler chamar o provedor: nada saiu, e a vaga volta. Outra exceção
+          // pode ter vindo depois da saída: a vaga fica.
+          if (err instanceof VetoDaCampanhaError || err instanceof OrgNaoOperanteError) await devolverVaga(quando);
+          // O handler vetou um balão SEGUINTE: o começo já saiu e não volta, e o
+          // resto não vai — o mesmo desfecho do `continuar` falso. Aplicar o
+          // veto aqui devolveria a pessoa à fila, e a rodada seguinte repetiria
+          // o começo. O veto do 1º balão segue para o `catch` de fora.
+          if (i > 0 && err instanceof VetoDaCampanhaError) return null;
+          throw err;
+        }
+        if (ehProspeccao(campanha) && retidaPeloCanal(resultado)) await devolverVaga(quando);
+        return resultado;
+      },
       // Pausa curta e fixa no ritmo anti-ban do número, nunca o intervalo da
       // campanha: este laço é dividido por todas as campanhas da instalação.
       esperar: () => new Promise((ok) => setTimeout(ok, pausaEntreBaloes(knobs))),
+      // Na prospecção, os balões seguintes passam pela conferência final
+      // inteira (F4g, A4): quem respondeu, foi para atendimento humano, recusou
+      // marketing, entrou na lista de exclusão ou teve a campanha cancelada
+      // depois do 1º balão não recebe o resto; sem conseguir ler, também não
+      // (o começo já saiu, e o resto espera a pessoa).
+      ...(ehProspeccao(campanha)
+        ? {
+            continuar: async () => (await conferenciaFinal(admin, entrega, agora, ESTADOS_DE_QUEM_RECEBEU)) === null,
+            // O balão que não saiu para os seguintes: o que o canal segurou na
+            // fila física (F4i, A1), porque se o canal voltasse na pausa o
+            // próximo sairia sem ele; e o incerto (`queued` sem o motivo), porque
+            // o seguinte que saísse viraria o desfecho e esconderia a incerteza
+            // (F4j, J04 do cxj).
+            parar: (desfecho) => !SAIU.has(desfecho.status ?? ""),
+          }
+        : {}),
     });
 
     // O desfecho vem do ESTADO da mensagem, nunca da ausência de exceção — o
@@ -695,6 +1004,22 @@ async function rodarUmaCampanha(
     const erro = mensagem;
     const codigoDaFalha = falhou ? codigoDaPlataforma(erro.error_code, erro.error_message) : null;
 
+    // A mensagem de PROSPECÇÃO que não saiu (a fila física do canal) nunca conta
+    // como enviada, nem fica na fila física (F4i, A1): o resgate do watchdog a
+    // mandaria depois sem conferir a pessoa, e a vigia deixaria de acompanhar
+    // quem já constasse como enviado.
+    if (ehProspeccao(campanha) && !falhou && !SAIU.has(status ?? "")) {
+      return desfechoDaFilaDoCanal(admin, {
+        organizationId: campanha.organization_id,
+        destinatarioId: alvo.id,
+        retida: mensagem,
+        primeiraId: primeira.id ?? messageId,
+        indiceDoDesfecho,
+        agora,
+        numero: sessionEscolhida,
+      });
+    }
+
     // O provedor ou a plataforma pediram para DESACELERAR (429 do parceiro,
     // 130429 da plataforma). A mensagem não saiu e não tem nada de errado: o
     // destinatário volta para a fila e sai na próxima rodada. Falhá-lo tiraria
@@ -702,39 +1027,31 @@ async function rodarUmaCampanha(
     // Só no 1º balão: se um balão seguinte foi o barrado, a pessoa já recebeu o
     // começo, e voltar à fila reenviaria esse começo.
     if (falhou && indiceDoDesfecho === 0 && ehLimiteDeVelocidade(codigoDaFalha, erro.error_message)) {
-      await admin
-        .from("campaign_recipients")
-        .update({
-          status: "pending",
-          sending_at: null,
-          next_attempt_at: new Date(agora.getTime() + 60_000).toISOString(),
-          last_error_code: "limite_de_velocidade",
-          last_error_detail: (erro.error_message ?? "").slice(0, 300) || null,
-        })
-        .eq("id", alvo.id)
-        .eq("status", "sending");
+      await gravarDesfecho(admin, alvo.id, {
+        status: "pending",
+        sending_at: null,
+        next_attempt_at: new Date(agora.getTime() + 60_000).toISOString(),
+        last_error_code: "limite_de_velocidade",
+        last_error_detail: (erro.error_message ?? "").slice(0, 300) || null,
+      });
       return { enviadas: 0, pulados: 0, concluidas: 0, detalhe: `limite:${codigoDaFalha ?? "429"}` };
     }
-    // `.eq("status","sending")` porque o ack pode ter chegado ANTES desta linha:
-    // o trigger já teria avançado o destinatário para `sent`/`delivered`, e
-    // escrever por cima o rebaixaria.
-    await admin
-      .from("campaign_recipients")
-      .update({
-        status: falhou ? "failed" : "sent",
-        sent_at: falhou ? null : agora.toISOString(),
-        // O código da PLATAFORMA quando há (131050, 132015…): é ele que a tela
-        // traduz em motivo e que decide se a campanha para.
-        last_error_code: falhou ? (codigoDaFalha ?? "send_failed") : null,
-        last_error_detail: falhou ? (erro.error_message ?? null) : null,
-        // O `message_id` só pode ser gravado AQUI: a coluna tem FK para
-        // `messages`, e a linha da mensagem só existe depois do envio. Gravá-lo
-        // antes — que era o desenho original, para o trigger de ack sempre achar
-        // o destinatário — viola a FK e a reserva falha inteira.
-        message_id: primeira.id ?? messageId,
-      })
-      .eq("id", alvo.id)
-      .eq("status", "sending");
+    // Só de quem segue `sending` (`gravarDesfecho`): o ack pode ter chegado ANTES
+    // desta linha, o trigger já teria avançado o destinatário para
+    // `sent`/`delivered`, e escrever por cima o rebaixaria.
+    await gravarDesfecho(admin, alvo.id, {
+      status: falhou ? "failed" : "sent",
+      sent_at: falhou ? null : agora.toISOString(),
+      // O código da PLATAFORMA quando há (131050, 132015…): é ele que a tela
+      // traduz em motivo e que decide se a campanha para.
+      last_error_code: falhou ? (codigoDaFalha ?? "send_failed") : null,
+      last_error_detail: falhou ? (erro.error_message ?? null) : null,
+      // O `message_id` só pode ser gravado AQUI: a coluna tem FK para
+      // `messages`, e a linha da mensagem só existe depois do envio. Gravá-lo
+      // antes — que era o desenho original, para o trigger de ack sempre achar
+      // o destinatário — viola a FK e a reserva falha inteira.
+      message_id: primeira.id ?? messageId,
+    });
 
     if (falhou && falhaDoEnvioInteiro(codigoDaFalha)) {
       await pausarPorFalha(
@@ -754,16 +1071,126 @@ async function rodarUmaCampanha(
       numero: sessionEscolhida,
     };
   } catch (err) {
-    logger.warn("[campanha] envio falhou", { campanha: campanha.id, destinatario: alvo.id });
+    // A vaga ocupada já deixou o aviso dela: não é falha do envio.
+    if (!(err instanceof VagaOcupadaError)) {
+      logger.warn("[campanha] envio falhou", { campanha: campanha.id, destinatario: alvo.id });
+    }
     // A exceção pode ter vindo depois de a mensagem sair: o número conta como usado.
+    // O veto da PESSOA no handler (F4g, A3) tira o destinatário da fila: conta
+    // como pulado, como nas conferências da rodada.
     return {
       enviadas: 0,
-      pulados: 0,
+      pulados: err instanceof VetoDaCampanhaError && "pular" in err.veto ? 1 : 0,
       concluidas: 0,
-      detalhe: await registrarExcecaoDoEnvio(admin, alvo.id, err),
+      detalhe: await registrarExcecaoDoEnvio(admin, alvo.id, err, agora),
       numero: sessionEscolhida,
     };
   }
+}
+
+/** O que já saiu para o cliente: o canal aceitou (`sent`) ou confirmou (`delivered`/`read`). */
+const SAIU = new Set(["sent", "delivered", "read"]);
+
+/**
+ * O canal segurou a mensagem na fila física, e o handler disse por quê
+ * (`metadata.queued_reason`): o canal fora do ar ou ainda sem credencial. Nos
+ * dois ramos o handler não chega a falar com o provedor — nada saiu.
+ */
+export function retidaPeloCanal(m: { status?: string | null; metadata?: unknown }): boolean {
+  const motivo = (m.metadata as { queued_reason?: unknown } | null | undefined)?.queued_reason;
+  return m.status === "queued" && typeof motivo === "string" && motivo !== "";
+}
+
+/**
+ * A mensagem de prospecção que voltou do handler sem ter saído (F4i, A1).
+ *
+ * 1. Sai da fila física (`failed/campanha_sem_reenvio`), só se ainda estiver
+ *    lá: quem manda a prospecção é a rodada, que confere a pessoa de novo; o
+ *    resgate do watchdog não confere (e também a recusa, em
+ *    `session-reconciler.ts`).
+ * 2. O destinatário volta à fila da campanha SÓ quando nada saiu com certeza: o
+ *    1º balão, retido com o motivo gravado pelo handler. Sem o motivo, o handler
+ *    pode ter mandado e só não ter conseguido marcar `sent` — voltar à fila
+ *    repetiria a mensagem; num balão seguinte, o começo já saiu. Nos dois casos
+ *    o destinatário fica `failed`, e ninguém recebe de novo. O código diz a
+ *    certeza: `canal_indisponivel` quando o canal segurou, `envio_incerto`
+ *    quando pode ter saído.
+ * 3. Escrita recusada pelo banco não passa por desfecho normal (F4j, J06 do cxj):
+ *    a da mensagem fica no log (ela segue `queued`, e o resgate não manda
+ *    prospecção); a do destinatário fica no log e no desfecho
+ *    (`fila:sem_registro`). Ele segue reservado (`sending`): nenhuma rodada o
+ *    pega de novo, e nada sai — o mesmo do veto sem registro (`aplicarVeto`).
+ */
+async function desfechoDaFilaDoCanal(
+  admin: SupabaseClient,
+  d: {
+    organizationId: string;
+    destinatarioId: string;
+    retida: { id?: string | null; status?: string | null; metadata?: unknown };
+    primeiraId: string;
+    indiceDoDesfecho: number;
+    agora: Date;
+    numero: string;
+  },
+): Promise<{ enviadas: number; pulados: number; concluidas: number; detalhe: string; numero?: string }> {
+  if (d.retida.id) {
+    const { error } = await admin
+      .from("messages")
+      .update({
+        status: "failed",
+        error_code: "campanha_sem_reenvio",
+        error_message: "Não saiu: a campanha de prospecção só manda pela rodada, que confere a pessoa de novo.",
+      })
+      .eq("id", d.retida.id)
+      .eq("organization_id", d.organizationId)
+      .eq("status", "queued");
+    if (error) {
+      logger.error("[campanha] a mensagem retida não saiu da fila física", {
+        mensagem: d.retida.id,
+        destinatario: d.destinatarioId,
+        erro: error.message,
+      });
+    }
+  }
+  const motivo = (d.retida.metadata as { queued_reason?: string } | null | undefined)?.queued_reason ?? null;
+  const certa = retidaPeloCanal(d.retida);
+  const semRegistro = (codigo: string, erro: string) => {
+    logger.error("[campanha] o desfecho da fila do canal não foi gravado", {
+      destinatario: d.destinatarioId,
+      codigo,
+      erro,
+    });
+    return { enviadas: 0, pulados: 0, concluidas: 0, detalhe: "fila:sem_registro" };
+  };
+  if (d.indiceDoDesfecho === 0 && certa) {
+    const { error } = await admin
+      .from("campaign_recipients")
+      .update({
+        status: "pending",
+        sending_at: null,
+        next_attempt_at: new Date(d.agora.getTime() + 60_000).toISOString(),
+        last_error_code: "canal_indisponivel",
+        last_error_detail: motivo,
+      })
+      .eq("id", d.destinatarioId)
+      .eq("status", "sending");
+    if (error) return semRegistro("canal_indisponivel", error.message);
+    return { enviadas: 0, pulados: 0, concluidas: 0, detalhe: "fila:canal_indisponivel" };
+  }
+  const codigo = certa ? "canal_indisponivel" : "envio_incerto";
+  const { error } = await admin
+    .from("campaign_recipients")
+    .update({
+      status: "failed",
+      last_error_code: codigo,
+      last_error_detail: motivo,
+      message_id: d.primeiraId,
+    })
+    .eq("id", d.destinatarioId)
+    .eq("status", "sending");
+  // O número conta como usado nos dois casos: o começo, ou a própria mensagem, pode ter saído.
+  if (error) return { ...semRegistro(codigo, error.message), numero: d.numero };
+  return { enviadas: 0, pulados: 0, concluidas: 0, detalhe: `fila:${codigo}`, numero: d.numero };
 }
 
 /**
@@ -780,26 +1207,90 @@ export async function registrarExcecaoDoEnvio(
   admin: SupabaseClient,
   destinatarioId: string,
   err: unknown,
+  agora: Date = new Date(),
 ): Promise<string> {
+  // O veto da conferência final no handler (F4g, A3): nada saiu, e o
+  // destinatário segue o veto — pulado, de volta à fila ou cancelado —, nunca
+  // `send_exception`, que o tiraria da campanha por um motivo que não é dele.
+  if (err instanceof VetoDaCampanhaError) return aplicarVeto(admin, destinatarioId, err.veto, agora);
   if (err instanceof OrgNaoOperanteError) {
-    await admin
-      .from("campaign_recipients")
-      .update({ status: "pending", sending_at: null })
-      .eq("id", destinatarioId)
-      .eq("status", "sending");
+    await gravarDesfecho(admin, destinatarioId, { status: "pending", sending_at: null });
     return "org_nao_operante";
   }
+  // A vaga do 1º balão não entrou no ledger do número (F4m, M01 do cxj): nada
+  // saiu, e a pessoa volta à fila, como na organização parada. A rajada para
+  // (`erro_no_teto`), e a rodada seguinte tenta de novo — sem a vaga, nada sai.
+  if (err instanceof VagaNaoRegistradaError) {
+    await gravarDesfecho(admin, destinatarioId, { status: "pending", sending_at: null });
+    return "erro_no_teto";
+  }
+  // A vaga do 1º balão já tinha sido ocupada por outro envio do número (F4n, N12 do
+  // cxj): nada saiu, e a pessoa volta à fila e sai quando o número tiver vaga. O
+  // `canal:` para a rajada, como o número sem vaga do rodízio (`canal:sem_numero_livre`).
+  if (err instanceof VagaOcupadaError) {
+    await gravarDesfecho(admin, destinatarioId, { status: "pending", sending_at: null });
+    return `canal:${err.motivo}`;
+  }
   const motivoErro = err instanceof Error ? err.message : String(err);
-  await admin
+  await gravarDesfecho(admin, destinatarioId, {
+    status: "failed",
+    last_error_code: "send_exception",
+    last_error_detail: motivoErro.slice(0, 300),
+  });
+  return "falhou";
+}
+
+/**
+ * A vaga do 1º balão não entrou no ledger do número (F4m, M01 do cxj): o balão
+ * não sai. Sobe do `enviar` até o `catch` do envio, que devolve a pessoa à fila.
+ */
+class VagaNaoRegistradaError extends Error {
+  constructor(motivo: string) {
+    super(`a vaga no teto do número não foi registrada: ${motivo}`);
+    this.name = "VagaNaoRegistradaError";
+  }
+}
+
+/**
+ * A vaga do 1º balão já não cabia no teto do dia ou no intervalo do número quando a
+ * reserva a conferiu, sob a trava (F4n, N12 do cxj): o balão não sai. Sobe do
+ * `enviar` até o `catch` do envio, que devolve a pessoa à fila.
+ */
+class VagaOcupadaError extends Error {
+  readonly motivo: Exclude<ReservaDaVaga, "reservada">;
+  constructor(motivo: Exclude<ReservaDaVaga, "reservada">) {
+    super(`a vaga do número já foi ocupada: ${motivo}`);
+    this.name = "VagaOcupadaError";
+    this.motivo = motivo;
+  }
+}
+
+/**
+ * Grava o desfecho do destinatário reservado — só se ele ainda estiver
+ * `sending`: o ack, o resgate ou outra rodada podem ter chegado antes, e
+ * escrever por cima os rebaixaria. A escrita recusada vai ao log (F4m, M02 do
+ * cxj): calada, o destinatário ficava `sending` sem o `message_id` que leva o ack
+ * até ele, e ninguém sabia que a mensagem tinha saído.
+ */
+async function gravarDesfecho(
+  admin: SupabaseClient,
+  destinatarioId: string,
+  campos: { status: string; last_error_code?: string | null; message_id?: string | null } & Record<string, unknown>,
+): Promise<void> {
+  const { error } = await admin
     .from("campaign_recipients")
-    .update({
-      status: "failed",
-      last_error_code: "send_exception",
-      last_error_detail: motivoErro.slice(0, 300),
-    })
+    .update(campos)
     .eq("id", destinatarioId)
     .eq("status", "sending");
-  return "falhou";
+  if (error) {
+    logger.error("[campanha] o desfecho do destinatário não foi gravado", {
+      destinatario: destinatarioId,
+      status: campos.status,
+      codigo: campos.last_error_code ?? null,
+      mensagem: campos.message_id ?? null,
+      motivo: error.message,
+    });
+  }
 }
 
 /**
@@ -814,12 +1305,23 @@ export async function registrarExcecaoDoEnvio(
  * ficava `running` para sempre, o destinatário `pending` com zero tentativas, e
  * o cron respondia `ja_reservado` a cada minuto. Um erro disfarçado de
  * concorrência é a pior espécie: ele descreve um sistema saudável.
+ *
+ * ═══ Por que a campanha é relida DEPOIS da reserva ═══
+ *
+ * O compare-and-set confere só o destinatário. O worker que escolheu o pendente
+ * antes de a campanha ser cancelada ou pausada o reservava depois, e a mensagem
+ * saía com a campanha já parada; cancelar a fila primeiro não fechava tudo (um
+ * 429 devolve `sending` a `pending` entre as duas escritas, e a fila pode falhar
+ * sozinha). Com a campanha caindo PRIMEIRO no cancelamento (`cancelarAcao`) e
+ * relida aqui, toda reserva feita depois da queda a enxerga e se desfaz: na
+ * cancelada, o destinatário fica cancelado; na pausada, volta à fila para a
+ * retomada. Sem conseguir ler a campanha, também se desfaz (falha fechada).
  */
 export async function reservarDestinatario(
   admin: SupabaseClient,
   destinatarioId: string,
   agora: Date,
-): Promise<{ reservado: boolean; erro?: string }> {
+): Promise<{ reservado: boolean; erro?: string; parou?: true }> {
   const { data, error } = await admin
     .from("campaign_recipients")
     .update({
@@ -830,7 +1332,7 @@ export async function reservarDestinatario(
     })
     .eq("id", destinatarioId)
     .eq("status", "pending")
-    .select("id");
+    .select("id, campaign_id");
   if (error) {
     logger.warn("[campanha] reserva do destinatário falhou", {
       destinatario: destinatarioId,
@@ -838,7 +1340,34 @@ export async function reservarDestinatario(
     });
     return { reservado: false, erro: error.message };
   }
-  return { reservado: (data ?? []).length > 0 };
+  const reservado = (data ?? [])[0] as { campaign_id?: string } | undefined;
+  if (!reservado) return { reservado: false };
+
+  const { data: campanha, error: erroDaCampanha } = await admin
+    .from("campaigns")
+    .select("status")
+    .eq("id", reservado.campaign_id ?? "")
+    .maybeSingle();
+  const status = (campanha as { status?: string } | null)?.status;
+  if (!erroDaCampanha && status === "running") return { reservado: true };
+
+  await admin
+    .from("campaign_recipients")
+    .update(
+      !erroDaCampanha && status === "cancelled"
+        ? { status: "cancelled", cancelled_at: agora.toISOString(), sending_at: null }
+        : { status: "pending", sending_at: null },
+    )
+    .eq("id", destinatarioId)
+    .eq("status", "sending");
+  if (erroDaCampanha) {
+    logger.warn("[campanha] sem ler a campanha depois da reserva; reserva desfeita", {
+      destinatario: destinatarioId,
+      motivo: erroDaCampanha.message,
+    });
+    return { reservado: false, erro: erroDaCampanha.message };
+  }
+  return { reservado: false, parou: true };
 }
 
 /**

@@ -95,6 +95,16 @@ export type ChannelSendResult =
   /** transporte/tool indisponível (transiente) — o job re-tenta com a MESMA key */
   | { kind: 'unavailable'; reason: string };
 
+// A marca do envio composto (bolhas, fotos) mora num módulo sem import (`saida-parcial.ts`), para os
+// testes das bolhas seguirem nas cercas; a cadeia de envio a lê por aqui, com o desfecho do canal.
+export {
+  comSaidaParcial,
+  erroComSaidaParcial,
+  erroSaiuEmParte,
+  saiuAlgo,
+  type MarcaDeSaidaParcial,
+} from './saida-parcial';
+
 /** Saúde da sessão do número no canal (o "session health" do adapter). */
 export interface ChannelSessionHealth {
   /** true só quando o canal pode enviar agora (WAHA: sessão WORKING) */

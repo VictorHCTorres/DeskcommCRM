@@ -120,6 +120,7 @@ export function createMeetDeliveryHandler(deps: {
           }),
           optedOutThisTurn: false,
           now: new Date(),
+          relogio: () => new Date(),
           lgpd: deriveLgpdFromContact(row, false),
           ...(deps.sleep ? { sleep: deps.sleep } : {}),
           send: async (body) => {

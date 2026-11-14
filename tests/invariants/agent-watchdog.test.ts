@@ -29,6 +29,12 @@ const pool = new pg.Pool({
   max: 2,
 });
 const log = createLogger();
+/**
+ * O relógio do resgate, fixo dentro da janela do número (11h em São Paulo): a reserva confere a
+ * janela do tipo da mensagem (F4r do cxj, R07), e o relógio de verdade fazia estes casos
+ * dependerem da hora em que a suíte roda.
+ */
+const NA_JANELA = () => new Date("2026-11-18T14:00:00Z");
 
 const ORG = "bbbbbbbb-0000-4000-8000-000000000001";
 const CONTACT = "bbbbbbbb-0000-4000-8000-000000000002";
@@ -118,6 +124,15 @@ beforeAll(async () => {
      values ($1, $2, $3, 'STARTING', '\\x00'::bytea) on conflict (id) do nothing`,
     [SESSION, ORG, WAHA_SESSION_NAME],
   );
+  // O resgate reserva a vaga no limite do número antes de mandar (F4p do cxj, P07). Este
+  // arquivo reenvia várias vezes no mesmo número, a milissegundos de distância, e prende o
+  // espelho, o eco e a lista de testadores, não o limite: aqui o número não tem intervalo nem
+  // aquecimento. O limite do resgate mora em `resgate-da-fila-conta-a-saida.test.ts`.
+  await pool.query(
+    `insert into channel_knobs (organization_id, channel_session_id, throttle_ms, number_activated_at)
+     values ($1, $2, 0, now() - interval '365 days') on conflict do nothing`,
+    [ORG, SESSION],
+  );
   await pool.query(
     `insert into conversations (id, organization_id, contact_id, channel_session_id, status, is_group)
      values ($1, $2, $3, $4, 'open', false) on conflict (id) do nothing`,
@@ -179,7 +194,7 @@ describe("4A-2 — watchdog reconcilia o espelho e reenvia queued", () => {
   });
 
   it("redrive: a queued sai sent COM external_id (shape NOWEB parseado)", async () => {
-    const redriven = await redriveQueued(pool, watchdogCfg(), log);
+    const redriven = await redriveQueued(pool, watchdogCfg(), log, undefined, NA_JANELA);
     expect(redriven).toBe(1);
 
     // o WAHA recebeu exatamente 1 sendText, para a sessão certa
@@ -197,7 +212,7 @@ describe("4A-2 — watchdog reconcilia o espelho e reenvia queued", () => {
   });
 
   it("idempotência: segundo tick não reenvia (nada mais queued)", async () => {
-    const redriven = await redriveQueued(pool, watchdogCfg(), log);
+    const redriven = await redriveQueued(pool, watchdogCfg(), log, undefined, NA_JANELA);
     expect(redriven).toBe(0);
     expect(sendTextCalls).toHaveLength(1); // nenhum sendText novo
   });
@@ -210,7 +225,7 @@ describe("4A-2 — watchdog reconcilia o espelho e reenvia queued", () => {
     );
     await pool.query("update messages set status = 'queued', external_id = null where id = $1", [QUEUED_MSG]);
     sendTextCalls.length = 0;
-    expect(await redriveQueued(pool, watchdogCfg(), log)).toBe(1);
+    expect(await redriveQueued(pool, watchdogCfg(), log, undefined, NA_JANELA)).toBe(1);
     expect(sendTextCalls).toHaveLength(1);
 
     // A mensagem já existia quando o operador retirou o número da lista.
@@ -221,7 +236,7 @@ describe("4A-2 — watchdog reconcilia o espelho e reenvia queued", () => {
       [SESSION, ORG],
     );
     sendTextCalls.length = 0;
-    expect(await redriveQueued(pool, watchdogCfg(), log)).toBe(0);
+    expect(await redriveQueued(pool, watchdogCfg(), log, undefined, NA_JANELA)).toBe(0);
     expect(sendTextCalls).toHaveLength(0);
     const { rows } = await pool.query("select status, error_code from messages where id = $1", [QUEUED_MSG]);
     expect(rows[0]).toMatchObject({ status: "failed", error_code: "pre_go_live" });
@@ -231,7 +246,7 @@ describe("4A-2 — watchdog reconcilia o espelho e reenvia queued", () => {
       `update channel_sessions set metadata = jsonb_set(metadata, '{ai_gate}', '"open"') where id = $1`,
       [SESSION],
     );
-    expect(await redriveQueued(pool, watchdogCfg(), log)).toBe(0);
+    expect(await redriveQueued(pool, watchdogCfg(), log, undefined, NA_JANELA)).toBe(0);
     expect(sendTextCalls).toHaveLength(0);
   });
 });
@@ -332,7 +347,7 @@ describe("o reenvio não deixa o eco da própria mensagem duplicado", () => {
     proximasRespostasDoSendText.push({ id: { id } });
 
     const antes = sendTextCalls.length;
-    expect(await redriveQueued(pool, watchdogCfg(), log)).toBe(1);
+    expect(await redriveQueued(pool, watchdogCfg(), log, undefined, NA_JANELA)).toBe(1);
     expect(sendTextCalls).toHaveLength(antes + 1);
     // A fixture só mede alguma coisa se o eco usa o MESMO chat do reenvio.
     expect(sendTextCalls[sendTextCalls.length - 1]!.chatId).toBe(CHAT_DO_CONTATO);
@@ -367,7 +382,7 @@ describe("o reenvio não deixa o eco da própria mensagem duplicado", () => {
     await inserirDoCelular(LINHA_OUTRA_CONVERSA, CONV_2, CONTACT_2, `true_${CHAT_DO_CONTATO}_${id}`, frase);
     proximasRespostasDoSendText.push({ id: { id } });
 
-    expect(await redriveQueued(pool, watchdogCfg(), log)).toBe(1);
+    expect(await redriveQueued(pool, watchdogCfg(), log, undefined, NA_JANELA)).toBe(1);
 
     expect(await linhasCom(CONV_2, frase), "o reenvio apagou linha de outra conversa").toHaveLength(1);
   });
@@ -385,7 +400,7 @@ describe("o reenvio não deixa o eco da própria mensagem duplicado", () => {
     proximasRespostasDoSendText.push({ id: { _serialized: serializado } });
 
     const antes = sendTextCalls.length;
-    expect(await redriveQueued(pool, watchdogCfg(), log)).toBe(1);
+    expect(await redriveQueued(pool, watchdogCfg(), log, undefined, NA_JANELA)).toBe(1);
 
     const linhas = await linhasCom(CONV, frase);
     expect(linhas, "a mesma frase ficou duas vezes na conversa").toHaveLength(1);
@@ -402,7 +417,7 @@ describe("o reenvio não deixa o eco da própria mensagem duplicado", () => {
     // (organization_id, external_id) que o eco já ocupa, o catch trata como
     // "erro transiente — mantida queued", e o watchdog manda a mensagem ao
     // cliente de novo a cada tick, sem limite.
-    expect(await redriveQueued(pool, watchdogCfg(), log)).toBe(0);
+    expect(await redriveQueued(pool, watchdogCfg(), log, undefined, NA_JANELA)).toBe(0);
     expect(sendTextCalls, "o cliente recebeu a mesma mensagem de novo").toHaveLength(antes + 1);
   });
 });

@@ -37,6 +37,13 @@ export interface OpcoesDoDubleDoHandler {
   /** Linhas que já estavam em `messages` antes deste envio (eco do webhook). */
   mensagensIniciais?: LinhaDoDuble[];
   /**
+   * Reproduz a chave primária de `messages`: gravar um `id` que outra linha já tem devolve `23505` em vez de gravar
+   * uma segunda linha. É o que o handler lê para retomar a mensagem pelo mesmo id (a nova tentativa do job).
+   *
+   * LIGADO SÓ por quem prova a retomada: nos demais casos o `id` vem do contador do dublê e nunca repete.
+   */
+  chavePrimariaDaMensagem?: boolean;
+  /**
    * Reproduz o índice único `(organization_id, external_id)` de `messages`:
    * gravar um `external_id` que outra linha já tem devolve `23505` em vez de
    * gravar em cima.
@@ -70,6 +77,13 @@ export interface OpcoesDoDubleDoHandler {
    * agente entre uma bolha e outra.
    */
   agente?: LinhaDoDuble | null | (() => LinhaDoDuble | null);
+  /**
+   * A gravação que o banco recusa: para o `update` de `messages` com este patch, devolve o erro (e nada é gravado), ou
+   * `null` para gravar. É o que prova o que o handler faz quando a gravação da retenção falha (F4x do cxj, X01).
+   *
+   * LIGADO SÓ por quem prova a queda da gravação: nos demais casos, todo `update` grava.
+   */
+  erroAoAtualizarMensagem?: (patch: LinhaDoDuble) => { code: string; message: string } | null;
 }
 
 export interface RetornoDoDubleDoHandler {
@@ -397,6 +411,8 @@ export function criarDubleDoHandler(
           patch: LinhaDoDuble,
           filtros: Array<(r: LinhaDoDuble) => boolean>,
         ): { data: LinhaDoDuble | null; error: { code: string; message: string } | null } => {
+          const recusa = opcoes.erroAoAtualizarMensagem?.(patch) ?? null;
+          if (recusa) return { data: null, error: recusa };
           const alvos = filtrarMensagens(filtros);
           const externo = typeof patch.external_id === "string" ? patch.external_id : null;
           if (externo !== null && opcoes.indiceUnicoMensagem === true) {
@@ -424,6 +440,20 @@ export function criarDubleDoHandler(
 
         return {
           insert: (row: LinhaDoDuble) => {
+            if (
+              opcoes.chavePrimariaDaMensagem === true &&
+              row.id !== undefined &&
+              mensagens.some((r) => r.id === row.id)
+            ) {
+              return {
+                select: () => ({
+                  single: async () => ({
+                    data: null,
+                    error: { code: "23505", message: 'duplicate key value violates "messages_pkey"' },
+                  }),
+                }),
+              };
+            }
             contadorDeMensagens += 1;
             const nova: LinhaDoDuble = {
               id: `msg-${contadorDeMensagens}`,

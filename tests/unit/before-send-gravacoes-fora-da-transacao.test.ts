@@ -20,11 +20,13 @@
  * escalação LGPD) rodavam antes do rollback. A sabotagem (reverter só o before-send.ts) reprova
  * os 3 casos daqui.
  *
- * O QUE NÃO É MEDIDO AQUI (declarado também no PR): o `args.send` continua DENTRO da tx, sob o
- * advisory lock do número (serialização anti-ban). O `send_ledger` e a `messages`, gravados pelo
- * handler noutra conexão/Supabase dentro do `send`, seguem sendo uma aresta possível de ciclo —
- * fechá-la exige o advisory lock de SESSÃO proposto no próprio #2426, que precisa de prova com 2
- * conexões (job `invariants`) e não cabe nesta fatia.
+ * F4p do cxj (12/11/2026), P05: a régua ficou mais dura. A auditoria pelo pool feita com a conexão
+ * da cadeia ainda na mão (depois do commit, antes do `release`) esperava uma SEGUNDA conexão; num
+ * pool de uma, a cadeia pendurava sem chegar ao `release`. Agora nenhuma escrita sai pelo pool
+ * enquanto a cadeia segura a conexão, e o transporte (`args.send`, que no handler de produção grava
+ * `send_ledger` e `messages` por outra conexão) só roda com a transação fechada e a conexão
+ * devolvida: o registro da saída é confirmado antes dele. A prova com duas conexões e DDL na fila
+ * está em `tests/invariants/before-send-auditoria-nao-fecha-ciclo-com-ddl.test.ts`.
  */
 import type pg from 'pg';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -38,6 +40,8 @@ import {
 /** Estado compartilhado entre o cliente (que abre/fecha a tx) e o pool (que audita). */
 interface EstadoTransacao {
   aberta: boolean;
+  /** A cadeia está com a conexão na mão: do `connect` ao `release`. */
+  conexaoNaMao: boolean;
 }
 
 /**
@@ -46,7 +50,7 @@ interface EstadoTransacao {
  * (o caminho feliz do #2506 já prova que `runBeforeSend` completa assim).
  */
 function clienteComTransacao(): { cliente: pg.PoolClient; estado: EstadoTransacao } {
-  const estado: EstadoTransacao = { aberta: false };
+  const estado: EstadoTransacao = { aberta: false, conexaoNaMao: false };
   const cliente = {
     query: vi.fn(async (sql: string) => {
       const s = String(sql).toLowerCase().trim();
@@ -54,7 +58,9 @@ function clienteComTransacao(): { cliente: pg.PoolClient; estado: EstadoTransaca
       if (s === 'commit' || s === 'rollback') estado.aberta = false;
       return { rows: [], rowCount: 1 };
     }),
-    release: vi.fn(),
+    release: vi.fn(() => {
+      estado.conexaoNaMao = false;
+    }),
   };
   return { cliente: cliente as unknown as pg.PoolClient, estado };
 }
@@ -67,23 +73,28 @@ function clienteComTransacao(): { cliente: pg.PoolClient; estado: EstadoTransaca
 function poolAuditoriado(
   cliente: pg.PoolClient,
   estado: EstadoTransacao,
-): { pool: pg.Pool; violacoes: string[]; escritas: string[] } {
+): { pool: pg.Pool; violacoes: string[]; comConexaoNaMao: string[]; escritas: string[] } {
   const violacoes: string[] = [];
+  const comConexaoNaMao: string[] = [];
   const escritas: string[] = [];
   const pool = {
-    connect: vi.fn(async () => cliente),
+    connect: vi.fn(async () => {
+      estado.conexaoNaMao = true;
+      return cliente;
+    }),
     query: vi.fn(async (sql: string) => {
       const s = String(sql).toLowerCase().trim();
-      if (/^(insert|update|delete)\b/.test(s)) {
+      if (/^(insert|update|delete|with)\b/.test(s)) {
         escritas.push(s);
         if (estado.aberta) violacoes.push(s);
+        if (estado.conexaoNaMao) comConexaoNaMao.push(s);
       }
       if (s.includes('insert into before_send_traces'))
         return { rows: [{ id: 'trace-1' }], rowCount: 1 };
       return { rows: [], rowCount: 0 };
     }),
   };
-  return { pool: pool as unknown as pg.Pool, violacoes, escritas };
+  return { pool: pool as unknown as pg.Pool, violacoes, comConexaoNaMao, escritas };
 }
 
 function argsDoTurno(pool: pg.Pool, extras: Partial<RunBeforeSendArgs> = {}): RunBeforeSendArgs {
@@ -115,23 +126,42 @@ beforeEach(() => {
   vi.clearAllMocks();
 });
 
-describe('#2426 · runBeforeSend não grava pelo pool enquanto a transação está aberta', () => {
-  it('caminho enviado: o trace sai DEPOIS do commit, nunca durante a transação', async () => {
+describe('#2426 e F4p · runBeforeSend não grava pelo pool com a transação aberta nem com a conexão na mão', () => {
+  it('caminho enviado: o trace sai DEPOIS do commit e do release, nunca com a conexão na mão', async () => {
     const { cliente, estado } = clienteComTransacao();
-    const { pool, violacoes, escritas } = poolAuditoriado(cliente, estado);
+    const { pool, violacoes, comConexaoNaMao, escritas } = poolAuditoriado(cliente, estado);
 
     const r = await runBeforeSend(argsDoTurno(pool));
 
     expect(r.status).toBe('sent');
-    // A régua: nenhuma escrita pelo pool com a tx aberta.
+    // A régua: nenhuma escrita pelo pool com a tx aberta, nem com a conexão da cadeia na mão.
     expect(violacoes, 'escrita pelo pool durante a transação aberta (#2426)').toEqual([]);
-    // A auditoria continua existindo — só mudou o momento: depois do commit.
+    expect(comConexaoNaMao, 'escrita pelo pool com a conexão da cadeia na mão (F4p, P05)').toEqual([]);
+    // A auditoria continua existindo — só mudou o momento: depois do release.
     expect(escritas.some((s) => s.includes('insert into before_send_traces'))).toBe(true);
   });
 
-  it('veto (LGPD): trace + timeline + escalação saem DEPOIS do rollback, nunca durante a transação', async () => {
+  it('o transporte roda com a transação fechada e a conexão já devolvida ao pool (F4p, P05)', async () => {
     const { cliente, estado } = clienteComTransacao();
-    const { pool, violacoes, escritas } = poolAuditoriado(cliente, estado);
+    const { pool } = poolAuditoriado(cliente, estado);
+    let noEnvio: EstadoTransacao | undefined;
+
+    const r = await runBeforeSend(
+      argsDoTurno(pool, {
+        send: async () => {
+          noEnvio = { ...estado };
+          return { kind: 'sent', idempotencyKey: 'k', messageId: 'm' };
+        },
+      }),
+    );
+
+    expect(r.status).toBe('sent');
+    expect(noEnvio).toEqual({ aberta: false, conexaoNaMao: false });
+  });
+
+  it('veto (LGPD): trace + timeline + escalação saem DEPOIS do rollback e do release', async () => {
+    const { cliente, estado } = clienteComTransacao();
+    const { pool, violacoes, comConexaoNaMao, escritas } = poolAuditoriado(cliente, estado);
 
     const r = await runBeforeSend(
       argsDoTurno(pool, { gates: [gateQueVeta('lgpd_anonymized')] }),
@@ -139,14 +169,15 @@ describe('#2426 · runBeforeSend não grava pelo pool enquanto a transação est
 
     expect(r.status).toBe('vetoed');
     expect(violacoes, 'escrita pelo pool durante a transação aberta (#2426)').toEqual([]);
+    expect(comConexaoNaMao, 'escrita pelo pool com a conexão da cadeia na mão (F4p, P05)').toEqual([]);
     // O trace do veto é gravado (sobrevive ao rollback) — e o código lgpd_ dispara a escalação.
     expect(escritas.some((s) => s.includes('insert into before_send_traces'))).toBe(true);
     expect(escritas.some((s) => s.includes('insert into agent_inbox_items'))).toBe(true);
   });
 
-  it('envio que ERRA: a auditoria é gravada depois do rollback, sem escrita pela transação aberta', async () => {
+  it('envio que ERRA: a auditoria é gravada depois de a transação fechar e a conexão voltar ao pool', async () => {
     const { cliente, estado } = clienteComTransacao();
-    const { pool, violacoes, escritas } = poolAuditoriado(cliente, estado);
+    const { pool, violacoes, comConexaoNaMao, escritas } = poolAuditoriado(cliente, estado);
 
     await expect(
       runBeforeSend(
@@ -159,7 +190,11 @@ describe('#2426 · runBeforeSend não grava pelo pool enquanto a transação est
     ).rejects.toThrow('transporte fora');
 
     expect(violacoes, 'escrita pelo pool durante a transação aberta (#2426)').toEqual([]);
-    // A tentativa que errou ainda tem linha de auditoria (autônoma, pós-rollback).
+    expect(comConexaoNaMao, 'escrita pelo pool com a conexão da cadeia na mão (F4p, P05)').toEqual([]);
+    // A tentativa que errou ainda tem linha de auditoria (autônoma, gravada depois de a
+    // conexão voltar ao pool). O transporte que lança deixa a saída incerta, e o registro no
+    // limite diário do número, confirmado antes dele, fica
+    // (`tests/unit/registro-da-ia-antes-do-envio.test.ts`).
     expect(escritas.some((s) => s.includes('insert into before_send_traces'))).toBe(true);
   });
 });

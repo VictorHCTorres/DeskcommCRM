@@ -34,18 +34,24 @@ import { assertMeetingDeliveryPg, type MeetingDeliveryContext } from '@/lib/agen
  * comando `pnpm audit:run`, acceptance 3).
  *
  * SERIALIZAÇÃO por número (INBOX-008): o read-then-act (ler estado de pacing/copies
- * → decidir → enviar → registrar) roda sob `pg_advisory_xact_lock(hashtext(
+ * → decidir → registrar a saída) roda sob `pg_advisory_xact_lock(hashtext(
  * channel_session_id))` numa transação dedicada. Dois workers no MESMO número não
  * leem cap-1 ambos e estouram o cap em 1 (nem enviam copy duplicada): o segundo
- * espera o lock, relê o estado JÁ com o envio do primeiro contabilizado e veta.
- * O `channel.send` (POST ao CRM) roda na sua PRÓPRIA conexão/tx — o advisory lock
- * do nosso client serializa os concorrentes enquanto ele acontece.
- * ponytail: o lock fica retido durante o POST ao CRM (bounded por CRM_MCP_TIMEOUT_MS)
- * — aceitável no volume do MVP (throttle já espaça o número); se um número virar
- * gargalo, o upgrade é reservar o slot antes do POST e reconciliar no watchdog.
+ * espera o lock, relê o estado JÁ com a saída do primeiro contabilizada e veta.
+ * Desde a F4p do cxj (12/11/2026), o registro da saída (a linha no limite diário e a
+ * cópia) é confirmado ANTES do POST ao CRM, e o `channel.send` roda depois do commit, sem
+ * transação e sem a conexão da cadeia: é o upgrade que este cabeçalho previa (reservar o
+ * slot antes do POST). A linha de uma saída que certamente não aconteceu é apagada pelo id;
+ * a de uma saída incerta fica (a mais, nunca a menos). O resgate da fila do watchdog
+ * (`redriveQueued`) reserva a vaga do mesmo jeito antes de mandar.
  */
 import type pg from 'pg';
-import type { ChannelSendResult } from '../channel-adapter';
+import {
+  erroSaiuEmParte,
+  saiuAlgo,
+  type ChannelSendResult,
+  type MarcaDeSaidaParcial,
+} from '../channel-adapter';
 
 import type { Logger } from '../obs/logger';
 import { emitVetoActivity } from '@/lib/leads/veto-activity';
@@ -53,7 +59,16 @@ import type { Queryable } from '../queue/queue';
 import { decidePacing } from '../pacing/engine';
 import type { PacingState } from '../pacing/engine';
 import type { PacingKnobs } from '../pacing/defaults';
-import { loadChannelKnobs, loadPacingState, recordSend } from '../pacing/store';
+import { lerUltimaSaida, loadChannelKnobs, loadPacingState, recordSend } from '../pacing/store';
+import {
+  ATRASO_MAXIMO_DA_SAIDA_DO_AGENTE_MS,
+  MOTIVO_DA_SAIDA_VENCIDA,
+  SaidaDoAgenteVencidaError,
+  comSaidaDoAgente,
+  conferirSaidaDoAgente,
+  novaSaidaDoAgente,
+} from '../pacing/saida-do-agente';
+import { haRespostaRetidaAntes } from '../pacing/resposta-retida';
 import { decideSpinning } from '../spinning/engine';
 import type { RecentCopy } from '../spinning/engine';
 import { loadRecentCopies, loadSpinningKnobs, recordCopy } from '../spinning/store';
@@ -90,6 +105,7 @@ import { renderVetoDeAfirmacao, type ConferenciaDeFato } from './factual-claim';
 // segundo caminho de envio que não passa pelo gate de elegibilidade, e é ele que
 // barra o texto FIXO do worker e o modelo aprovado.
 import { sqlContatoInterno } from '@/lib/contacts/tags-internas';
+import { OrgNaoOperanteError } from '@/lib/organizacao/operante';
 import { avaliarHorarios, type HorariosDaAgenda } from './horario-da-agenda';
 import { concessoesSemLastro, renderVetoDeConcessaoSemLastro, type LastroComercial } from './lastro-comercial';
 
@@ -166,6 +182,11 @@ export interface GateContext {
      * só distingue resposta de retomada por follow-up.
      */
     resposta?: boolean;
+    /**
+     * O relógio lido sob a trava do número, de onde a espera do intervalo é contada (versão 17, F4v do cxj, V02): ver
+     * `PacingInput.agoraDoIntervalo`. Omitir = `now`.
+     */
+    agora?: Date;
   };
   spinning: {
     knobs: SpinningKnobs;
@@ -1180,6 +1201,7 @@ export const pacingGate: Gate = {
       banRisk,
       resposta: ctx.pacing.resposta,
       rng: ctx.pacing.rng,
+      ...(ctx.pacing.agora !== undefined ? { agoraDoIntervalo: ctx.pacing.agora } : {}),
     });
     if (!decision.allow) {
       return {
@@ -1438,9 +1460,9 @@ export interface RunBeforeSendArgs {
    */
   agentId?: string | null;
   /**
-   * channel_sessions.daily_message_limit do CRM (fonte única do cap absoluto). null =
-   * ainda não lido do CRM no runtime → os degraus de warm-up (conservadores) seguram
-   * o cap. Ponto de injeção: quando o drain expuser o limite da sessão, passar aqui.
+   * channel_sessions.daily_message_limit do CRM (fonte única do cap absoluto). null = o
+   * chamador não o traz, e a cadeia o lê do número, sob a trava (F4o do cxj, O07); antes,
+   * null deixava só os degraus de warm-up segurarem o cap.
    */
   crmDailyLimit: number | null;
   /**
@@ -1450,6 +1472,26 @@ export interface RunBeforeSendArgs {
    */
   resposta?: boolean;
   now: Date;
+  /**
+   * O relógio da saída (versão 16, F4u do cxj, U02): lido SOB a trava, depois da espera do intervalo, dá a hora
+   * gravada no registro da saída (`pacing_ledger`), que é a hora a partir da qual o próximo envio do número mede o
+   * intervalo. `now` é lido pelo chamador antes da pausa humana, da classificação, da espera pela trava e da espera
+   * do intervalo: gravado, ele deixava o registro segundos antes da saída de verdade, e o envio seguinte do número
+   * (o resgate, a campanha, outra resposta) saía a menos do intervalo desta. O registro leva o maior entre o relógio e
+   * `now` mais a espera do intervalo; sem o relógio, `now` mais a espera. A janela e o teto seguem contados de `now`.
+   *
+   * Versão 17 (F4v do cxj). V02: a espera do intervalo conta do relógio lido sob a trava, e não mais de `now`: lido
+   * antes da fila da trava, `now` cobrava de novo o tempo que o envio já tinha esperado. Com a última linha do número
+   * no futuro (uma saída ainda em curso), a espera vai em fatias e relê a linha (`esperarOIntervalo`). V01: com o
+   * relógio, e com intervalo no número, o registro guarda a hora mais tardia da saída, e a idade dela é conferida
+   * antes do transporte (`pacing/saida-do-agente.ts`). Sem o relógio não há como medir a idade nem acompanhar a linha:
+   * o registro fica sem a folga, e a espera é uma só, como antes.
+   *
+   * Versão 18 (F4w do cxj). W12: a espera em fatias conta também o tempo das releituras, pelo relógio. W02: a saída
+   * leva ao handler a ordem, e o texto do agente não sai na frente de uma resposta retida e mais antiga da conversa
+   * (`pacing/resposta-retida.ts`).
+   */
+  relogio?: () => Date;
   /** injeções de teste (jitter determinístico + espera sem relógio real). */
   rng?: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -1550,9 +1592,11 @@ export interface RunBeforeSendArgs {
   /**
    * Enviado SÓ se TODOS os gates passarem — ChannelAdapter (própria tx/idempotência). Recebe o
    * corpo FINAL (o disclosureGate F4-05 pode emendá-lo via `amendBody`): quem monta o send DEVE
-   * enviar este `body`, não o corpo original capturado antes da cadeia.
+   * enviar este `body`, não o corpo original capturado antes da cadeia. O envio composto (bolhas,
+   * fotos) devolve o desfecho da última mensagem física, com `saiuEmParte` quando uma anterior
+   * saiu e ela não (F4q): a cadeia o trata como saída e mantém o registro no limite do número.
    */
-  send: (body: string) => Promise<ChannelSendResult>;
+  send: (body: string) => Promise<ChannelSendResult & MarcaDeSaidaParcial>;
 }
 
 /** Pure chain shared by real delivery and preview; no locks, writes or transport. */
@@ -1650,18 +1694,21 @@ const realSleep = (ms: number): Promise<void> => new Promise((resolve) => setTim
 /**
  * Roda a cadeia before_send para UMA tentativa de envio. Curto-circuita no 1º veto
  * (o resto da cadeia é registrado como 'skipped'); só chama `send()` se todos passam.
- * Serializa o read-then-act por número via advisory xact lock (ver cabeçalho).
+ * Serializa a decisão por número via advisory xact lock (ver cabeçalho): as leituras, os
+ * gates, o throttle e o registro da saída no limite do número, confirmado antes do `send()`
+ * (F4p do cxj). O `send()` roda depois, sem transação e sem a conexão da cadeia.
  *
  * A pausa humana do turno é paga AQUI, ANTES de qualquer contato com o banco (#654).
  * Antes ela era paga dentro do `send` (via `antesDaPrimeira` do `sendInBubbles`), e o
- * `send` só é chamado com o `pg_advisory_xact_lock` do NÚMERO na mão: cada turno
+ * `send` era chamado com o `pg_advisory_xact_lock` do NÚMERO na mão: cada turno
  * segurava a fila do número por 1,2s–7,5s além do necessário (+0–2s do throttle
  * anti-ban, que dorme no mesmo ponto), e o efeito é o de fora — dois atendentes no
  * MESMO WhatsApp entram em fila, e a fila ficou mais longa.
  *
  * O que NÃO muda de ordem: a cadeia continua julgando (e o estado sob o lock sendo
- * lido) exatamente quando julgava, o `send` continua acontecendo sob o lock, uma vez
- * por re-run, e o `finalBody` pós-disclosure continua sendo o que vai ao canal. A
+ * lido) exatamente quando julgava, o `send` continua acontecendo uma vez por re-run,
+ * depois do registro confirmado (desde a F4p do cxj, fora do lock), e o `finalBody`
+ * pós-disclosure continua sendo o que vai ao canal. A
  * espera é uma das três coisas que saem da janela da transação; as outras duas são o
  * classificador semântico de promessa (F4-02) e a conferência de fato (#2231), que
  * rodam antes de tomar conexão — ver o porquê no ponto da chamada.
@@ -1740,11 +1787,17 @@ export async function runBeforeSend(args: RunBeforeSendArgs): Promise<BeforeSend
   // rollbackado de novo depois disso (um `rollback` tardio só geraria WARNING no pg e
   // esconderia o erro real). O finally continua lendo `erroNaTransacao`.
   let transacaoFechada = false;
-  // #2426: trace capturado assim que a cadeia evalua, para a auditoria DURÁVEL ser gravada
-  // FORA da janela da transação (commit no caminho enviado, rollback no veto/erro) — nunca
-  // enquanto a tx aberta segura o `contacts` (readStopFlags). `undefined` = a cadeia ainda
-  // não avaliou (falha numa leitura sob o lock) → nada a persistir.
+  // #2426 e F4p do cxj (P05): trace capturado assim que a cadeia avalia, para a auditoria DURÁVEL
+  // ser gravada depois de a conexão voltar ao pool — nunca enquanto a tx aberta segura o
+  // `contacts` (readStopFlags), nem com a conexão da cadeia na mão (num pool de uma conexão, a
+  // auditoria esperava a que a própria cadeia segurava). `undefined` = a cadeia ainda não
+  // avaliou (falha numa leitura sob o lock) → nada a persistir.
   let traceDaAuditoria: GateTraceEntry[] | undefined;
+  // O veto já decidido, para a auditoria levá-lo mesmo se o rollback do veto falhar.
+  let vetoDaCadeia: VetoDaCadeia | null = null;
+  // O que a cadeia decidiu sob a trava. O transporte e as gravações pelo pool vêm DEPOIS de a
+  // conexão voltar ao pool (F4p do cxj, P05), lidos daqui.
+  let decisao: DecisaoSobATrava;
   try {
     await client.query('begin');
     // Serialização por número: dois workers no MESMO channel_session esperam a vez.
@@ -1797,6 +1850,13 @@ export async function runBeforeSend(args: RunBeforeSendArgs): Promise<BeforeSend
       args.channelSessionId,
       args.log,
     );
+    // F4o do cxj, O07: o teto do CRM do número vale também para o agente. O turno de entrada,
+    // o follow-up, o aviso de escalação e a prévia passam `null` (o limite do CRM não chegava
+    // ao runtime), e o disparo do agente só esbarrava no aquecimento — num chip de 19 dias, 200
+    // por dia contra os 60 do CRM que a campanha respeita. Sem o teto do chamador, a cadeia o
+    // lê do número, sob a trava; com ele, vale o dele.
+    const crmDailyLimit =
+      args.crmDailyLimit ?? (await loadCrmDailyLimit(client, args.tenantId, args.channelSessionId));
     const pacingState = await loadPacingState(client, args.tenantId, args.channelSessionId, {
       now: args.now,
       timezone: pacingCfg.knobs.timezone,
@@ -1833,6 +1893,9 @@ export async function runBeforeSend(args: RunBeforeSendArgs): Promise<BeforeSend
       args.channelSessionId,
     );
 
+    // O relógio sob a trava, lido depois de todo o estado (versão 17, F4v do cxj, V02): a espera do intervalo conta
+    // dele. O `now` do chamador é de antes da fila da trava.
+    const agoraSobATrava = args.relogio ? args.relogio() : args.now;
     const ctx: GateContext = {
       now: args.now,
       body: bodyDoModelo,
@@ -1845,9 +1908,10 @@ export async function runBeforeSend(args: RunBeforeSendArgs): Promise<BeforeSend
       pacing: {
         knobs: pacingCfg.knobs,
         state: pacingState,
-        crmDailyLimit: args.crmDailyLimit,
+        crmDailyLimit,
         rng: args.rng,
         ...(args.resposta !== undefined ? { resposta: args.resposta } : {}),
+        agora: agoraSobATrava,
       },
       spinning: { knobs: spinningKnobs, window },
       ...(args.enforceSpinning === false ? { spinningEnforced: false as const } : {}),
@@ -1896,105 +1960,386 @@ export async function runBeforeSend(args: RunBeforeSendArgs): Promise<BeforeSend
     // insert esperava o DDL, o DDL esperava a tx (ACCESS SHARE) e a tx esperava o insert.
     // Mesmo ciclo medido no #2363 (8m47s idle in transaction); a aresta que o #2121 não
     // encerrou, porque uma das bordas mora no Node e o Postgres não a detecta. Autônomas no
-    // pool, sobrevivem ao rollback por natureza — gravá-las DEPOIS do commit/rollback as tira
-    // da janela sem mudar o desfecho.
+    // pool, sobrevivem ao rollback por natureza — gravá-las depois de a conexão voltar ao pool
+    // as tira da janela sem mudar o desfecho.
     //
-    // O envio (`args.send`) continua DENTRO da tx, sob o advisory lock do número: tirá-lo
-    // derrubaria a serialização anti-ban (a vez por número e a gravação do pacing no mesmo
-    // commit). Fechar essa outra aresta (o `send_ledger` e a `messages`, gravados noutra
-    // conexão/Supabase dentro do handler) exige o advisory lock de SESSÃO proposto no #2426 —
-    // redesign que precisa de prova com 2 conexões (job `invariants`), fora desta fatia.
+    // O envio (`args.send`) saiu da transação na F4p do cxj (12/11/2026). Ele grava `send_ledger`
+    // e `messages` (FK `contacts`) noutra conexão, e com esta tx aberta fechava a outra aresta do
+    // mesmo ciclo; e um commit recusado DEPOIS da saída deixava a contagem do número para uma
+    // recuperação que a reserva da campanha atravessava (P01, P02). Agora a vez do número (a
+    // trava) cobre a DECISÃO: as leituras, os gates, a espera do throttle e o registro da saída,
+    // confirmado neste commit. O transporte vem depois, sem transação e sem conexão: quem pega a
+    // trava em seguida já lê esta saída no limite e mede o intervalo a partir dela.
 
     if (veto !== null) {
+      vetoDaCadeia = veto;
       // Nada foi escrito na tx: rollback fecha a transação e solta o lock. O envio NÃO acontece.
       await client.query('rollback');
       transacaoFechada = true;
-      // Auditoria DURÁVEL por run (F4-08 acc 3): escrita autônoma no pool — o trace do VETO
-      // tem de sobreviver ao rollback ACIMA. Nunca bloqueia o message-plane: falha aqui vira
-      // log.error (o trace do logger já é o backup), não exceção.
-      const traceId = await persistTrace(args, trace, veto);
-      // Wave 3 (CORE 2), cenário 11: o agente decidir NÃO falar é evento. Silêncio com motivo
-      // é informação; silêncio sem registro é abandono. Só o VETO entra na timeline.
-      if (traceId) {
-        try {
-          const r = await emitVetoActivity({
-            pool: args.pool,
-            organizationId: args.tenantId,
-            contactId: args.leadId,
-            traceId,
-            gate: veto.gate,
-            code: veto.code,
-            agentId: args.agentId ?? null,
-          });
-          if (!r.routed) {
-            args.log.info('veto sem negócio para pendurar: registrado no event_log', {
-              channel_session_id: args.channelSessionId,
-              reason: r.reason,
-            });
-          }
-        } catch (err) {
-          // A timeline do veto não pode derrubar o veto.
-          args.log.error('falha ao registrar atividade de veto (segue)', {
-            channel_session_id: args.channelSessionId,
-            error: err instanceof Error ? err.name : 'unknown',
-          });
-        }
-      }
-      // Veto de LGPD (F4-09): escala à inbox do runtime (regra dura nº 13) para o DPO/comercial
-      // regularizar. Escrita autônoma no pool, como o trace — sobrevive ao rollback e nunca
-      // derruba o message-plane (o gate já barrou o envio).
-      if (veto.code.startsWith('lgpd_')) {
-        await escalateLgpdVeto(
-          args.pool,
-          { tenantId: args.tenantId, leadId: args.leadId, code: veto.code },
-          args.log,
-        );
-      }
-      return { status: 'vetoed', trace, ...veto };
-    }
+      decisao = { tipo: 'veto', trace, veto };
+    } else {
+      // Throttle: espera o gap restante (bounded pelos knobs) antes do envio. Com a última linha do número no futuro
+      // (uma saída ainda em curso), a espera acompanha a linha (`esperarOIntervalo`).
+      const esperado = await esperarOIntervalo(args, client, throttleWaitMs, pacingState.lastSentAt, agoraSobATrava);
 
-    // Throttle: espera o gap restante (bounded pelos knobs) antes do envio.
-    if (throttleWaitMs > 0) await (args.sleep ?? realSleep)(throttleWaitMs);
+      // ctx.body é o corpo FINAL (emendado pelo disclosureGate F4-05 quando aplicável).
+      if (args.approvedReply && ctx.body !== args.body)
+        throw new Error('reply_body_changed_reapproval_required');
 
-    // ctx.body é o corpo FINAL (emendado pelo disclosureGate F4-05 quando aplicável).
-    if (args.approvedReply && ctx.body !== args.body)
-      throw new Error('reply_body_changed_reapproval_required');
-    const outcome = await args.send(ctx.body);
-
-    // Registra pacing + copy SÓ no envio físico fresco ('sent'). 'already_sent'/'queued'
-    // já foram (ou serão) contabilizados na tentativa original — o ledger F2-06 faz as
-    // repetições curto-circuitarem, então re-registrar aqui inflaria o cap.
-    if (outcome.kind === 'sent') {
-      await recordSend(client, args.tenantId, args.channelSessionId, args.now, {
-        resposta: tipoDeEnvio(args.resposta) === 'resposta',
-      });
+      // ═══ A SAÍDA ESTÁ NO LIMITE DO NÚMERO, CONFIRMADA, ANTES DO TRANSPORTE (F4o e F4p do cxj) ═══
+      //
+      // O pacing e a cópia eram gravados DEPOIS do transporte (até a versão 9): se a gravação ou o
+      // commit falhassem com a mensagem já fora, o rollback apagava o registro, e a reserva seguinte
+      // da campanha (`reservarVaga`, sob esta mesma trava) liberava o 61º disparo do dia, ou passava
+      // por cima do intervalo depois de uma resposta (O06). Gravados antes mas confirmados só depois
+      // do transporte (versão 10), um commit recusado deixava a saída para uma gravação de fora que
+      // a reserva já na fila da trava atravessava (P01) e que, recusada, virava só log (P02).
+      //
+      // Agora a linha do limite diário e a cópia são confirmadas aqui, sob a trava: recusado o
+      // registro ou o commit, nada sai. Quem pega a trava depois já as lê. Só um desfecho que prova
+      // que nada saiu as apaga, pelo id (`apagarRegistroDaSaida`).
+      //
+      // O registro leva a hora da saída, depois da espera (versão 16, F4u do cxj, U02): o próximo envio do número, de
+      // qualquer emissor, mede o intervalo a partir dela. Com `args.now`, de antes da pausa humana e da espera, a linha
+      // ficava segundos antes da saída de verdade.
+      //
+      // Versão 17 (F4v do cxj). V02: a espera foi contada do relógio lido sob a trava, e o instante é o maior entre o
+      // relógio de agora e aquele mais o que se esperou. V01: o transporte vem depois do commit, e leva segundos; com
+      // intervalo no número, a linha guarda a hora mais tardia em que a mensagem chega ao provedor (o instante mais a
+      // folga), a idade é conferida antes do transporte, e a linha vai para a hora em que ele voltou quando confirma
+      // (`enviarComORegistroConfirmado`). Quem pega a trava com o transporte em curso mede o intervalo da hora mais
+      // tardia.
+      const instanteDaSaida = new Date(
+        Math.max(args.relogio ? args.relogio().getTime() : -Infinity, agoraSobATrava.getTime() + esperado),
+      );
+      const folgaDaSaida =
+        args.relogio && capabilitiesOf(provider).banRisk && pacingCfg.knobs.throttleMs > 0
+          ? ATRASO_MAXIMO_DA_SAIDA_DO_AGENTE_MS
+          : 0;
+      const linha = await recordSend(
+        client,
+        args.tenantId,
+        args.channelSessionId,
+        new Date(instanteDaSaida.getTime() + folgaDaSaida),
+        { resposta: tipoDeEnvio(args.resposta) === 'resposta' },
+      );
       // Simetria com o gate desarmado: quem não é julgado pela janela não entra
       // nela. Ver `GateContext.spinningEnforced`.
-      if (args.enforceSpinning !== false) {
-        await recordCopy(client, args.tenantId, args.channelSessionId, ctx.body, args.now);
-      }
+      const copia =
+        args.enforceSpinning !== false
+          ? await recordCopy(client, args.tenantId, args.channelSessionId, ctx.body, args.now)
+          : null;
+      await client.query('commit');
+      transacaoFechada = true;
+      decisao = {
+        tipo: 'envio',
+        trace,
+        corpo: ctx.body,
+        registro: { linha, copia, instante: instanteDaSaida, folgaMs: folgaDaSaida },
+      };
     }
-    await client.query('commit');
-    transacaoFechada = true;
-    // Auditoria DURÁVEL por run (F4-08 acc 3): gravada DEPOIS do commit — antes, o insert em
-    // `before_send_traces` (FK `contacts`) saía pelo pool enquanto a tx aberta segurava o
-    // `contacts` e podia enfileirar atrás de um DDL (#2426). Autônoma no pool; falha vira
-    // log.error (o logger é o backup).
-    await persistTrace(args, trace, null);
-    return { status: 'sent', outcome, trace };
   } catch (err) {
     erroNaTransacao = err instanceof Error ? err : new Error(String(err));
+    let erroQueSobe: unknown = err;
     // Uma tx já fechada (commit/rollback explícito acima) não pode ser rollback de novo.
     if (!transacaoFechada) {
-      await rollback(client, err);
-      // Auditoria da tentativa que ERROU (ex.: envio com o transporte fora): o rollback desfaz
-      // a tx, mas a linha de auditoria é autônoma no pool e sobrevive — gravada AQUI, fora da
-      // janela, para não reabrir o ciclo do #2426. O veto já gravou o seu no ramo dele.
-      if (traceDaAuditoria !== undefined) await persistTrace(args, traceDaAuditoria, null);
+      try {
+        await rollback(client, err);
+      } catch (erroDoRollback) {
+        erroQueSobe = erroDoRollback;
+      }
     }
-    throw err;
+    decisao = { tipo: 'erro', erro: erroQueSobe, trace: traceDaAuditoria, veto: vetoDaCadeia };
   } finally {
     client.release(erroNaTransacao);
+  }
+
+  // Daqui para baixo a cadeia não segura conexão nenhuma (F4p do cxj, P05): a auditoria, o
+  // transporte e o apagar do registro pegam a deles no pool.
+  if (decisao.tipo === 'erro') {
+    // Auditoria da tentativa que ERROU sob a trava (registro ou commit recusado, leitura que
+    // falhou): o rollback desfez a tx, mas a linha de auditoria é autônoma no pool e sobrevive.
+    if (decisao.trace !== undefined) await persistTrace(args, decisao.trace, decisao.veto);
+    throw decisao.erro;
+  }
+  if (decisao.tipo === 'veto') return registrarVeto(args, decisao.trace, decisao.veto);
+  return enviarComORegistroConfirmado(args, decisao);
+}
+
+/** A fatia da espera do intervalo enquanto a última linha do número está no futuro (`esperarOIntervalo`). */
+const PASSO_DA_ESPERA_DO_INTERVALO_MS = 500;
+
+/**
+ * A espera do intervalo, sob a trava do número; devolve quanto esperou (versão 17, F4v do cxj, V02).
+ *
+ * A última linha do número no passado não muda mais: a espera é uma só, como sempre. No futuro, ela é a hora mais
+ * tardia de uma saída ainda em curso (a vaga da campanha ou do resgate, ou o registro de outra resposta do agente), e
+ * muda sem a trava: vai para a hora em que o transporte voltou, ou some, se nada saiu. Esperar a hora mais tardia
+ * inteira cobrava de cada resposta em fila a folga de uma saída que já tinha acontecido. Por isso, com o relógio, a
+ * espera vai em fatias, e depois de cada uma a linha é relida, nesta conexão: o intervalo conta da última linha
+ * lida, para menos ou para mais, e a espera só termina quando a leitura diz que ele passou.
+ *
+ * O tempo que passou é o maior entre a soma das fatias e o relógio (versão 18, F4w do cxj, W12). A soma das fatias é
+ * o piso: a espera termina mesmo que o relógio não ande, ou recue. O relógio conta o que a soma não vê, o tempo de
+ * cada releitura: só com a soma, releituras de 1 s levavam a 34,2 s uma espera de 11,2 s. Quem chama recebe o tempo
+ * que passou, e grava o registro nele: a linha nunca fica a menos do intervalo da última linha lida, mesmo que o
+ * relógio recue logo depois. Sem o relógio, a espera é uma só, como antes.
+ */
+async function esperarOIntervalo(
+  args: RunBeforeSendArgs,
+  client: pg.PoolClient,
+  espera: number,
+  ultimaSaida: Date | null,
+  agora: Date,
+): Promise<number> {
+  if (espera <= 0) return 0;
+  const sleep = args.sleep ?? realSleep;
+  if (!args.relogio || ultimaSaida === null || ultimaSaida.getTime() <= agora.getTime()) {
+    await sleep(espera);
+    return espera;
+  }
+  // O intervalo desta decisão, com o jitter dela: a espera era ele menos o tempo desde a última linha.
+  const intervalo = espera + agora.getTime() - ultimaSaida.getTime();
+  let esperado = 0;
+  let passou = 0;
+  let falta = espera;
+  while (falta > 0) {
+    const fatia = Math.min(falta, PASSO_DA_ESPERA_DO_INTERVALO_MS);
+    await sleep(fatia);
+    esperado += fatia;
+    const ultima = await lerUltimaSaida(client, args.tenantId, args.channelSessionId);
+    passou = Math.max(esperado, args.relogio().getTime() - agora.getTime());
+    falta = ultima === null ? 0 : Math.max(0, ultima.getTime() + intervalo - (agora.getTime() + passou));
+  }
+  return passou;
+}
+
+/** O veto que a cadeia devolve (`evaluateBeforeSend`). */
+type VetoDaCadeia = NonNullable<ReturnType<typeof evaluateBeforeSend>['veto']>;
+
+/** O registro da saída no limite do número, confirmado antes do transporte (F4p do cxj). */
+interface RegistroDaSaida {
+  /** O id da linha em `pacing_ledger`. */
+  linha: string | null;
+  /** O id da cópia em `outbound_copies`; `null` sem a janela de cópias. */
+  copia: string | null;
+  /** O instante da saída, lido sob a trava, depois da espera do intervalo (versão 16). */
+  instante: Date;
+  /**
+   * A folga da saída (versão 17, F4v do cxj, V01): a linha é gravada em `instante + folgaMs`, a hora mais tardia em
+   * que a mensagem chega ao provedor, e vai para a hora em que o transporte voltou quando ele confirma. `0` = sem folga
+   * (número sem intervalo, canal sem risco de banimento, ou cadeia sem o relógio): a linha fica no instante.
+   */
+  folgaMs: number;
+}
+
+/** O que a cadeia decidiu sob a trava do número, lido depois de a conexão voltar ao pool. */
+type DecisaoSobATrava =
+  | { tipo: 'veto'; trace: GateTraceEntry[]; veto: VetoDaCadeia }
+  | { tipo: 'envio'; trace: GateTraceEntry[]; corpo: string; registro: RegistroDaSaida }
+  | { tipo: 'erro'; erro: unknown; trace: GateTraceEntry[] | undefined; veto: VetoDaCadeia | null };
+
+/**
+ * O veto já fechou a transação e devolveu a conexão: as escritas duráveis vêm agora, autônomas
+ * no pool. Nunca bloqueiam o message-plane: falha vira `log.error`, não exceção.
+ */
+async function registrarVeto(
+  args: RunBeforeSendArgs,
+  trace: GateTraceEntry[],
+  veto: VetoDaCadeia,
+): Promise<BeforeSendResult> {
+  // Auditoria DURÁVEL por run (F4-08 acc 3): o trace do VETO tem de sobreviver ao rollback.
+  // O trace do logger já é o backup.
+  const traceId = await persistTrace(args, trace, veto);
+  // Wave 3 (CORE 2), cenário 11: o agente decidir NÃO falar é evento. Silêncio com motivo
+  // é informação; silêncio sem registro é abandono. Só o VETO entra na timeline.
+  if (traceId) {
+    try {
+      const r = await emitVetoActivity({
+        pool: args.pool,
+        organizationId: args.tenantId,
+        contactId: args.leadId,
+        traceId,
+        gate: veto.gate,
+        code: veto.code,
+        agentId: args.agentId ?? null,
+      });
+      if (!r.routed) {
+        args.log.info('veto sem negócio para pendurar: registrado no event_log', {
+          channel_session_id: args.channelSessionId,
+          reason: r.reason,
+        });
+      }
+    } catch (err) {
+      // A timeline do veto não pode derrubar o veto.
+      args.log.error('falha ao registrar atividade de veto (segue)', {
+        channel_session_id: args.channelSessionId,
+        error: err instanceof Error ? err.name : 'unknown',
+      });
+    }
+  }
+  // Veto de LGPD (F4-09): escala à inbox do runtime (regra dura nº 13) para o DPO/comercial
+  // regularizar. Escrita autônoma no pool, como o trace — nunca derruba o message-plane (o gate
+  // já barrou o envio).
+  if (veto.code.startsWith('lgpd_')) {
+    await escalateLgpdVeto(
+      args.pool,
+      { tenantId: args.tenantId, leadId: args.leadId, code: veto.code },
+      args.log,
+    );
+  }
+  return { status: 'vetoed', trace, ...veto };
+}
+
+/**
+ * O transporte, com a saída já confirmada no limite do número e a conexão da cadeia de volta ao
+ * pool (F4p do cxj). Quem pega a trava do número enquanto o transporte trabalha já lê esta saída.
+ */
+async function enviarComORegistroConfirmado(
+  args: RunBeforeSendArgs,
+  decisao: { trace: GateTraceEntry[]; corpo: string; registro: RegistroDaSaida },
+): Promise<BeforeSendResult> {
+  // A saída do agente (versão 17, F4v do cxj, V01): com a folga, o transporte roda com ela no escopo, e a idade é
+  // conferida aqui, logo antes dele (o INSERT, o commit e a devolução da conexão já passaram), e de novo no último
+  // passo do handler, sem espera nenhuma entre a conta e o provedor.
+  //
+  // E a ordem (versão 18, F4w do cxj, W02): a mensagem que vence no último passo do handler fica na fila, e o turno
+  // segue. A saída leva ao handler se este envio responde a quem escreveu, e a pergunta “há, nesta conversa, uma
+  // resposta do agente retida e mais antiga do que esta mensagem?”, lida no banco: havendo, o texto não sai na frente
+  // dela (`lib/agent-engine/pacing/resposta-retida.ts`). Na versão 19 (F4x do cxj, X01 e X08), o handler também lê
+  // daqui se a mensagem de texto nasce com a marca de resposta: é a resposta ainda na fila que segura as seguintes.
+  const saida =
+    decisao.registro.folgaMs > 0 && args.relogio
+      ? novaSaidaDoAgente(decisao.registro.instante, decisao.registro.folgaMs, args.relogio, {
+          resposta: tipoDeEnvio(args.resposta) === 'resposta',
+          haRespostaRetidaAntes: (mensagem) => haRespostaRetidaAntes(args.pool, args.tenantId, mensagem),
+        })
+      : null;
+  if (saida) {
+    try {
+      conferirSaidaDoAgente(saida);
+    } catch (erroDaIdade) {
+      if (!(erroDaIdade instanceof SaidaDoAgenteVencidaError)) throw erroDaIdade;
+      // Nada saiu, e nenhuma mensagem nasceu: o registro volta, e o desfecho é o do transporte indisponível. O job
+      // tenta de novo pela fila, com a mesma chave, e passa por esta cadeia com um registro novo.
+      args.log.warn('saída do agente mais velha do que a folga antes do transporte: não enviada, o job tenta de novo', {
+        organization_id: args.tenantId,
+        channel_session_id: args.channelSessionId,
+        idade_ms: erroDaIdade.idadeMs,
+        folga_ms: saida.folgaMs,
+      });
+      await apagarRegistroDaSaida(args, decisao.registro, MOTIVO_DA_SAIDA_VENCIDA);
+      await persistTrace(args, decisao.trace, null);
+      return {
+        status: 'sent',
+        outcome: { kind: 'unavailable', reason: MOTIVO_DA_SAIDA_VENCIDA },
+        trace: decisao.trace,
+      };
+    }
+  }
+  let outcome: ChannelSendResult & MarcaDeSaidaParcial;
+  try {
+    outcome = saida
+      ? await comSaidaDoAgente(saida, () => args.send(decisao.corpo))
+      : await args.send(decisao.corpo);
+  } catch (erroDoEnvio) {
+    // Organização parada: o handler barra na primeira linha (`assertOrgOperante`), antes de
+    // gravar a mensagem e de chamar o canal — nada saiu NESTA mensagem física. No envio composto
+    // (bolhas, fotos), uma anterior pode ter saído (a organização parou entre uma e outra): o erro
+    // chega marcado (`erroSaiuEmParte`), e o registro fica (F4q do cxj, Q01). Outro erro deixa a
+    // saída incerta (o provedor pode ter aceitado antes do erro, como no `store.update` do
+    // `sendWithLedger`), e o registro fica: a mais, nunca a menos.
+    if (erroDoEnvio instanceof OrgNaoOperanteError && !erroSaiuEmParte(erroDoEnvio))
+      await apagarRegistroDaSaida(args, decisao.registro, 'org_nao_operante');
+    // Auditoria da tentativa que ERROU (ex.: envio com o transporte fora): autônoma no pool.
+    await persistTrace(args, decisao.trace, null);
+    throw erroDoEnvio;
+  }
+  // Só 'sent' saiu agora — ou, no envio composto (bolhas, fotos), uma mensagem física anterior à
+  // última (`saiuEmParte`, F4q). 'already_sent' foi contado na tentativa original (o ledger F2-06
+  // curto-circuita a repetição); 'queued', 'failed', 'blocked' e 'unavailable' não saíram, e quem
+  // os manda depois conta a própria saída: a mensagem 'queued' fica na fila física, e o resgate
+  // (`redriveQueued`) reserva a vaga antes de mandá-la — como resposta, quando o job que a mandou
+  // responde a quem escreveu (F4q do cxj, Q08); a nova tentativa de um job passa por esta cadeia.
+  if (!saiuAlgo(outcome)) await apagarRegistroDaSaida(args, decisao.registro, outcome.kind);
+  // O transporte confirmou: a linha sai da hora mais tardia e vai para a hora em que ele voltou (versão 17). Antes da
+  // auditoria: quem pega a trava em seguida já lê a hora em que a mensagem saiu.
+  else if (saida) await ajustarRegistroDaSaida(args, decisao.registro, saida.relogio());
+  // Auditoria DURÁVEL por run (F4-08 acc 3), gravada sem a conexão da cadeia na mão (#2426, P05).
+  // Autônoma no pool; falha vira log.error (o logger é o backup).
+  await persistTrace(args, decisao.trace, null);
+  return { status: 'sent', outcome, trace: decisao.trace };
+}
+
+/**
+ * Leva a linha da saída da hora mais tardia (`instante + folgaMs`) para a hora em que o transporte voltou (versão 17,
+ * F4v do cxj, V01). Essa hora é lida depois de o transporte devolver que a mensagem saiu: nunca fica antes da saída de
+ * verdade, por onde quer que o transporte tenha passado. Quase sempre a linha recua (o transporte volta dentro da
+ * folga), e a resposta seguinte não paga a folga de uma saída que já aconteceu. Se a chamada ao provedor passou da hora
+ * mais tardia, a linha avança até a hora em que ela voltou: quem mede depois mede da saída de verdade. Nunca para antes
+ * do instante do registro.
+ *
+ * Nunca lança: a mensagem já saiu. Se o banco recusar, a linha fica na hora mais tardia, e o log leva o número e as
+ * duas horas.
+ */
+async function ajustarRegistroDaSaida(args: RunBeforeSendArgs, registro: RegistroDaSaida, voltouEm: Date): Promise<void> {
+  const saiuEm = new Date(Math.max(voltouEm.getTime(), registro.instante.getTime()));
+  try {
+    await args.pool.query(
+      `update pacing_ledger set sent_at = $4
+        where organization_id = $1 and channel_session_id = $2 and id = $3`,
+      [args.tenantId, args.channelSessionId, registro.linha, saiuEm],
+    );
+  } catch (err) {
+    args.log.error(
+      'a linha da saída ficou na hora mais tardia: a hora em que o transporte voltou não foi gravada',
+      {
+        organization_id: args.tenantId,
+        channel_session_id: args.channelSessionId,
+        sent_at: new Date(registro.instante.getTime() + registro.folgaMs).toISOString(),
+        voltou_em: saiuEm.toISOString(),
+        error: err instanceof Error ? err.name : 'unknown',
+      },
+    );
+  }
+}
+
+/**
+ * Apaga, num comando só, a linha do limite diário e a cópia de uma tentativa que certamente não
+ * saiu — pelo id, e não pelo instante: a linha de resposta (que `undoSend` não alcança) também
+ * volta, e nunca a de outra saída do mesmo instante.
+ *
+ * Nunca lança: o desfecho do transporte já é a resposta da cadeia. Se o banco recusar, a saída que
+ * não aconteceu segue contada (uma a mais, o lado seguro), e o log leva o número, o instante e o
+ * desfecho para a reconciliação.
+ */
+async function apagarRegistroDaSaida(
+  args: RunBeforeSendArgs,
+  registro: RegistroDaSaida,
+  desfecho: string,
+): Promise<void> {
+  try {
+    await args.pool.query(
+      `with linha as (
+         delete from pacing_ledger
+          where organization_id = $1 and channel_session_id = $2 and id = $3
+       )
+       delete from outbound_copies
+        where organization_id = $1 and channel_session_id = $2 and id = $4`,
+      [args.tenantId, args.channelSessionId, registro.linha, registro.copia],
+    );
+  } catch (err) {
+    args.log.error(
+      'saída que não aconteceu segue no limite diário do número: o registro não foi apagado (conta uma a mais)',
+      {
+        organization_id: args.tenantId,
+        channel_session_id: args.channelSessionId,
+        sent_at: new Date(registro.instante.getTime() + registro.folgaMs).toISOString(),
+        resposta: tipoDeEnvio(args.resposta) === 'resposta',
+        desfecho,
+        error: err instanceof Error ? err.name : 'unknown',
+      },
+    );
   }
 }
 
@@ -2026,6 +2371,23 @@ export async function loadChannelProvider(
 }
 
 /**
+ * O limite diário que o CRM dá ao número (`channel_sessions.daily_message_limit`); `null` =
+ * sem limite, ou número que não aparece. É a fonte do teto quando o chamador não o traz (F4o
+ * do cxj, O07), lida sob a trava, como o resto do estado do pacing.
+ */
+async function loadCrmDailyLimit(
+  db: Queryable,
+  organizationId: string,
+  channelSessionId: string,
+): Promise<number | null> {
+  const { rows } = await db.query<{ daily_message_limit: number | null }>(
+    'select daily_message_limit from channel_sessions where organization_id = $1 and id = $2',
+    [organizationId, channelSessionId],
+  );
+  return rows[0]?.daily_message_limit ?? null;
+}
+
+/**
  * STOP direto da fonte (pós-fusão, mesmo banco): `contacts.is_blocked` OR
  * `contacts.force_human` OR `contacts.is_personal` OR `contacts.ai_opt_out` OR a
  * etiqueta de contato INTERNO (#2353), lidos sob o lock — não existe mais cache
@@ -2051,6 +2413,10 @@ export async function loadChannelProvider(
  * Exportada para a suíte de invariantes poder medir o predicado REAL contra
  * Postgres de verdade (`tests/invariants/contato-interno-barra-o-envio.test.ts`):
  * SQL transcrito dentro do teste mediria o teste contra ele mesmo.
+ *
+ * A régua mora em `regraDoStop` e o veredito em `vereditoDoStop`: o resgate da
+ * fila (`session-reconciler.ts`) lê a mesma régua dentro da consulta que confere
+ * a sessão, o canal e a organização (F4s do cxj, S09). A régua é uma só.
  */
 export async function readStopFlags(
   db: Queryable,
@@ -2058,37 +2424,67 @@ export async function readStopFlags(
   contactId: string,
   humanMeetingCommand = false,
 ): Promise<{ stopped: boolean; motivo: MotivoDoStop | null }> {
+  const regra = regraDoStop('contacts', humanMeetingCommand);
+  const { rows } = await db.query<LinhaDoStop>(
+    `select ${regra.colunas} from contacts${regra.juncao} where organization_id = $1 and id = $2`,
+    [organizationId, contactId],
+  );
+  return vereditoDoStop(rows[0]);
+}
+
+/** As colunas da régua do STOP, como `regraDoStop` as escreve e `vereditoDoStop` as lê. */
+export interface LinhaDoStop {
+  stopped: boolean | null;
+  contato_interno: boolean | null;
+  stop_por_handoff: boolean | null;
+}
+
+/**
+ * A régua do STOP em SQL, sobre a linha de `contacts` chamada `contato` na consulta: as colunas
+ * (`stopped`, `contato_interno` e `stop_por_handoff`) e a junção de que elas precisam (o `cross
+ * join lateral` da etiqueta interna; vazia no ramo do encontro). `juncao`, quando existe, começa
+ * com espaço, para entrar logo depois do `from`.
+ *
+ * Os dois leitores: `readStopFlags`, sozinha, na cadeia do agente; e o resgate da fila
+ * (`session-reconciler.ts`), dentro da consulta que confere a sessão, o canal e a organização, para
+ * tudo ser lido no mesmo instante, logo antes do envio (F4s do cxj, S09).
+ */
+export function regraDoStop(contato: string, humanMeetingCommand: boolean): { colunas: string; juncao: string } {
   // Pessoal não recebe nem via encontro (spec 21, etapa 11): o `or is_personal`
   // vale nos DOIS ramos — o veto segue o bloqueio até aqui.
+  if (humanMeetingCommand) {
+    return {
+      colunas: `(${contato}.is_blocked or ${contato}.is_personal) as stopped, false as contato_interno, false as stop_por_handoff`,
+      juncao: '',
+    };
+  }
+  // `ai_opt_out` (issue 2379): a marca permanente "sempre atendimento
+  // humano" entra no MESMO stop, e não numa nova consulta — o custo é
+  // nulo e a garantia é que nenhum escritor futuro de `force_human` consegue
+  // devolver a IA para um contato que a operação trancou.
+  //
+  // `stop_por_handoff` (#3310): `force_human` SOZINHO é a conversa passada
+  // para a EQUIPE, não um pedido do contato para sair. `is_blocked`,
+  // `is_personal` e `ai_opt_out` ficam fora dele: sobrevivem a "Devolver ao
+  // automático" e, quando valem junto, vence o opt-out (a mesma ordem de
+  // `lib/inbox/comando-da-conversa.ts`).
   //
   // O `cross join lateral` avalia a régua da etiqueta UMA vez por linha e a
   // entrega nos dois lugares em que ela decide: o `stopped` e o motivo do veto.
-  const { rows } = await db.query<{
-    stopped: boolean;
-    contato_interno: boolean;
-    stop_por_handoff: boolean;
-  }>(
-    humanMeetingCommand
-      ? 'select (is_blocked or is_personal) as stopped, false as contato_interno, false as stop_por_handoff from contacts where organization_id = $1 and id = $2'
-      // `ai_opt_out` (issue 2379): a marca permanente "sempre atendimento
-      // humano" entra no MESMO stop, e não numa nova consulta — o custo é
-      // nulo e a garantia é que nenhum escritor futuro de `force_human` consegue
-      // devolver a IA para um contato que a operação trancou.
-      //
-      // `stop_por_handoff` (#3310): `force_human` SOZINHO é a conversa passada
-      // para a EQUIPE, não um pedido do contato para sair. `is_blocked`,
-      // `is_personal` e `ai_opt_out` ficam fora dele: sobrevivem a "Devolver ao
-      // automático" e, quando valem junto, vence o opt-out (a mesma ordem de
-      // `lib/inbox/comando-da-conversa.ts`).
-      : `select (is_blocked or force_human or is_personal or ai_opt_out or i.contato_interno) as stopped,
-                i.contato_interno,
-                (force_human and not (is_blocked or is_personal or ai_opt_out)) as stop_por_handoff
-           from contacts
-           cross join lateral (select (${sqlContatoInterno('contacts')}) as contato_interno) i
-          where organization_id = $1 and id = $2`,
-    [organizationId, contactId],
-  );
-  const linha = rows[0];
+  return {
+    colunas: `(${contato}.is_blocked or ${contato}.force_human or ${contato}.is_personal or ${contato}.ai_opt_out
+               or stop_interno.contato_interno) as stopped,
+              stop_interno.contato_interno,
+              (${contato}.force_human and not (${contato}.is_blocked or ${contato}.is_personal or ${contato}.ai_opt_out))
+                as stop_por_handoff`,
+    juncao: ` cross join lateral (select (${sqlContatoInterno(contato)}) as contato_interno) stop_interno`,
+  };
+}
+
+/** O veredito da régua do STOP, na linha com as colunas de `regraDoStop`. */
+export function vereditoDoStop(
+  linha: Partial<LinhaDoStop> | undefined,
+): { stopped: boolean; motivo: MotivoDoStop | null } {
   if (linha?.stopped !== true) return { stopped: false, motivo: null };
   return {
     stopped: true,

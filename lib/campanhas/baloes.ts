@@ -42,27 +42,55 @@ export function pausaEntreBaloes(
 
 /**
  * Envia os balões em ordem. Cada balão enviado passa por `registrar`, com o
- * índice (o `recordSend` da rodada: cada balão é uma mensagem física, conta no
- * teto do número e é a base do throttle do próximo envio). Para no primeiro balão `failed` e o devolve como desfecho: mandar o
+ * índice. A rodada não o usa desde a F4m: ela registra a vaga de cada balão no
+ * teto do número ANTES de enviá-lo, dentro do `enviar`, para nenhuma mensagem
+ * sair fora da conta do dia (`rodada.ts`); registrar aqui, depois do envio,
+ * deixava a mensagem fora do teto quando o banco recusava. Para no primeiro balão `failed` e o devolve como desfecho: mandar o
  * resto depois de uma falha entregaria a mensagem pela metade e fora de ordem.
+ *
+ * `continuar` (opcional) é perguntado antes de cada balão seguinte, depois da
+ * pausa: `false` para ali, e o desfecho é o do último balão que saiu. A
+ * prospecção o usa para não mandar o resto a quem respondeu ao começo.
+ *
+ * `enviar` devolver `null` num balão SEGUINTE é o mesmo `false` do `continuar`,
+ * dito de dentro do envio: a conferência final do handler vetou aquele balão
+ * (F4i). Ele não saiu, não é registrado, e o desfecho é o do último que saiu. No
+ * 1º balão não há "último que saiu", e o laço recusa.
+ *
+ * `parar` (opcional) é perguntado depois de cada balão: `true` para ali, como a
+ * falha, e esse balão é o desfecho. A prospecção o usa para o balão que não
+ * saiu: o que o canal segurou na fila física (F4i, A1), porque se o canal
+ * voltasse na pausa o seguinte sairia sem ele; e o incerto (F4j, J04), porque o
+ * seguinte que saísse viraria o desfecho e esconderia a incerteza.
  */
 export async function enviarEmBaloes<T extends { status?: string }>(
   baloes: readonly string[],
   passos: {
-    enviar: (corpo: string, indice: number) => Promise<T>;
+    enviar: (corpo: string, indice: number) => Promise<T | null>;
     registrar?: (indice: number) => Promise<void>;
     esperar: () => Promise<void>;
+    continuar?: (indice: number) => Promise<boolean>;
+    parar?: (desfecho: T) => boolean;
   },
 ): Promise<{ primeira: T; desfecho: T; indiceDoDesfecho: number }> {
   let primeira: T | undefined;
   let desfecho: T | undefined;
-  let indice = 0;
-  for (; indice < baloes.length; indice++) {
-    if (indice > 0) await passos.esperar();
-    desfecho = await passos.enviar(baloes[indice]!, indice);
+  let indiceDoDesfecho = 0;
+  for (let indice = 0; indice < baloes.length; indice++) {
+    if (indice > 0) {
+      await passos.esperar();
+      if (passos.continuar && !(await passos.continuar(indice))) break;
+    }
+    const resultado = await passos.enviar(baloes[indice]!, indice);
+    if (resultado === null) {
+      if (indice === 0) throw new Error("enviarEmBaloes: o 1º balão não pode parar sem desfecho");
+      break;
+    }
+    desfecho = resultado;
+    indiceDoDesfecho = indice;
     primeira ??= desfecho;
     await passos.registrar?.(indice);
-    if (desfecho.status === "failed") break;
+    if (desfecho.status === "failed" || passos.parar?.(desfecho)) break;
   }
-  return { primeira: primeira!, desfecho: desfecho!, indiceDoDesfecho: Math.min(indice, baloes.length - 1) };
+  return { primeira: primeira!, desfecho: desfecho!, indiceDoDesfecho };
 }

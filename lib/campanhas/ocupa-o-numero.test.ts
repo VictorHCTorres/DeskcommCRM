@@ -15,6 +15,8 @@ vi.mock("@/lib/agent-engine/pacing/store", () => ({
     throw new Error("a rodada deste teste não chega ao rodízio");
   },
   recordSend: async () => undefined,
+  reservarVaga: async () => "reservada",
+  undoSend: async () => undefined,
 }));
 
 import { rodarEmRajada, type DesfechoDeUm } from "@/lib/campanhas/rajada";

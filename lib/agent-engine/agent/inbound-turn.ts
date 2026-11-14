@@ -2122,6 +2122,7 @@ export async function deteccoesDeterministicasDoAssistido(
       // follow-up dispara. Mesmo discriminador do resto do turno (`eTurnoDeResposta`).
       origem: tipoDeEnvio(eTurnoDeResposta(job)),
       now: clock(),
+      relogio: clock,
       log,
       ...(lgpd !== undefined ? { lgpd } : {}),
       agentId: agent.agentId,
@@ -2311,6 +2312,7 @@ export async function runAgentTurn(
               // o tipo do turno é o que diz qual janela o gate do aviso avalia.
               origem: tipoDeEnvio(eTurnoDeResposta(job)),
               now: deps.clock?.() ?? new Date(),
+              relogio: deps.clock ?? ((): Date => new Date()),
               log: logDaEscolta,
               ...(deps.knobs.disclosureMode !== undefined
                 ? { disclosureMode: deps.knobs.disclosureMode }
@@ -2490,6 +2492,7 @@ async function escalarComercialAntesDoModelo(
       channel: (deps.channel ?? ((p: pg.Pool) => new WahaChannelAdapter(p, deps.crmCfg)))(pool),
       origem: tipoDeEnvio(eTurnoDeResposta(job)),
       now: deps.clock?.() ?? new Date(),
+      relogio: deps.clock ?? ((): Date => new Date()),
       log,
       ...(deps.knobs.disclosureMode !== undefined ? { disclosureMode: deps.knobs.disclosureMode } : {}),
       ...(deps.sleep !== undefined ? { sleep: deps.sleep } : {}),
@@ -3345,6 +3348,7 @@ async function executarTurnoDoAgente(
       // `window_*`. Mesmo discriminador do resto do turno.
       origem: tipoDeEnvio(eTurnoDeResposta(liveJob())),
       now: clock(),
+      relogio: clock,
       log: runLog,
       lgpd,
       agentId: agentConfig?.agentId ?? null,
@@ -4509,6 +4513,7 @@ async function executarTurnoDoAgente(
           resposta: eTurnoDeResposta(liveJob()),
           crmDailyLimit: null,
           now: clock(),
+          relogio: clock,
           sleep: deps.sleep,
           lgpd,
           send: (finalBody: string) => {
@@ -4964,11 +4969,11 @@ async function executarTurnoDoAgente(
             // janela de RESPOSTA (0495). `followup_turn` retoma conversa parada e
             // continua na janela de DISPARO.
             resposta: eTurnoDeResposta(liveJob()),
-            // ponytail: channel_sessions.daily_message_limit do CRM ainda não é lido
-            // no runtime — null cai nos degraus de warm-up (conservadores). Injetar
-            // aqui quando o drain expuser o limite da sessão.
+            // `null` = a cadeia lê o `channel_sessions.daily_message_limit` do número,
+            // sob a trava (F4o do cxj, O07). Antes, null caía só nos degraus de warm-up.
             crmDailyLimit: null,
             now: clock(),
+            relogio: clock,
             sleep: deps.sleep,
             lgpd,
             casesEnabled: agentConfig?.casesEnabled ?? false,
@@ -5029,7 +5034,7 @@ async function executarTurnoDoAgente(
             conferirAfirmacoes,
             // Pausa humana do turno, paga FORA do lock do número (issue #654). Antes ela
             // era paga dentro do `send` logo abaixo (via `antesDaPrimeira`), e o `send`
-            // só acontece com o `pg_advisory_xact_lock` do canal na mão — cada turno
+            // acontecia com o `pg_advisory_xact_lock` do canal na mão — cada turno
             // segurava a fila do NÚMERO por 1,2s–7,5s além do necessário. Agora o
             // guardrail a paga antes de tomar conexão: sem transação aberta durante a espera.
             //
@@ -7037,6 +7042,7 @@ async function executarTurnoDoAgente(
               // motivo do aviso de escalação.
               enforceSpinning: false,
               now: clock(),
+              relogio: clock,
               sleep: deps.sleep,
               lgpd,
               ...(deps.knobs.disclosureMode !== undefined

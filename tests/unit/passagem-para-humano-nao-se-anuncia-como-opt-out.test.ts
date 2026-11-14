@@ -189,10 +189,16 @@ describe("#3310 · 1+2 — o gate separa a passagem para a equipe do opt-out rea
     const src = semComentarios(fonte("lib", "agent-engine", "guardrails", "before-send.ts"));
     // O predicado do STOP continua o da main — com a etiqueta interna do #2353
     // (a decisão não mudou)…
-    expect(src).toMatch(/is_blocked or force_human or is_personal or ai_opt_out or i\.contato_interno\) as stopped/);
+    // Revisto em 12/11/2026 (F4s do cxj, S09): a régua passou para `regraDoStop`, que
+    // qualifica cada coluna com a linha do contato (`${contato}.`) e chama a junção da
+    // etiqueta de `stop_interno` (o resgate da fila a usa numa consulta com junções). As
+    // colunas, o `or` e a ordem são os mesmos de antes.
+    expect(src).toMatch(
+      /\$\{contato\}\.is_blocked or \$\{contato\}\.force_human or \$\{contato\}\.is_personal or \$\{contato\}\.ai_opt_out\s+or stop_interno\.contato_interno\) as stopped/,
+    );
     // …e a segunda coluna é o que distingue o handoff do opt-out.
     expect(src).toMatch(
-      /force_human and not \(is_blocked or is_personal or ai_opt_out\)\) as stop_por_handoff/,
+      /\$\{contato\}\.force_human and not \(\$\{contato\}\.is_blocked or \$\{contato\}\.is_personal or \$\{contato\}\.ai_opt_out\)\)\s+as stop_por_handoff/,
     );
   });
 });

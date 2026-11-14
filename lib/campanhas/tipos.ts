@@ -114,6 +114,13 @@ export const MOTIVOS_DE_EXCLUSAO = [
    */
   "sem_email",
   "email_invalido",
+  // Prospecção (base `legitimate_interest`): o que a revalidação no envio acha
+  // de novo desde a preparação (`travaDaProspeccao`, em `rodada.ts`).
+  "escreveu_depois_da_preparacao",
+  "etiqueta_de_parada",
+  "atendimento_humano",
+  "contato_mesclado",
+  "destino_mudou",
 ] as const;
 
 export type MotivoDeExclusao = (typeof MOTIVOS_DE_EXCLUSAO)[number];
@@ -135,4 +142,9 @@ export const TEXTO_DA_EXCLUSAO: Record<MotivoDeExclusao, string> = {
   contato_pessoal: "Contato marcado como pessoal",
   sem_email: "Sem e-mail no cadastro",
   email_invalido: "E-mail fora do formato de envio",
+  escreveu_depois_da_preparacao: "Escreveu depois que a campanha foi preparada",
+  etiqueta_de_parada: "Ganhou uma etiqueta que a campanha exclui",
+  atendimento_humano: "Contato travado para atendimento humano",
+  contato_mesclado: "Contato mesclado em outro",
+  destino_mudou: "O telefone mudou depois da preparação",
 };

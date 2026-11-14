@@ -40,9 +40,9 @@ export function createPool(
   // SO perceber a conexão ociosa morta antes de ela ser reusada.
   // Sem `connectionTimeoutMillis` de propósito: no pg-pool ele também limita a
   // ESPERA NA FILA do pool cheio ('timeout exceeded when trying to connect'), e
-  // aqui a fila é esperada no pico (before-send segura conexão durante lock,
-  // throttle e envio; inbound-turn e get-lead-context contam com "espera, não
-  // erro"). O socket mudo já é fechado pelas duas peças acima.
+  // aqui a fila é esperada no pico (before-send segura conexão durante a trava,
+  // o throttle e o registro da saída; inbound-turn e get-lead-context contam com
+  // "espera, não erro"). O socket mudo já é fechado pelas duas peças acima.
   const pool = new pg.Pool({
     connectionString: databaseUrl,
     max,

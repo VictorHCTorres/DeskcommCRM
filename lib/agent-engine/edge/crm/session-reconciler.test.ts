@@ -2,9 +2,42 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type pg from "pg";
 import { createLogger } from "../../obs/logger";
 
-import { deveRetomarSessao, redriveQueued, reconcileSessions } from "./session-reconciler";
+import { ATRASO_MAXIMO_DA_VAGA_DO_RESGATE_MS, deveRetomarSessao, redriveQueued, reconcileSessions } from "./session-reconciler";
 
 afterEach(() => vi.restoreAllMocks());
+
+/**
+ * O pool do resgate. Desde a F4p do cxj (P07), o resgate reserva a vaga no limite do número
+ * antes de mandar (`reservarVaga`), numa conexão própria: o dublê dela responde como um número
+ * com vaga (nenhuma saída no dia, nenhuma recente). A prova da vaga no Postgres real está em
+ * `tests/invariants/resgate-da-fila-conta-a-saida.test.ts`.
+ */
+/**
+ * O relógio do resgate, fixo dentro da janela do número (11h em São Paulo). A reserva confere a
+ * janela do tipo da mensagem (F4r do cxj, R07): com o relógio de verdade, estes casos passavam ou
+ * falhavam conforme a hora em que a suíte rodasse.
+ */
+const NA_JANELA = () => new Date("2026-11-18T14:00:00Z");
+
+/**
+ * A janela da campanha que a reserva lê sob a trava (versão 16, F4u do cxj, U01): sem horas próprias, no principal da
+ * mensagem. A conexão falsa da reserva responde a ela; antes, a reserva não lia a campanha.
+ */
+const CAMPANHA_SEM_JANELA = { rows: [{ janela_inicio_hora: null, janela_fim_hora: null, channel_session_id: null }] };
+
+function poolDoResgate(query: unknown): pg.Pool {
+  const conexaoDaVaga = {
+    query: vi.fn(async (sql: string) =>
+      /as ultimo/.test(String(sql))
+        ? { rows: [{ ultimo: null, do_dia: "0" }] }
+        : /from campaigns/i.test(String(sql))
+          ? CAMPANHA_SEM_JANELA
+          : { rows: [] },
+    ),
+    release: vi.fn(),
+  };
+  return { query, connect: vi.fn(async () => conexaoDaVaga) } as unknown as pg.Pool;
+}
 
 /**
  * A regra que decide se o watchdog RELIGA a sessão. Religar FAILED é o que o
@@ -37,10 +70,10 @@ describe("redrive pré-go-live", () => {
       .mockResolvedValueOnce({ rows: [{ n: "0" }] })
       .mockRejectedValueOnce(new Error("banco indisponível"));
 
-    expect(await redriveQueued({ query } as unknown as pg.Pool, {
+    expect(await redriveQueued(poolDoResgate(query), {
       wahaBaseUrl: "http://127.0.0.1:9999", wahaApiKey: "test-key",
       intervalMs: 1, redriveMinAgeMs: 0, redriveBatchSize: 10, redriveSpacingMs: 0,
-    }, createLogger())).toBe(0);
+    }, createLogger(), undefined, NA_JANELA)).toBe(0);
     expect(send).not.toHaveBeenCalled();
     expect(query).toHaveBeenLastCalledWith(expect.stringContaining("m.organization_id = $2"), ["message-test", "org-test"]);
   });
@@ -120,14 +153,14 @@ describe("resgate da fila — a mensagem da AUTOMAÇÃO é alcançada (#652)", (
       },
     ]);
 
-    const reenviadas = await redriveQueued({ query } as unknown as pg.Pool, {
+    const reenviadas = await redriveQueued(poolDoResgate(query), {
       wahaBaseUrl: "http://127.0.0.1:9999",
       wahaApiKey: "test-key",
       intervalMs: 1,
       redriveMinAgeMs: 0,
       redriveBatchSize: 10,
       redriveSpacingMs: 0,
-    }, createLogger());
+    }, createLogger(), undefined, NA_JANELA);
 
     expect(
       reenviadas,
@@ -157,14 +190,14 @@ describe("resgate da fila — a mensagem da AUTOMAÇÃO é alcançada (#652)", (
     ]);
 
     expect(
-      await redriveQueued({ query } as unknown as pg.Pool, {
+      await redriveQueued(poolDoResgate(query), {
         wahaBaseUrl: "http://127.0.0.1:9999",
         wahaApiKey: "test-key",
         intervalMs: 1,
         redriveMinAgeMs: 0,
         redriveBatchSize: 10,
         redriveSpacingMs: 0,
-      }, createLogger()),
+      }, createLogger(), undefined, NA_JANELA),
     ).toBe(0);
     expect(send).not.toHaveBeenCalled();
   });
@@ -184,10 +217,10 @@ describe("redrive × organização parada", () => {
       .mockResolvedValueOnce({ rows: [{ metadata: {}, phone_number: "+5511999998888", operante: false }] })
       .mockResolvedValue({ rows: [] });
 
-    expect(await redriveQueued({ query } as unknown as pg.Pool, {
+    expect(await redriveQueued(poolDoResgate(query), {
       wahaBaseUrl: "http://127.0.0.1:9999", wahaApiKey: "test-key",
       intervalMs: 1, redriveMinAgeMs: 0, redriveBatchSize: 10, redriveSpacingMs: 0,
-    }, createLogger())).toBe(0);
+    }, createLogger(), undefined, NA_JANELA)).toBe(0);
     expect(send).not.toHaveBeenCalled();
     expect(query.mock.calls[2]?.[0]).toContain("public.fn_org_operante(m.organization_id)");
     expect(query).toHaveBeenCalledWith(expect.stringContaining("error_code = 'org_suspensa'"), ["message-test", "org-test"]);
@@ -207,10 +240,10 @@ describe("redrive × canal pausado (#2318)", () => {
       .mockResolvedValueOnce({ rows: [{ metadata: { disabled: true }, phone_number: "+5511999998888", operante: true }] })
       .mockResolvedValue({ rows: [] });
 
-    expect(await redriveQueued({ query } as unknown as pg.Pool, {
+    expect(await redriveQueued(poolDoResgate(query), {
       wahaBaseUrl: "http://127.0.0.1:9999", wahaApiKey: "test-key",
       intervalMs: 1, redriveMinAgeMs: 0, redriveBatchSize: 10, redriveSpacingMs: 0,
-    }, createLogger())).toBe(0);
+    }, createLogger(), undefined, NA_JANELA)).toBe(0);
     expect(send).not.toHaveBeenCalled();
     expect(query).toHaveBeenCalledWith(expect.stringContaining("error_code = 'channel_disabled'"), ["message-test", "org-test"]);
   });
@@ -253,10 +286,10 @@ describe("redrive × ficha com telefone extra (Spec 31 B1)", () => {
       return { rows: [] };
     });
 
-    const reenviadas = await redriveQueued({ query } as unknown as pg.Pool, {
+    const reenviadas = await redriveQueued(poolDoResgate(query), {
       wahaBaseUrl: "http://127.0.0.1:9999", wahaApiKey: "test-key",
       intervalMs: 1, redriveMinAgeMs: 0, redriveBatchSize: 10, redriveSpacingMs: 0,
-    }, createLogger());
+    }, createLogger(), undefined, NA_JANELA);
 
     expect(reenviadas).toBe(1);
     const corpo = JSON.parse((send.mock.calls[0]![1] as { body: string }).body) as { chatId: string };
@@ -295,5 +328,408 @@ describe("reconciliação durante a parada", () => {
       : { rows: [{ id: "synthetic-channel", status: "STOPPED" }] });
     expect(await reconcileSessions({ query } as unknown as pg.Pool, cfg, createLogger(), c.signal)).toBe(1);
     expect(transport).toHaveBeenCalledTimes(2); expect(query).toHaveBeenCalledTimes(2);
+  });
+});
+
+/**
+ * F4i do cxj (11/11/2026), A1: a mensagem de campanha de PROSPECÇÃO que ficou na fila física (o canal caiu, ou o veto
+ * não conseguiu ser gravado) não sai pelo resgate. O resgate manda direto ao WAHA, sem conferir a pessoa (resposta,
+ * atendimento humano, recusa, lista de exclusão, campanha cancelada); quem manda a prospecção é a rodada, que confere
+ * tudo de novo. A linha vira `failed/campanha_sem_reenvio`, e a campanha de consentimento segue como antes.
+ */
+describe("redrive × campanha de prospecção (F4i)", () => {
+  const CFG = {
+    wahaBaseUrl: "http://127.0.0.1:9999", wahaApiKey: "test-key",
+    intervalMs: 1, redriveMinAgeMs: 0, redriveBatchSize: 10, redriveSpacingMs: 0,
+  };
+  function cenario(metadata: unknown, campanha: (sql: string, params: unknown[]) => Promise<{ rows: unknown[] }>) {
+    const send = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(JSON.stringify({ id: { id: "3EB0NEW" } }), { status: 200 }));
+    const consultas: Array<{ sql: string; params: unknown[] }> = [];
+    const query = vi.fn(async (sql: string, params: unknown[] = []) => {
+      consultas.push({ sql, params });
+      if (/select\s+m\.id/i.test(sql)) {
+        return { rows: [{
+          id: "m-1", organization_id: "org-1", conversation_id: "conv-1", contact_id: "ficha-1", body: "Olá",
+          waha_session_name: "default", wa_identity: null, wa_lid: null, phone_number: "+5588999990000",
+          is_group: false, group_chat_id: null,
+          // Como o banco: a coluna só volta se a consulta a pedir.
+          ...(/\bm\.metadata\b/.test(sql) ? { metadata } : {}),
+        }] };
+      }
+      if (/count\(\*\)/i.test(sql)) return { rows: [{ n: "0" }] };
+      if (/select\s+s\.metadata/i.test(sql)) return { rows: [{ metadata: {}, phone_number: "+5588999990000", operante: true }] };
+      if (/from campaigns/i.test(sql)) return campanha(sql, params);
+      return { rows: [] };
+    });
+    const rodar = () => redriveQueued(poolDoResgate(query), CFG, createLogger(), undefined, NA_JANELA);
+    const bloqueio = () => consultas.find((c) => c.sql.includes("error_code = 'campanha_sem_reenvio'"));
+    const leuCampanha = () => consultas.filter((c) => /from campaigns/i.test(c.sql));
+    return { send, rodar, bloqueio, leuCampanha };
+  }
+  const daCampanha = { source: "campaign", campaign_id: "camp-1", campaign_recipient_id: "r-1" };
+
+  it("⭐ mensagem presa de campanha de prospecção: não sai pelo resgate, e vira failed/campanha_sem_reenvio", async () => {
+    const c = cenario(daCampanha, async () => ({ rows: [{ base_legal: "legitimate_interest" }] }));
+    expect(await c.rodar()).toBe(0);
+    expect(c.send).not.toHaveBeenCalled();
+    expect(c.bloqueio()?.params).toEqual(["m-1", "org-1"]);
+    expect(c.leuCampanha()[0]?.params).toEqual(["org-1", "camp-1"]);
+  });
+
+  it("⭐ a campanha não se acha (apagada, ou o id não casa): também não sai (falha fechada)", async () => {
+    const c = cenario(daCampanha, async () => ({ rows: [] }));
+    expect(await c.rodar()).toBe(0);
+    expect(c.send).not.toHaveBeenCalled();
+    expect(c.bloqueio()).toBeDefined();
+  });
+
+  it("⭐ a campanha voltou sem a base legal (só o status, como no dublê do cxj): não sai", async () => {
+    const c = cenario(daCampanha, async () => ({ rows: [{ status: "cancelled" }] }));
+    expect(await c.rodar()).toBe(0);
+    expect(c.send).not.toHaveBeenCalled();
+    expect(c.bloqueio()).toBeDefined();
+  });
+
+  it("⭐ de campanha, mas sem o id da campanha: não sai", async () => {
+    const c = cenario({ source: "campaign" }, async () => ({ rows: [] }));
+    expect(await c.rodar()).toBe(0);
+    expect(c.send).not.toHaveBeenCalled();
+    expect(c.bloqueio()).toBeDefined();
+  });
+
+  it("⭐ sem conseguir ler a campanha: não sai, e a linha fica na fila para o próximo tique", async () => {
+    const c = cenario(daCampanha, async () => {
+      throw new Error("leitura de campaigns falhou");
+    });
+    expect(await c.rodar()).toBe(0);
+    expect(c.send).not.toHaveBeenCalled();
+    expect(c.bloqueio()).toBeUndefined();
+  });
+
+  it("controle: campanha de consentimento segue como antes, e sai pelo resgate", async () => {
+    const c = cenario(daCampanha, async () => ({ rows: [{ base_legal: "consent" }] }));
+    expect(await c.rodar()).toBe(1);
+    expect(c.send).toHaveBeenCalledTimes(1);
+    expect(c.bloqueio()).toBeUndefined();
+  });
+
+  it("controle: a mensagem que não é de campanha não lê campanha nenhuma, e sai como antes", async () => {
+    const c = cenario({ source: "agent" }, async () => ({ rows: [{ base_legal: "legitimate_interest" }] }));
+    expect(await c.rodar()).toBe(1);
+    expect(c.send).toHaveBeenCalledTimes(1);
+    expect(c.leuCampanha()).toEqual([]);
+  });
+
+  // O arnês de mutações da v4 (11/11/2026, 18h23) achou estas três propriedades sem teste. Só testes: a produção não mudou.
+
+  it("⭐ o bloqueio tira a linha da fila física (`failed`), e só se ela ainda estiver `queued`: não reescreve o que outro caminho mudou", async () => {
+    const c = cenario(daCampanha, async () => ({ rows: [{ base_legal: "legitimate_interest" }] }));
+    await c.rodar();
+    const sql = c.bloqueio()!.sql.replace(/\s+/g, " ");
+    expect(sql).toMatch(/set status = 'failed', error_code = 'campanha_sem_reenvio'/);
+    expect(sql).toMatch(/where id = \$1 and organization_id = \$2 and status = 'queued'/);
+  });
+
+  it("⭐ a campanha é procurada na organização da mensagem: a de consentimento de OUTRA organização, com o mesmo id, não libera o resgate", async () => {
+    const campanhas = [{ organization_id: "org-2", id: "camp-1", base_legal: "consent" }];
+    const c = cenario(daCampanha, async (sql, params) => {
+      const daOrganizacao = /k\.organization_id\s*=\s*\$1/i.test(sql);
+      return { rows: campanhas.filter((k) => (!daOrganizacao || k.organization_id === params[0]) && k.id === params[1]) };
+    });
+    expect(await c.rodar()).toBe(0);
+    expect(c.send).not.toHaveBeenCalled();
+    expect(c.bloqueio()).toBeDefined();
+  });
+});
+
+describe("resgate × vaga no limite do número (F4p do cxj, P07)", () => {
+  const CFG_DA_VAGA = {
+    wahaBaseUrl: "http://127.0.0.1:9999",
+    wahaApiKey: "test-key",
+    intervalMs: 1,
+    redriveMinAgeMs: 0,
+    redriveBatchSize: 10,
+    redriveSpacingMs: 0,
+  };
+  const presa = {
+    id: "m-vaga",
+    organization_id: "org-1",
+    conversation_id: "conversa-1",
+    body: "Oi! Consegui ver o seu caso.",
+    sent_via: "ai",
+    waha_session_name: "default",
+    wa_identity: null,
+    wa_lid: null,
+    phone_number: "+5531999998888",
+    is_group: false,
+    group_chat_id: null,
+    channel_session_id: "numero-1",
+    daily_message_limit: 60,
+    provider: "waha",
+  };
+
+  it("o WAHA recusa (4xx) e o banco recusa devolver a vaga: a mensagem fica na fila, e o log leva o número e o instante", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("{}", { status: 422 }));
+    const { query: daFila } = bancoComFila([presa]);
+    const query = vi.fn(async (sql: string) => {
+      if (/delete from pacing_ledger/i.test(sql)) throw new Error("banco fora do ar");
+      return daFila(sql);
+    });
+    const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const agora = new Date("2026-11-18T14:00:00Z");
+
+    const reenviadas = await redriveQueued(
+      poolDoResgate(query),
+      CFG_DA_VAGA,
+      log as unknown as ReturnType<typeof createLogger>,
+      undefined,
+      () => agora,
+    );
+
+    expect(reenviadas).toBe(0);
+    expect(log.error).toHaveBeenCalledWith(
+      expect.stringMatching(/vaga de um reenvio que não saiu ficou no limite do número/),
+      expect.objectContaining({ message_id: "m-vaga", channel_session_id: "numero-1", sent_at: agora.toISOString() }),
+    );
+  });
+
+  it("sem vaga no número: o resgate não chama o WAHA nem mexe na mensagem", async () => {
+    const send = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("{}", { status: 200 }));
+    const { query } = bancoComFila([presa]);
+    const semVaga = {
+      query: vi.fn(async (sql: string) =>
+        /as ultimo/.test(String(sql)) ? { rows: [{ ultimo: null, do_dia: "60" }] } : { rows: [] },
+      ),
+      release: vi.fn(),
+    };
+    const pool = { query, connect: vi.fn(async () => semVaga) } as unknown as pg.Pool;
+
+    expect(await redriveQueued(pool, CFG_DA_VAGA, createLogger(), undefined, NA_JANELA)).toBe(0);
+
+    expect(send).not.toHaveBeenCalled();
+    expect(query).not.toHaveBeenCalledWith(expect.stringMatching(/update messages/i), expect.anything());
+  });
+});
+
+/**
+ * F4q do cxj (Q03 e Q08). O banco do resgate em que a releitura MUDA enquanto o resgate espera a
+ * vaga (a conexão da reserva): até a conexão ser concedida, a releitura diz que a mensagem pode
+ * sair; depois, diz `depois` (ou lança). As devoluções da vaga (`undoSend`) passam pelo pool, e a
+ * gravação da vaga, pela conexão.
+ */
+function bancoQueMudaNaEspera(opcoes: {
+  depois?: { metadata: unknown; phone_number: string | null; operante: boolean } | null | Error;
+  aoConceder?: () => void;
+  resposta?: boolean;
+  doDia?: string;
+  presas?: number;
+  /** A presa é de campanha de consentimento; `aoLerACampanha` roda a cada leitura dela. */
+  aoLerACampanha?: (vez: number) => void;
+}) {
+  const presa = {
+    id: "m-vaga",
+    organization_id: "org-1",
+    conversation_id: "conversa-1",
+    contact_id: "ficha-1",
+    body: "Oi! Consegui ver o seu caso.",
+    waha_session_name: "default",
+    wa_identity: null,
+    wa_lid: null,
+    phone_number: "+5531999998888",
+    is_group: false,
+    group_chat_id: null,
+    metadata: opcoes.aoLerACampanha ? { source: "campaign", campaign_id: "camp-1" } : {},
+    channel_session_id: "numero-1",
+    daily_message_limit: 60,
+    provider: "waha",
+    resposta: opcoes.resposta ?? false,
+  };
+  let leiturasDaCampanha = 0;
+  const livre = { metadata: {}, phone_number: "+5531999998888", operante: true };
+  let concedida = false;
+  const query = vi.fn(async (sql: string, _params: unknown[] = []) => {
+    if (/count\(\*\)/i.test(sql)) return { rows: [{ n: "0" }] };
+    if (/select\s+m\.id/i.test(sql)) {
+      return { rows: Array.from({ length: opcoes.presas ?? 1 }, (_, i) => ({ ...presa, id: `m-vaga-${i + 1}` })) };
+    }
+    if (/select\s+s\.metadata/i.test(sql)) {
+      if (!concedida || opcoes.depois === undefined) return { rows: [livre] };
+      if (opcoes.depois instanceof Error) throw opcoes.depois;
+      return { rows: opcoes.depois === null ? [] : [opcoes.depois] };
+    }
+    if (/from campaigns/i.test(sql)) {
+      leiturasDaCampanha += 1;
+      opcoes.aoLerACampanha?.(leiturasDaCampanha);
+      return { rows: [{ base_legal: "consent" }] };
+    }
+    return { rows: [] };
+  });
+  const conexao = {
+    query: vi.fn(async (sql: string, _params: unknown[] = []) =>
+      /as ultimo/.test(String(sql))
+        ? { rows: [{ ultimo: null, do_dia: opcoes.doDia ?? "0" }] }
+        : /from campaigns/i.test(String(sql))
+          ? CAMPANHA_SEM_JANELA
+          : { rows: [] },
+    ),
+    release: vi.fn(),
+  };
+  const connect = vi.fn(async () => {
+    concedida = true;
+    opcoes.aoConceder?.();
+    return conexao;
+  });
+  const pool = { query, connect } as unknown as pg.Pool;
+  const chamadas = (alvo: { mock: { calls: unknown[][] } }, padrao: RegExp) =>
+    alvo.mock.calls.filter(([sql]) => padrao.test(String(sql))).map(([, params]) => params);
+  return {
+    pool,
+    query,
+    connect,
+    devolucoes: () => chamadas(query, /delete from pacing_ledger/i),
+    gravacoes: () => chamadas(conexao.query, /insert into pacing_ledger/i),
+    releituras: () => chamadas(query, /select\s+s\.metadata/i).map((params) => (params as unknown[])[0]),
+  };
+}
+
+describe("F4q do cxj (Q03) · o que muda enquanto o resgate espera a vaga vale", () => {
+  const CFG = {
+    wahaBaseUrl: "http://127.0.0.1:9999",
+    wahaApiKey: "test-key",
+    intervalMs: 1,
+    redriveMinAgeMs: 0,
+    redriveBatchSize: 10,
+    redriveSpacingMs: 0,
+  };
+  const AGORA = new Date("2026-11-18T14:00:00Z");
+  // A linha da vaga leva o instante mais a folga, e a devolução a procura com ela (versão 16, F4u do cxj, U02).
+  const COM_FOLGA = new Date(+AGORA + ATRASO_MAXIMO_DA_VAGA_DO_RESGATE_MS);
+  const enviou = () =>
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ id: { id: "3EB0NEW" } }), { status: 200 }));
+
+  it("a organização para durante a espera: nada sai, a mensagem vira failed/org_suspensa, e a vaga volta", async () => {
+    const send = enviou();
+    const b = bancoQueMudaNaEspera({ depois: { metadata: {}, phone_number: "+5531999998888", operante: false } });
+
+    expect(await redriveQueued(b.pool, CFG, createLogger(), undefined, () => AGORA)).toBe(0);
+
+    expect(send).not.toHaveBeenCalled();
+    expect(b.query).toHaveBeenCalledWith(expect.stringContaining("error_code = 'org_suspensa'"), ["m-vaga-1", "org-1"]);
+    expect(b.devolucoes()).toEqual([["org-1", "numero-1", COM_FOLGA, false]]);
+  });
+
+  it("a releitura depois da vaga falha: nada sai, a vaga volta, e a mensagem fica na fila", async () => {
+    const send = enviou();
+    const b = bancoQueMudaNaEspera({ depois: new Error("banco indisponível") });
+
+    expect(await redriveQueued(b.pool, CFG, createLogger(), undefined, () => AGORA)).toBe(0);
+
+    expect(send).not.toHaveBeenCalled();
+    expect(b.devolucoes()).toEqual([["org-1", "numero-1", COM_FOLGA, false]]);
+    expect(b.query).not.toHaveBeenCalledWith(expect.stringMatching(/update messages/i), expect.anything());
+  });
+
+  it("a mensagem deixou a fila durante a espera (outro caminho a mandou): nada sai, e a vaga volta", async () => {
+    const send = enviou();
+    const b = bancoQueMudaNaEspera({ depois: null });
+
+    expect(await redriveQueued(b.pool, CFG, createLogger(), undefined, () => AGORA)).toBe(0);
+
+    expect(send).not.toHaveBeenCalled();
+    expect(b.devolucoes()).toEqual([["org-1", "numero-1", COM_FOLGA, false]]);
+  });
+
+  it("o processo começa a desligar durante a espera: nada sai, a vaga volta, e o lote para ali", async () => {
+    const send = enviou();
+    const desligar = new AbortController();
+    const b = bancoQueMudaNaEspera({ aoConceder: () => desligar.abort(), presas: 2 });
+
+    expect(await redriveQueued(b.pool, CFG, createLogger(), desligar.signal, () => AGORA)).toBe(0);
+
+    expect(send).not.toHaveBeenCalled();
+    expect(b.devolucoes()).toEqual([["org-1", "numero-1", COM_FOLGA, false]]);
+    expect(b.connect).toHaveBeenCalledTimes(1);
+    expect(b.releituras()).toEqual(["m-vaga-1", "m-vaga-1"]); // a segunda presa nem é relida
+    expect(b.query).not.toHaveBeenCalledWith(expect.stringMatching(/update messages/i), expect.anything());
+  });
+
+  it("o processo começa a desligar durante a releitura da campanha, depois da vaga: nada sai, e a vaga volta", async () => {
+    const send = enviou();
+    const desligar = new AbortController();
+    const b = bancoQueMudaNaEspera({ aoLerACampanha: (vez) => vez === 2 && desligar.abort() });
+
+    expect(await redriveQueued(b.pool, CFG, createLogger(), desligar.signal, () => AGORA)).toBe(0);
+
+    expect(send).not.toHaveBeenCalled();
+    expect(b.devolucoes()).toEqual([["org-1", "numero-1", COM_FOLGA, false]]);
+  });
+
+  it("controle: a campanha de consentimento sem desligamento sai, relida antes e depois da vaga", async () => {
+    const send = enviou();
+    let leituras = 0;
+    const b = bancoQueMudaNaEspera({ aoLerACampanha: (vez) => (leituras = vez) });
+
+    expect(await redriveQueued(b.pool, CFG, createLogger(), undefined, () => AGORA)).toBe(1);
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(leituras).toBe(2);
+  });
+
+  it("controle: nada muda durante a espera, e a mensagem sai com a vaga gravada", async () => {
+    const send = enviou();
+    const b = bancoQueMudaNaEspera({});
+
+    expect(await redriveQueued(b.pool, CFG, createLogger(), undefined, () => AGORA)).toBe(1);
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(b.devolucoes()).toEqual([]);
+    expect(b.gravacoes()).toEqual([["org-1", "numero-1", COM_FOLGA, false]]);
+  });
+});
+
+describe("F4q do cxj (Q08) · a resposta presa sai pelo resgate como resposta", () => {
+  const CFG = {
+    wahaBaseUrl: "http://127.0.0.1:9999",
+    wahaApiKey: "test-key",
+    intervalMs: 1,
+    redriveMinAgeMs: 0,
+    redriveBatchSize: 10,
+    redriveSpacingMs: 0,
+  };
+  const AGORA = new Date("2026-11-18T14:00:00Z");
+  // A linha da vaga leva o instante mais a folga, e a devolução a procura com ela (versão 16, F4u do cxj, U02).
+  const COM_FOLGA = new Date(+AGORA + ATRASO_MAXIMO_DA_VAGA_DO_RESGATE_MS);
+
+  it("com o teto do dia batido, a resposta sai, e a vaga é gravada como resposta", async () => {
+    const send = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(JSON.stringify({ id: { id: "3EB0NEW" } }), { status: 200 }));
+    const b = bancoQueMudaNaEspera({ resposta: true, doDia: "60" });
+
+    expect(await redriveQueued(b.pool, CFG, createLogger(), undefined, () => AGORA)).toBe(1);
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(b.gravacoes()).toEqual([["org-1", "numero-1", COM_FOLGA, true]]);
+  });
+
+  it("o WAHA recusa a resposta (4xx): a vaga de RESPOSTA volta", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("{}", { status: 422 }));
+    const b = bancoQueMudaNaEspera({ resposta: true });
+
+    expect(await redriveQueued(b.pool, CFG, createLogger(), undefined, () => AGORA)).toBe(0);
+
+    expect(b.devolucoes()).toEqual([["org-1", "numero-1", COM_FOLGA, true]]);
+  });
+
+  it("controle: o disparo preso, com o teto batido, não sai e não grava nada", async () => {
+    const send = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("{}", { status: 200 }));
+    const b = bancoQueMudaNaEspera({ resposta: false, doDia: "60" });
+
+    expect(await redriveQueued(b.pool, CFG, createLogger(), undefined, () => AGORA)).toBe(0);
+
+    expect(send).not.toHaveBeenCalled();
+    expect(b.gravacoes()).toEqual([]);
   });
 });

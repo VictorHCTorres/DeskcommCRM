@@ -178,7 +178,21 @@ describe("saída configurável — uma vez por mensagem, do envio à entrega (ba
         redriveSpacingMs: 1,
       },
       log,
+      undefined,
+      // O relógio fixo dentro da janela do número (11h em São Paulo): a reserva confere a janela
+      // do tipo da mensagem (F4r do cxj, R07), e o relógio de verdade fazia o caso depender da
+      // hora em que a suíte roda.
+      () => new Date("2026-11-18T14:00:00Z"),
     );
+
+  /**
+   * O job da mensagem presa termina, e ela fica sem dono: só então é do watchdog (F4r do cxj,
+   * R08). Com o job vivo, quem a manda de novo é ele, pela cadeia; o turno de entrada aceita o
+   * `queued` e termina.
+   */
+  async function terminar(jobId: string) {
+    await pool.query("update job_queue set status = 'done' where id = $1", [jobId]);
+  }
 
   type Candidata = Awaited<ReturnType<typeof candidata>>;
 
@@ -274,6 +288,7 @@ describe("saída configurável — uma vez por mensagem, do envio à entrega (ba
     expect(auditoriasDaSaida(c.id)).toBe(1);
 
     // O inbound_turn termina no `queued`; quem entrega é o watchdog, pelo corpo guardado.
+    await terminar(j1);
     await watchdog();
     const daSessao = entreguesPeloWatchdog.filter((e) => e.text.startsWith("Que bom que respondeu!"));
     expect(daSessao).toHaveLength(1);
@@ -304,11 +319,15 @@ describe("saída configurável — uma vez por mensagem, do envio à entrega (ba
     expect(auditoriasDaSaida(c.id)).toBe(1);
   });
 
-  it("followup_turn: queued, o watchdog entrega primeiro, e a nova tentativa não conta nem transmite", async () => {
+  it("followup_turn: queued, sem job vivo o watchdog entrega, e uma nova tentativa da mesma chave não conta nem transmite", async () => {
     const { org, c } = await cenario();
     const j = await job(org, c, "followup_turn");
     await tentativa(org, c, j, "queued", "Lembrete do watchdog", "followup");
     const reservada = await estado(org, c.id);
+    // Com o job do follow-up vivo, quem reenvia é ele, pela cadeia (F4r do cxj, R08); aqui ele já
+    // terminou, e quem entrega é o watchdog. A tentativa seguinte, pela mesma chave, mede só a
+    // idempotência do ledger: a mensagem já saiu, e nada conta nem transmite de novo.
+    await terminar(j);
     await watchdog();
     expect(entreguesPeloWatchdog.some((e) => e.text.startsWith("Lembrete do watchdog") && e.text.includes("PARAR"))).toBe(true);
 
@@ -361,6 +380,7 @@ describe("saída configurável — uma vez por mensagem, do envio à entrega (ba
       `update channel_sessions set metadata = coalesce(metadata,'{}'::jsonb) || '{"disabled":true}'::jsonb where organization_id=$1 and id=$2`,
       [org, c.sessao],
     );
+    await terminar(j1);
     await watchdog();
     expect(entreguesPeloWatchdog.some((e) => e.text.startsWith("Cetico A guardada"))).toBe(false);
     const { rows: msg } = await pool.query<{ status: string; error_code: string | null }>(
