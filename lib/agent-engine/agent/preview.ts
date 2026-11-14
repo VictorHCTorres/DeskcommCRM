@@ -1,4 +1,5 @@
 import { comercialExigeHumano } from '@/lib/escalacao/assunto-comercial';
+import { lerExcecaoFunilA } from '@/lib/escalacao/excecao-funil-a';
 /** Preview is an execution policy of the real turn, never a simulated queue job. */
 import type pg from 'pg';
 import { hasOpenCaseForContact } from './human-cases';
@@ -170,6 +171,7 @@ export async function previewGateContext(
     lastInbound = last ? new Date(last.sent_at) : null;
     p.result.restrictions.push('contact_state_is_scenario');
   }
+  const restricaoComercial = await comercialExigeHumano(db, org);
   return {
     now,
     body: '',
@@ -220,7 +222,10 @@ export async function previewGateContext(
     // Um Testar que arma diferente da produção faz quem afina o prompt testar contra
     // outro sistema — o mesmo motivo do `agenda` logo acima.
     clinicalClaimEnforced: camadaLigada((await lerCamadasDaOrg(db, org)).afirmacao_clinica, false),
-    commercialRestrictionEnforced: await comercialExigeHumano(db, org),
+    commercialRestrictionEnforced: restricaoComercial,
+    // A mesma exceção do turno real (Linha A): só com contato de verdade e com a trava ligada.
+    commercialExceptionFunilA:
+      restricaoComercial && p.contactId ? await lerExcecaoFunilA(db, org, p.contactId) : null,
   };
 }
 export const SCENARIO_READS = new Set([

@@ -103,7 +103,10 @@ describe("sem o argumento, a cadeia lê a restrição da organização (falha fe
     const pool = {
       connect: vi.fn().mockResolvedValue(client),
       query: vi.fn(async (sql: string, values: unknown[]) => {
-        if (sql.includes("org_guardrail_layers")) {
+        // Só a leitura da PRÓPRIA camada conta aqui: com a restrição ligada, a cadeia
+        // pergunta também pela opção da exceção da Linha A (outra linha da mesma
+        // tabela, 1.110.2), que nesta organização não existe.
+        if (sql.includes("org_guardrail_layers") && values[1] === "restricao_comercial") {
           leituras.push(values);
           if (camada === "falha") throw new Error("banco fora do ar");
           return { rows: [{ enabled: camada }] };

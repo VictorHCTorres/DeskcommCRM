@@ -1,4 +1,5 @@
 import { comercialExigeHumano, contemAssuntoComercialNaSaida, restricaoComercialBarra } from '@/lib/escalacao/assunto-comercial';
+import { conferirRespostaDaLinhaA, lerExcecaoFunilA, type ExcecaoFunilA } from '@/lib/escalacao/excecao-funil-a';
 import { assertAgentOperationPg, type AgentOperationContext } from '@/lib/ai/agents/operation';
 import { assertApprovedReplyPg, type ApprovedReplyContext } from '@/lib/ai/replies/delivery';
 import { assertMeetingDeliveryPg, type MeetingDeliveryContext } from '@/lib/agenda/meet-delivery';
@@ -293,6 +294,14 @@ export interface GateContext {
    * `RunBeforeSendArgs.enforceCommercialRestriction` —, nunca um default calado.
    */
   commercialRestrictionEnforced?: boolean;
+  /**
+   * Exceção da Linha A (1.110.2): o contato `funil-a` com um negócio aberto no
+   * funil Prospecção e `preco` preenchido, numa organização que ligou a opção.
+   * Presente, o `commercialRestrictionGate` troca "não fale de valor" por "só o
+   * preço do negócio, sem condição, chave nem promessa" — ver
+   * `lib/escalacao/excecao-funil-a.ts`. Ausente ou `null` = a trava de sempre.
+   */
+  commercialExceptionFunilA?: ExcecaoFunilA | null;
   /**
    * Arma o `spinningGate`. **Ausente = ARMADO** — a direção segura aqui é a
    * oposta do `internalVocabularyEnforced` logo acima, e a assimetria é
@@ -789,9 +798,19 @@ export const clinicalClaimGate: Gate = {
 /** Valores e negociação são exclusivos da equipe quando a organização assim determina. */
 export const commercialRestrictionGate: Gate = {
   name: 'commercial_restriction',
-  evaluate: (ctx) => {
-    if (ctx.commercialRestrictionEnforced !== true || !contemAssuntoComercialNaSaida(ctx.body))
-      return { pass: true };
+  evaluate: (ctx): GateVerdict => {
+    if (ctx.commercialRestrictionEnforced !== true) return { pass: true };
+    // Linha A: a resposta pode dizer o preço do negócio, e só ele. Barrada, tem o
+    // MESMO código e o mesmo destino da trava de sempre (a conversa vai à equipe).
+    if (ctx.commercialExceptionFunilA !== undefined && ctx.commercialExceptionFunilA !== null) {
+      const conferencia = conferirRespostaDaLinhaA(ctx.body, ctx.commercialExceptionFunilA);
+      if (conferencia.ok) return { pass: true };
+      return { pass: false, code: 'commercial_requires_human',
+        reason: 'A resposta saiu do que a Linha A permite (só o preço do negócio, sem condição, chave de pagamento nem promessa); não envie esta resposta.',
+        // Só rótulos fechados: o trecho barrado não vai para log.
+        detail: { restricted_kind: 'commercial', excecao_funil_a: conferencia.motivos.join(',') } };
+    }
+    if (!contemAssuntoComercialNaSaida(ctx.body)) return { pass: true };
     return { pass: false, code: 'commercial_requires_human',
       reason: 'Valores e negociação exigem atendimento humano; não envie esta resposta.',
       detail: { restricted_kind: 'commercial' } };
@@ -1780,6 +1799,11 @@ export async function runBeforeSend(args: RunBeforeSendArgs): Promise<BeforeSend
   // Só consulta quando o corpo tem cara de preço: o gate não vetaria nada sem
   // isso, e todo envio comum não paga o round-trip.
   const restricaoComercial = await resolverRestricaoComercial(args, bodyDoModelo);
+  // Exceção da Linha A: só é lida com a restrição armada, e só custa a segunda
+  // consulta na organização que ligou a opção. Falha fechada (`null`).
+  const excecaoFunilA = restricaoComercial
+    ? await lerExcecaoFunilA(args.pool, args.tenantId, args.leadId, (m, c) => args.log.warn(m, c))
+    : null;
 
   // ═══ A CONFERÊNCIA SEMÂNTICA DE PROMESSA RODA FORA DO LOCK ═══
   //
@@ -1973,6 +1997,7 @@ export async function runBeforeSend(args: RunBeforeSendArgs): Promise<BeforeSend
       internalVocabularyEnforced: args.enforceInternalVocabulary ?? false,
       clinicalClaimEnforced: args.enforceClinicalClaim ?? false,
       commercialRestrictionEnforced: restricaoComercial,
+      commercialExceptionFunilA: excecaoFunilA,
       ...(args.agenda !== undefined ? { agenda: args.agenda } : {}),
       ...(args.horariosDaAgenda !== undefined ? { horariosDaAgenda: args.horariosDaAgenda } : {}),
       ...(args.followup !== undefined ? { followup: args.followup } : {}),

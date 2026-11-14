@@ -1,4 +1,5 @@
 import { contemAssuntoComercialRestrito, comercialExigeHumano } from '@/lib/escalacao/assunto-comercial';
+import { lerExcecaoFunilA } from '@/lib/escalacao/excecao-funil-a';
 import { prospectingConversationContext } from "@/lib/prospecting/context";
 import { setExecutionAgentOperation } from '@/lib/atendimento/fronteira-server';
 import { TIPOS_DE_CASO, TIPOS_DE_CASO_PARA_A_IA } from "@/lib/ai/case-copy";
@@ -2477,6 +2478,14 @@ async function escalarComercialAntesDoModelo(
   if (textos.some((t) => detectAmbiguousOptOut(t) || detectHumanHandoffRequest(t))) return false;
   if (!textos.some(contemAssuntoComercialRestrito)) return false;
   const log = withFields(deps.log, { job_id: job.id, tenant_id: tenantId, lead_id: turno.leadId });
+  // Exceção da Linha A (1.110.2): contato `funil-a` com um negócio aberto no funil
+  // Prospecção e `preco` preenchido segue para a IA — a saída dela é conferida
+  // contra esse preço no `commercialRestrictionGate`. Opção desligada, leitura
+  // que falha ou condição incompleta: `null`, e o desvio de sempre.
+  if ((await lerExcecaoFunilA(pool, tenantId, turno.leadId, (m, c) => log.warn(m, c))) !== null) {
+    log.info('assunto comercial na Linha A: segue para a IA (exceção funil-a)');
+    return false;
+  }
   const aviso = await avisarLeadLendoOContato(
     pool,
     {
@@ -2762,7 +2771,10 @@ async function executarTurnoDoAgente(
   if (
     preview &&
     restricaoComercial &&
-    inboundsNaoRespondidos(preview.context.context.messages).some(contemAssuntoComercialRestrito)
+    inboundsNaoRespondidos(preview.context.context.messages).some(contemAssuntoComercialRestrito) &&
+    // A mesma exceção do handler (`escalarComercialAntesDoModelo`): o Testar não
+    // pode propor passagem onde o turno real deixa a IA responder.
+    (await lerExcecaoFunilA(pool, tenantId, leadId, (m, c) => runLog.warn(m, c))) === null
   ) {
     preview.result.proposals.push({ tool: 'crm_request_human_handoff', arguments: {
       reason: 'Valores e negociação: atendimento exclusivamente humano.',
