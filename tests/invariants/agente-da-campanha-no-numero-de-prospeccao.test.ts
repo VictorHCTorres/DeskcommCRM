@@ -93,6 +93,30 @@ describe("v20 · o número de prospecção só responde com o agente do número"
     expect(await agenteDaCampanhaDaConversa(pool, ORG, conversa)).toBeNull();
   });
 
+  it("⭐ o número é de prospecção só pelo RODÍZIO de uma campanha de outro principal: o agente alheio também não responde", async () => {
+    const terceiro = randomUUID();
+    const principal = randomUUID();
+    for (const [id, nome] of [[terceiro, "terceiro"], [principal, "principal"]] as const) {
+      await pool.query(
+        `insert into channel_sessions (id, organization_id, waha_session_name, status, webhook_secret_encrypted)
+         values ($1, $2, $3, 'WORKING', '\\x00'::bytea)`,
+        [id, ORG, `${nome}-${id.slice(0, 6)}`],
+      );
+    }
+    const prospeccao = randomUUID();
+    await pool.query(
+      `insert into campaigns (id, organization_id, name, channel_session_id, base_legal, lia_ref, status)
+       values ($1, $2, 'Prospecção', $3, 'legitimate_interest', 'LIA', 'running')`,
+      [prospeccao, ORG, principal],
+    );
+    await pool.query(
+      `insert into campaign_channel_sessions (organization_id, campaign_id, channel_session_id) values ($1, $2, $3)`,
+      [ORG, prospeccao, terceiro],
+    );
+    const conversa = await conversaDeCampanha(terceiro, "consent", AGENTE_DE_OUTRO);
+    expect(await agenteDaCampanhaDaConversa(pool, ORG, conversa)).toBeNull();
+  });
+
   it("controle: a campanha de prospecção que declara o agente DO CHIP segue valendo", async () => {
     const conversa = await conversaDeCampanha(CHIP, "legitimate_interest", AGENTE_DO_CHIP);
     expect(await agenteDaCampanhaDaConversa(pool, ORG, conversa)).toBe(AGENTE_DO_CHIP);

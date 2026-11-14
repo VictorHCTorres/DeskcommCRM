@@ -1031,7 +1031,9 @@ describe('F4s no Postgres real · o resgate confere no instante do envio (S01 e 
     ]);
     const waha = wahaResponde(200);
 
-    const n = await resgatarMudandoNaLeitura(/from campaigns/, 2, () =>
+    // A leitura da BASE LEGAL da campanha (a 2ª, a de depois da vaga). Desde a v20 a consulta que decide também lê
+    // `campaigns` (o status) e a pergunta do número de prospecção também: `/from campaigns/` pegava uma delas.
+    const n = await resgatarMudandoNaLeitura(/select k\.base_legal from campaigns/, 2, () =>
       pool.query(`update channel_sessions set metadata = '{"disabled":true}'::jsonb where id = $1`, [f.numero]),
     );
 

@@ -76,7 +76,7 @@ vi.mock("@/app/api/v1/messages/_handler", () => ({
 }));
 
 import { rodarUmaRodadaDeCampanha } from "@/lib/campanhas/rodada";
-import { recebeuOutraCampanhaNoDia } from "@/lib/campanhas/conferencia";
+import { recebeuOutraCampanhaNoDia, travaDaProspeccao } from "@/lib/campanhas/conferencia";
 
 type Linha = Record<string, unknown>;
 type Tabelas = Record<string, Linha[]> & Record<"campaigns" | "campaign_recipients" | "channel_sessions" | "messages", Linha[]>;
@@ -430,5 +430,20 @@ describe("v20 · a duplicidade no último passo (a própria reserva não conta)"
     expect(
       await recebeuOutraCampanhaNoDia(fakeAdmin({ campaigns: [], campaign_recipients: [], channel_sessions: [], messages: [] } as never, { falhas: ["campaign_recipients"] }), { organization_id: "org-1" }, alvo, em("2026-11-18", "10:00")),
     ).toBeNull();
+  });
+});
+
+describe("v20 · a duplicidade que não se lê não deixa sair", () => {
+  it("⭐ a conferência da prospecção espera (`sem_leitura`) quando a leitura da duplicidade falha", async () => {
+    const tabelas = { campaigns: [], campaign_recipients: [], channel_sessions: [], messages: [], conversations: [], crm_leads: [] } as never;
+    const c = campanha("legitimate_interest") as never;
+    const alvo = pendente("ana", ["funil-a"], { organization_id: "org-1" }) as never;
+    // Só a fila da campanha falha: tudo o mais (mensagens, conversas, negócios) lê.
+    const trava = await travaDaProspeccao(fakeAdmin(tabelas, { falhas: ["campaign_recipients"] }), c, alvo, em("2026-11-18", "10:00"));
+    expect(trava).toEqual({ esperar: "sem_leitura" });
+  });
+  it("controle: com a leitura, a pessoa livre passa", async () => {
+    const tabelas = { campaigns: [], campaign_recipients: [], channel_sessions: [], messages: [], conversations: [], crm_leads: [] } as never;
+    expect(await travaDaProspeccao(fakeAdmin(tabelas), campanha("legitimate_interest") as never, pendente("ana") as never, em("2026-11-18", "10:00"))).toBeNull();
   });
 });

@@ -200,6 +200,10 @@ describe("a leitura pelo PostgREST (o handler de mensagens)", () => {
     const t = base({ conversations: [{ organization_id: "org-1", contact_id: ALVO.contactId, status: "open", assigned_to_user_id: "u1", bot_silenced_until: null }] });
     expect((await travaDoChipPorSupabase(postgrest(t), ALVO, em("2026-11-18", "10:00")))?.motivo).toBe("atendimento_humano");
   });
+  it("⭐ conversa ENCERRADA com o dono antigo gravado: não barra (é histórico)", async () => {
+    const t = base({ conversations: [{ organization_id: "org-1", contact_id: ALVO.contactId, status: "closed", assigned_to_user_id: "u1", bot_silenced_until: null }] });
+    expect(await travaDoChipPorSupabase(postgrest(t), ALVO, em("2026-11-18", "10:00"))).toBeNull();
+  });
   it("⭐ sem ler a campanha: recusa (falha fechada)", async () => {
     expect((await travaDoChipPorSupabase(postgrest(base(), ["campaigns"]), ALVO, em("2026-11-18", "10:00")))?.motivo).toBe("sem_leitura");
   });
