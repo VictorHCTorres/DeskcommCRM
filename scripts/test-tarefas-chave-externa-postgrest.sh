@@ -3,7 +3,7 @@
 #
 # Prova, contra Postgres + PostgREST de verdade (nada de dublê de banco):
 #   1. UPGRADE COM DADOS: um banco instalado pelo baseline da base (1.101.0, D9_BASE_REF) com
-#      centenas de tarefas é atualizado pelo baseline da branch (que carrega a 9338) DUAS vezes,
+#      centenas de tarefas é atualizado pelo baseline da branch (que carrega a 8338) DUAS vezes,
 #      com ON_ERROR_STOP=1; o hash das linhas antigas não muda, a coluna nasce nula.
 #   2. CATÁLOGO: scripts/d9-conferir-catalogo.sql (somente leitura) passa nesse banco e no instalado do zero.
 #   2b. CURA DA v3 (v4, D9v3-1): um banco que recebeu a D9 v3 (coluna `external_id` SEM a collation "C") com
@@ -133,7 +133,7 @@ nulas=$(psql_t "$PG_VELHO" <<<'select count(*) from public.crm_tasks where exter
 psql_de "$PG_VELHO" < "$ROOT/scripts/d9-conferir-catalogo.sql" >/dev/null
 echo "    ✓ hash das linhas antigas idêntico; external_id nulo em todas; catálogo confere"
 # A migration sozinha, de novo, sobre o banco já migrado e com dados (é o que o `supabase db push` faria).
-mig=$(ls "$ROOT"/supabase/migrations/*_9338_tarefas_chave_externa_unica.sql)
+mig=$(ls "$ROOT"/supabase/migrations/*_8338_tarefas_chave_externa_unica.sql)
 psql_de "$PG_VELHO" < "$mig" >/dev/null
 psql_de "$PG_VELHO" < "$mig" >/dev/null
 psql_de "$PG_VELHO" < "$ROOT/scripts/d9-conferir-catalogo.sql" >/dev/null

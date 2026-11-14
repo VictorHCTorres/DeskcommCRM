@@ -60713,7 +60713,7 @@ alter table public.crm_lead_attachments enable row level security;
 -- arquivo é um segmento só (sem barra e sem começar por ponto), e a chave do
 -- campo segue a régua do funil (`customFieldSchema.key`). O `case` fixa a
 -- ordem: a chave é conferida antes de entrar na expressão regular.
--- A constraint final é declarada uma única vez no bloco ClickUp (9097), que
+-- A constraint final é declarada uma única vez no bloco ClickUp (8097), que
 -- preserva esta forma manual e acrescenta o caminho determinístico importado.
 
 -- Depois de gravado, o caminho não muda (nenhuma rota o altera).
@@ -71078,7 +71078,7 @@ alter table public.attendant_sectors
 comment on column public.attendant_sectors.color is
   'Cor de identificação da fila (migration 9084): #rrggbb, ou NULL = sem cor. O CHECK guarda a FORMA; a paleta é a da tela (PALETA_DE_ETIQUETAS) e não se valida no banco. Lida por GET /api/v1/attendants/sectors e gravada por PATCH /api/v1/attendants/sectors/[id] (manager+).';
 
--- ---- hierarquia Área > Grupo > Funil (migration 9094) ----
+-- ---- hierarquia Área > Grupo > Funil (migration 8094) ----
 -- manifest: Organiza funis em Áreas e Grupos sem mover nem apagar negócios; vínculos compostos garantem que toda relação permaneça dentro da organização.
 
 create table if not exists public.crm_pipeline_groups (
@@ -71167,7 +71167,7 @@ comment on table public.crm_pipeline_groups is
 comment on column public.crm_pipelines.group_id is
   'Grupo visual do funil; NULL mantém o funil em Sem grupo. Arquivar o grupo preserva o vínculo e todos os negócios.';
 
--- ---- visualizações salvas de funil (migration 9099) ----
+-- ---- visualizações salvas de funil (migration 8099) ----
 create unique index if not exists crm_pipelines_org_id_uidx
   on public.crm_pipelines (organization_id, id);
 create table if not exists public.crm_pipeline_views (
@@ -71258,7 +71258,7 @@ create trigger trg_crm_pipeline_views_updated_at before update on public.crm_pip
 comment on table public.crm_pipeline_views is
   'Visualizações salvas de um funil. JSON é contrato versionado e canonicalizado na aplicação; nunca contém SQL ou âncora temporal.';
 
--- ---- envelope de subtarefas e recorrência (migration 9093) ----
+-- ---- envelope de subtarefas e recorrência (migration 8093) ----
 create unique index if not exists crm_tasks_org_id_uidx on public.crm_tasks (organization_id, id);
 create unique index if not exists crm_leads_org_id_uidx on public.crm_leads (organization_id, id);
 create unique index if not exists contacts_org_id_uidx on public.contacts (organization_id, id);
@@ -71586,7 +71586,7 @@ create trigger trg_preparar_purge_tarefas_da_organizacao before delete on public
 do $f$ begin perform public.fn_aplicar_travas_de_suporte(); end $f$;
 
 -- Self-heal da W1: leitura continua aceitando platform support, mas mutações
--- exigem scope full. Mantido aqui para upgrades que já aplicaram a 9094.
+-- exigem scope full. Mantido aqui para upgrades que já aplicaram a 8094.
 drop policy if exists crm_pipeline_groups_manager_insert on public.crm_pipeline_groups;
 create policy crm_pipeline_groups_manager_insert on public.crm_pipeline_groups
   for insert with check (
@@ -73296,7 +73296,7 @@ grant execute on function public.fn_mark_clickup_import_item_result(uuid,uuid,uu
 
 notify pgrst, 'reload schema';
 
--- ---- sidecar seguro e anexos binários ClickUp (migration 9097) ----
+-- ---- sidecar seguro e anexos binários ClickUp (migration 8097) ----
 -- manifest: Adiciona sidecar seguro e idempotente para anexos ClickUp, com quarantine privada, leases, receipts e destinos tenant-safe em leads, tarefas e conhecimento.
 
 insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
@@ -73318,7 +73318,7 @@ on conflict (id) do update set public=false,file_size_limit=excluded.file_size_l
 -- entra em source_payload: ele fica no bucket privado e é referenciado por upload_id.
 alter table public.clickup_import_items
   drop constraint if exists clickup_import_items_entity_type_check;
--- A versão final, incluindo `task_relation`, vive no bloco 9098. Não
+-- A versão final, incluindo `task_relation`, vive no bloco 8098. Não
 -- reconstruir aqui um vocabulário intermediário durante update sobre acervo.
 
 alter table public.clickup_object_mappings
@@ -74587,7 +74587,7 @@ revoke execute on function public.fn_claim_clickup_asset(uuid,integer)
 revoke execute on function public.fn_stage_clickup_asset_sidecar(uuid,uuid,uuid,jsonb)
   from public, anon, authenticated;
 
--- ---- prévia ClickUp em lotes (migration 9102) ----
+-- ---- prévia ClickUp em lotes (migration 8102) ----
 create or replace function public.fn_expurgar_clickup_preview_staging(p_limite integer default 25)
 returns integer language plpgsql security definer set search_path = public, pg_temp as $$
 declare removed_count integer;
@@ -74805,7 +74805,7 @@ comment on table public.clickup_asset_uploads is
 
 notify pgrst, 'reload schema';
 
--- ---- fidelidade e relacoes ClickUp (migration 9098) ----
+-- ---- fidelidade e relacoes ClickUp (migration 8098) ----
 -- manifest: Preserva fidelidade operacional do ClickUp em tarefas e negócios e importa relações canônicas tenant-safe sem inferir dados ausentes.
 
 alter table public.crm_tasks
@@ -75055,7 +75055,7 @@ grant execute on function public.fn_stage_clickup_import_preview(
   uuid, uuid, text, text, text, integer, text, text, uuid, jsonb
 ) to service_role;
 
--- Espelho da cerca explícita da migration 9100. CREATE OR REPLACE preserva ACLs,
+-- Espelho da cerca explícita da migration 8100. CREATE OR REPLACE preserva ACLs,
 -- mas estas revogações deixam instalação nova e atualização com a mesma prova.
 revoke execute on function public.fn_execute_clickup_import_run(uuid,uuid,integer,text,text,boolean)
   from public, anon, authenticated;
@@ -75070,7 +75070,7 @@ revoke execute on function public.fn_stage_clickup_asset_sidecar(uuid,uuid,uuid,
 revoke execute on function public.fn_commit_clickup_asset(uuid,uuid,uuid,text,uuid,uuid,text,bigint,text)
   from public, anon, authenticated;
 
--- Referência viva cancela somente a fila de retenção sem pedido LGPD (9101).
+-- Referência viva cancela somente a fila de retenção sem pedido LGPD (8101).
 create or replace function public.fn_cancel_clickup_asset_delete_on_insert()
 returns trigger
 language plpgsql
@@ -75111,9 +75111,9 @@ create trigger trg_clickup_knowledge_attachment_revive
   after insert on public.ai_knowledge_source_attachments for each row
   execute function public.fn_cancel_clickup_asset_delete_on_insert();
 
--- ---- chave externa única da tarefa (migration 9338) ----
+-- ---- chave externa única da tarefa (migration 8338) ----
 -- manifest: `crm_tasks.external_id` — chave externa única por organização, para que quem grava tarefa por token (robôs do n8n, importador) não crie a mesma tarefa em dobro (D9).
--- 9338: coluna nula (text COLLATE "C") + constraint de forma + índice único parcial `crm_tasks_org_external_id_unique` + trava de quem escreve a chave.
+-- 8338: coluna nula (text COLLATE "C") + constraint de forma + índice único parcial `crm_tasks_org_external_id_unique` + trava de quem escreve a chave.
 --
 -- ─── Por que o banco, e não a rota
 --

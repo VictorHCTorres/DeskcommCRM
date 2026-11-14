@@ -7,7 +7,7 @@
 do $f$ begin perform public.fn_aplicar_travas_de_suporte(); end $f$;
 
 -- Self-heal da W1: leitura continua aceitando platform support, mas mutações
--- exigem scope full. Mantido aqui para upgrades que já aplicaram a 9094.
+-- exigem scope full. Mantido aqui para upgrades que já aplicaram a 8094.
 drop policy if exists crm_pipeline_groups_manager_insert on public.crm_pipeline_groups;
 create policy crm_pipeline_groups_manager_insert on public.crm_pipeline_groups
   for insert with check (

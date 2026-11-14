@@ -10,7 +10,7 @@ import { REGEX_DA_CHAVE } from "../../lib/tarefas/chave-externa";
 import { GOV_ORG, seedGov, sql } from "./gov-helpers";
 
 /**
- * A CHAVE EXTERNA DA TAREFA (D9, migration 9338) — NO BANCO DE VERDADE, COM O BASELINE INTEIRO.
+ * A CHAVE EXTERNA DA TAREFA (D9, migration 8338) — NO BANCO DE VERDADE, COM O BASELINE INTEIRO.
  *
  * O que as provas de unidade das rotas (`app/api/v1/tasks/route.chave-externa.test.ts`) NÃO
  * medem, porque lá o banco é falso: o índice único, a constraint de forma (a mesma regra do zod,
@@ -74,7 +74,7 @@ function um(query: string): string {
   return out.split("\n").pop() ?? "";
 }
 
-describe("catálogo: o que a migração 9338 tem de ter deixado", () => {
+describe("catálogo: o que a migração 8338 tem de ter deixado", () => {
   it("coluna, constraint validada, índice único parcial válido e o gatilho", () => {
     expect(
       um(`select data_type from information_schema.columns
@@ -412,7 +412,7 @@ describe("o conferidor de catálogo (scripts/d9-conferir-catalogo.sql): positivo
 
   it("positivo: reaplicar a migration sobre o banco migrado e conferir de novo passa", () => {
     const mig = readFileSync(
-      join(__dirname, "../../supabase/migrations/20261111175431_9338_tarefas_chave_externa_unica.sql"),
+      join(__dirname, "../../supabase/migrations/20261111175431_8338_tarefas_chave_externa_unica.sql"),
       "utf8",
     );
     expect(erroDe(`${mig}\n${mig}\n${conferidor}`)).toBeNull();
@@ -518,7 +518,7 @@ describe("o conferidor de catálogo (scripts/d9-conferir-catalogo.sql): positivo
 describe("D9v3-1: a coluna é `text COLLATE \"C\"` e o conferidor exige isso (collation efetiva da coluna E do índice)", () => {
   const conferidor = readFileSync(join(__dirname, "../../scripts/d9-conferir-catalogo.sql"), "utf8");
   const migracao = readFileSync(
-    join(__dirname, "../../supabase/migrations/20261111175431_9338_tarefas_chave_externa_unica.sql"),
+    join(__dirname, "../../supabase/migrations/20261111175431_8338_tarefas_chave_externa_unica.sql"),
     "utf8",
   );
   const ESPERADA = `check (external_id is null or (char_length(external_id) between 1 and 200
@@ -722,11 +722,11 @@ describe("concorrência real: várias conexões, a mesma chave", () => {
 });
 
 describe("tabela com dados e reaplicação (a migração é re-aplicável e não mexe nas linhas)", () => {
-  it("reaplicar 9338 com tarefas (com e sem chave) não muda uma linha nem o catálogo", () => {
+  it("reaplicar 8338 com tarefas (com e sem chave) não muda uma linha nem o catálogo", () => {
     const migracao = readFileSync(
       join(
         __dirname,
-        "../../supabase/migrations/20261111175431_9338_tarefas_chave_externa_unica.sql",
+        "../../supabase/migrations/20261111175431_8338_tarefas_chave_externa_unica.sql",
       ),
       "utf8",
     );
