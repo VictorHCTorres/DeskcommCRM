@@ -69,7 +69,7 @@ import {
   novaSaidaDoAgente,
 } from '../pacing/saida-do-agente';
 import { haRespostaRetidaAntes } from '../pacing/resposta-retida';
-import { FRASE_DA_TRAVA_DO_CHIP, travaDoChipPorPg } from '@/lib/campanhas/chip-de-prospeccao';
+import { FRASE_DA_TRAVA_DO_CHIP, type TravaDoChip, travaDoChipPorPg } from '@/lib/campanhas/chip-de-prospeccao';
 import { decideSpinning } from '../spinning/engine';
 import type { RecentCopy } from '../spinning/engine';
 import { loadRecentCopies, loadSpinningKnobs, recordCopy } from '../spinning/store';
@@ -2052,27 +2052,60 @@ export async function runBeforeSend(args: RunBeforeSendArgs): Promise<BeforeSend
         args.relogio && capabilitiesOf(provider).banRisk && pacingCfg.knobs.throttleMs > 0
           ? ATRASO_MAXIMO_DA_SAIDA_DO_AGENTE_MS
           : 0;
-      const linha = await recordSend(
-        client,
-        args.tenantId,
-        args.channelSessionId,
-        new Date(instanteDaSaida.getTime() + folgaDaSaida),
-        { resposta: tipoDeEnvio(args.resposta) === 'resposta' },
-      );
-      // Simetria com o gate desarmado: quem não é julgado pela janela não entra
-      // nela. Ver `GateContext.spinningEnforced`.
-      const copia =
-        args.enforceSpinning !== false
-          ? await recordCopy(client, args.tenantId, args.channelSessionId, ctx.body, args.now)
+      // ═══ O NÚMERO DE PROSPECÇÃO, DE NOVO, NA HORA DA SAÍDA (Linha A, v20; achado C/R2-01 da revisão) ═══
+      //
+      // A trava do número foi conferida na entrada, antes da pausa humana, da fila desta trava e da espera do
+      // intervalo: conferido às 17h59m50s, com 50 s de espera, o disparo saía às 18h00m40s. A campanha e o resgate
+      // reconferem a hora no último passo; aqui é o último ponto do disparo do agente antes de a saída entrar no
+      // limite do número. A hora conferida é a mais tardia em que a mensagem chega ao provedor (o instante mais a
+      // folga, que `conferirSaidaDoAgente` cobra antes do transporte). Fechou a janela, virou feriado ou a pessoa
+      // mudou: veto, nada é registrado e nada sai; pela hora, `outside_window` com a próxima abertura.
+      const vetoNaSaida =
+        tipoDeEnvio(args.resposta) === 'disparo'
+          ? vetoDaTravaDoChip(
+              await travaDoChipPorPg(
+                client,
+                { organizationId: args.tenantId, channelSessionId: args.channelSessionId, contactId: args.leadId },
+                new Date(instanteDaSaida.getTime() + folgaDaSaida),
+              ),
+            )
           : null;
-      await client.query('commit');
-      transacaoFechada = true;
-      decisao = {
-        tipo: 'envio',
-        trace,
-        corpo: ctx.body,
-        registro: { linha, copia, instante: instanteDaSaida, folgaMs: folgaDaSaida },
-      };
+      if (vetoNaSaida !== null) {
+        trace.push({ gate: 'chip_de_prospeccao', verdict: 'veto', code: vetoNaSaida.motivo });
+        args.log.info('envio automático barrado no número de prospecção depois da espera do intervalo', {
+          organization_id: args.tenantId,
+          channel_session_id: args.channelSessionId,
+          motivo: vetoNaSaida.motivo,
+          ...(vetoNaSaida.veto.nextAllowedAt ? { proxima_abertura: vetoNaSaida.veto.nextAllowedAt.toISOString() } : {}),
+        });
+        vetoDaCadeia = vetoNaSaida.veto;
+        // Nada foi escrito na tx: rollback fecha a transação e solta o lock. O envio NÃO acontece.
+        await client.query('rollback');
+        transacaoFechada = true;
+        decisao = { tipo: 'veto', trace, veto: vetoNaSaida.veto };
+      } else {
+        const linha = await recordSend(
+          client,
+          args.tenantId,
+          args.channelSessionId,
+          new Date(instanteDaSaida.getTime() + folgaDaSaida),
+          { resposta: tipoDeEnvio(args.resposta) === 'resposta' },
+        );
+        // Simetria com o gate desarmado: quem não é julgado pela janela não entra
+        // nela. Ver `GateContext.spinningEnforced`.
+        const copia =
+          args.enforceSpinning !== false
+            ? await recordCopy(client, args.tenantId, args.channelSessionId, ctx.body, args.now)
+            : null;
+        await client.query('commit');
+        transacaoFechada = true;
+        decisao = {
+          tipo: 'envio',
+          trace,
+          corpo: ctx.body,
+          registro: { linha, copia, instante: instanteDaSaida, folgaMs: folgaDaSaida },
+        };
+      }
     }
   } catch (err) {
     erroNaTransacao = err instanceof Error ? err : new Error(String(err));
@@ -2100,6 +2133,23 @@ export async function runBeforeSend(args: RunBeforeSendArgs): Promise<BeforeSend
   }
   if (decisao.tipo === 'veto') return registrarVeto(args, decisao.trace, decisao.veto);
   return enviarComORegistroConfirmado(args, decisao);
+}
+
+/** A recusa da trava do número de prospecção como veto da cadeia; `null` = pode sair. Pela hora, `outside_window`. */
+function vetoDaTravaDoChip(
+  trava: TravaDoChip | null,
+): { motivo: TravaDoChip['motivo']; veto: VetoDaCadeia } | null {
+  if (trava === null) return null;
+  const deHora = trava.motivo === 'fora_da_janela_de_prospeccao' || trava.motivo === 'feriado_nacional';
+  return {
+    motivo: trava.motivo,
+    veto: {
+      gate: 'chip_de_prospeccao',
+      code: deHora ? 'outside_window' : `chip_de_prospeccao:${trava.motivo}`,
+      message: FRASE_DA_TRAVA_DO_CHIP[trava.motivo],
+      ...(deHora && trava.proximaAbertura ? { nextAllowedAt: trava.proximaAbertura } : {}),
+    },
+  };
 }
 
 /** A fatia da espera do intervalo enquanto a última linha do número está no futuro (`esperarOIntervalo`). */
