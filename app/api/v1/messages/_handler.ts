@@ -1,5 +1,6 @@
+import { FRASE_DA_TRAVA_DO_CHIP, travaDoChipPorSupabase } from "@/lib/campanhas/chip-de-prospeccao";
 import { assertProspectingDelivery } from "@/lib/prospecting/guard";
-import { assertCampaignDelivery, assertCampaignSlot, entregaPeloAtor, VetoDaCampanhaError } from "@/lib/campanhas/entrega";
+import { assertCampaignDelivery, assertCampaignSlot, ehEnvioDaCampanha, entregaPeloAtor, VetoDaCampanhaError } from "@/lib/campanhas/entrega";
 import {
   MARCA_DE_RESPOSTA_RETIDA,
   MOTIVO_DA_SAIDA_ATRAS_DE_RETIDA,
@@ -628,6 +629,40 @@ export async function sendMessageHandler(
       ctx.requestId,
       traduzir("Contato marcado como pessoal.", ctx.idioma ?? "pt-BR"),
     );
+  }
+
+  // ─── O número de prospecção (Linha A, v20) ─────────────────────────────────
+  //
+  // Num número de campanha de prospecção, o envio automático que não é a própria campanha nem a resposta do agente a
+  // quem escreveu passa pelas travas da prospecção: janela de disparo e dias do número, feriado nacional, e a pessoa
+  // (SAIR, etiqueta de parada, atendimento humano, recusa de marketing, lista de exclusão). A cadeia do agente já as
+  // aplica no disparo dela (`runBeforeSend`); aqui ficam a automação, a integração por token e o agente externo (MCP),
+  // que não passam pela cadeia, e a pessoa outra vez para o disparo do agente. Pessoa digitando no Inbox não passa:
+  // é escolha humana. `lib/campanhas/chip-de-prospeccao.ts`.
+  if (ctx.actor.type !== "user" && !ctx.onBehalfOf && !ctx.campaignDelivery && !ctx.prospectingDelivery && !ehEnvioDaCampanha(ctx.actor) && c.contact_id && c.channel_session_id) {
+    const saida = saidaDoAgenteNoEscopo();
+    const doMotor = ctx.actor.type === "ai_agent" && !ctx.actor.api_token_id;
+    // O motor: a resposta a quem escreveu não passa; o disparo dele já teve a hora conferida na cadeia.
+    const conferir = !doMotor || (saida?.ordem != null && saida.ordem.resposta !== true);
+    if (conferir) {
+      const travaDoChip = await travaDoChipPorSupabase(
+        supabase,
+        { organizationId: ctx.organization_id, channelSessionId: c.channel_session_id, contactId: c.contact_id },
+        saida ? saida.relogio() : new Date(),
+        { hora: !doMotor },
+      );
+      if (travaDoChip) {
+        const deHora =
+          travaDoChip.motivo === "fora_da_janela_de_prospeccao" || travaDoChip.motivo === "feriado_nacional";
+        throw new ApiError(
+          deHora || travaDoChip.motivo === "sem_leitura" ? 409 : 403,
+          deHora || travaDoChip.motivo === "sem_leitura" ? "retry_later" : "forbidden",
+          { motivo: travaDoChip.motivo, ...(travaDoChip.proximaAbertura ? { proxima_abertura: travaDoChip.proximaAbertura.toISOString() } : {}) },
+          ctx.requestId,
+          FRASE_DA_TRAVA_DO_CHIP[travaDoChip.motivo],
+        );
+      }
+    }
   }
 
   // ─── De quem é o número desta conversa (#3642) ─────────────────────────────

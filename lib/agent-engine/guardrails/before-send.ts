@@ -69,6 +69,7 @@ import {
   novaSaidaDoAgente,
 } from '../pacing/saida-do-agente';
 import { haRespostaRetidaAntes } from '../pacing/resposta-retida';
+import { FRASE_DA_TRAVA_DO_CHIP, travaDoChipPorPg } from '@/lib/campanhas/chip-de-prospeccao';
 import { decideSpinning } from '../spinning/engine';
 import type { RecentCopy } from '../spinning/engine';
 import { loadRecentCopies, loadSpinningKnobs, recordCopy } from '../spinning/store';
@@ -1722,6 +1723,41 @@ async function resolverRestricaoComercial(args: RunBeforeSendArgs, body: string)
 
 export async function runBeforeSend(args: RunBeforeSendArgs): Promise<BeforeSendResult> {
   const gates = args.gates ?? BEFORE_SEND_GATES;
+  // ═══ O NÚMERO DE PROSPECÇÃO (Linha A, v20) ═══
+  //
+  // O envio que NÃO responde a quem escreveu (o retorno que o agente marcou, o follow-up, a retomada, o aviso de
+  // disparo, a entrega do Meet) num número de campanha de prospecção passa pelas travas da prospecção: a janela de
+  // disparo e os dias do número, o feriado nacional e a pessoa (SAIR, etiqueta de parada, atendimento humano, recusa,
+  // lista de exclusão). Antes do lock e de qualquer chamada de modelo: a recusa não custa conexão nem token. Fora da
+  // hora, o veto é `outside_window` com a próxima abertura, que quem chama já sabe adiar; da pessoa, é veto e não sai.
+  // A resposta segue as regras dela. `lib/campanhas/chip-de-prospeccao.ts`.
+  if (tipoDeEnvio(args.resposta) === 'disparo') {
+    const travaDoChip = await travaDoChipPorPg(
+      args.pool,
+      { organizationId: args.tenantId, channelSessionId: args.channelSessionId, contactId: args.leadId },
+      args.relogio ? args.relogio() : new Date(),
+    );
+    if (travaDoChip) {
+      const deHora =
+        travaDoChip.motivo === 'fora_da_janela_de_prospeccao' || travaDoChip.motivo === 'feriado_nacional';
+      const code = deHora ? 'outside_window' : `chip_de_prospeccao:${travaDoChip.motivo}`;
+      const trace: GateTraceEntry[] = [{ gate: 'chip_de_prospeccao', verdict: 'veto', code: travaDoChip.motivo }];
+      args.log.info('envio automático barrado no número de prospecção', {
+        organization_id: args.tenantId,
+        channel_session_id: args.channelSessionId,
+        motivo: travaDoChip.motivo,
+        ...(travaDoChip.proximaAbertura ? { proxima_abertura: travaDoChip.proximaAbertura.toISOString() } : {}),
+      });
+      return {
+        status: 'vetoed',
+        gate: 'chip_de_prospeccao',
+        code,
+        message: FRASE_DA_TRAVA_DO_CHIP[travaDoChip.motivo],
+        ...(deHora && travaDoChip.proximaAbertura ? { nextAllowedAt: travaDoChip.proximaAbertura } : {}),
+        trace,
+      };
+    }
+  }
   // ANTES de tomar conexão, de propósito: preferência de estilo não precisa do
   // lock, e uma consulta que falha DENTRO da transação a deixa abortada — a
   // próxima morreria com 25P02, longe daqui e com outro nome. Aqui, uma falha

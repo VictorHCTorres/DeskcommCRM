@@ -65,6 +65,10 @@ export interface OpcoesDoDubleDoHandler {
    */
   politicasDeNumero?: LinhaDoDuble[];
   responsaveisDeNumero?: LinhaDoDuble[];
+  /** Linha A, v20: as campanhas do número (`campaigns`), para o handler saber se ele é de prospecção. */
+  campanhasDoNumero?: LinhaDoDuble[];
+  /** Linha A, v20: a linha de `channel_knobs` do número (`null` = os padrões). */
+  knobsDoNumero?: LinhaDoDuble | null;
   /**
    * As sessões que a guarda do envio lê por lista (`.in("id", ...)`) para saber
    * se quem envia tem número próprio CONECTADO do mesmo canal (doc 237, 1-B).
@@ -624,6 +628,35 @@ export function criarDubleDoHandler(
               data: linhas.filter(casa),
               error: null,
             }).then(ok, erro),
+        };
+        return cadeia;
+      }
+
+      if (tabela === "channel_knobs") {
+        // Linha A, v20: a janela do número de prospecção. Sem linha: os padrões do pacing.
+        const cadeia = {
+          select: () => cadeia,
+          eq: () => cadeia,
+          maybeSingle: async () => ({ data: opcoes.knobsDoNumero ?? null, error: null }),
+        };
+        return cadeia;
+      }
+
+      if (tabela === "campaigns" || tabela === "campaign_channel_sessions") {
+        // Linha A, v20: o handler pergunta se o número é de prospecção (`chip-de-prospeccao.ts`). Vazias por
+        // padrão: nenhum número é de prospecção, e o envio segue como antes.
+        const linhas = tabela === "campaigns" ? opcoes.campanhasDoNumero ?? [] : [];
+        const filtros: Array<[string, unknown]> = [];
+        const listas: Array<[string, unknown[]]> = [];
+        const casa = (l: LinhaDoDuble) =>
+          filtros.every(([c, v]) => l[c] === v) && listas.every(([c, vs]) => vs.includes(l[c]));
+        const cadeia = {
+          select: () => cadeia,
+          eq: (coluna: string, valor: unknown) => (filtros.push([coluna, valor]), cadeia),
+          in: (coluna: string, valores: unknown[]) => (listas.push([coluna, valores]), cadeia),
+          maybeSingle: async () => ({ data: linhas.find(casa) ?? null, error: null }),
+          then: (ok: (v: unknown) => unknown, erro?: (e: unknown) => unknown) =>
+            Promise.resolve({ data: linhas.filter(casa), error: null }).then(ok, erro),
         };
         return cadeia;
       }

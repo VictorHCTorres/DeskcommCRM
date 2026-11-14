@@ -80,6 +80,17 @@ export function assertCampaignSlot(slot: CampaignSlot): void {
 
 /** O ator que a rodada dá ao envio de campanha. O envio de teste da tela usa `campaign-test:` e não é envio a lead. */
 const ATOR_DA_RODADA = "campaign:";
+/** O ator do envio de TESTE da campanha (para o próprio operador, nunca a um lead). */
+const ATOR_DO_TESTE_DA_CAMPANHA = "campaign-test:";
+
+/**
+ * O envio é da própria campanha (a rodada, ou o teste dela)? O ator vem do runtime (`HandlerCtx`), nunca do corpo.
+ * A trava do número de prospecção (`chip-de-prospeccao.ts`) não se aplica a ele: a campanha tem as travas dela.
+ */
+export function ehEnvioDaCampanha(actor: { type: string; id?: string | null }): boolean {
+  const ator = actor.type === "webhook_source" ? (actor.id ?? "") : "";
+  return ator.startsWith(ATOR_DA_RODADA) || ator.startsWith(ATOR_DO_TESTE_DA_CAMPANHA);
+}
 
 /**
  * A entrega montada pelo ATOR, quando o envio de campanha chega ao handler sem ela (F4i, H06/H07 do cxj). A rodada

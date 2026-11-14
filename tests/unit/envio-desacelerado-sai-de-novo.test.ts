@@ -196,7 +196,12 @@ describe("o envio grava `queued` e PEDE a nova tentativa", () => {
       "fetch",
       vi.fn(async () => resposta(429, { error: "Rate limited", code: "rate_limited" }, { "retry-after": "120" })),
     );
-    const { supabase, capturas } = criarDubleDoHandler({ conversation: conversa() });
+    // A campanha de consentimento da rodada: desde a trava da prospecção (v19, `entregaPeloAtor`), o handler lê a
+    // base legal da campanha do ator; a de consentimento segue como antes.
+    const { supabase, capturas } = criarDubleDoHandler({
+      conversation: conversa(),
+      campanhasDoNumero: [{ id: "c-1", organization_id: ORG, base_legal: "consent", status: "running" }],
+    });
     const ctx: HandlerCtx = {
       organization_id: ORG,
       actor: { type: "webhook_source", id: "campaign:c-1" },

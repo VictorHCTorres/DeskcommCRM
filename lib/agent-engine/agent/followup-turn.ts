@@ -1,3 +1,4 @@
+import { travaDoChipPorPg } from '@/lib/campanhas/chip-de-prospeccao';
 import {claimOfJob,type JobClaim} from "../queue/claim";
 import {resultadoDoEnvioDoFollowup} from "../edge/crm/send-ledger";
 import { parseServiceBoundary } from "@/lib/atendimento/fronteira";
@@ -1535,8 +1536,15 @@ async function aberturaDaJanelaDeDisparo(
   log: Parameters<typeof loadChannelKnobs>[3],
 ): Promise<Date | null> {
   const { knobs } = await loadChannelKnobs(pool, target.tenantId, target.channelSessionId, log);
-  if (janelaDeEnvioAberta(agora, knobs, false)) return null;
-  return proximaAberturaDaJanela(agora, knobs, false);
+  if (!janelaDeEnvioAberta(agora, knobs, false)) return proximaAberturaDaJanela(agora, knobs, false);
+  // O número de prospecção (Linha A, v20): também os dias da prospecção e o feriado nacional, antes de gastar o
+  // turno da IA. A pessoa fica com a cadeia (`runBeforeSend`), que veta o disparo; aqui só a hora adia.
+  const travaDoChip = await travaDoChipPorPg(
+    pool,
+    { organizationId: target.tenantId, channelSessionId: target.channelSessionId, contactId: target.leadId },
+    agora,
+  );
+  return travaDoChip?.proximaAbertura ?? null;
 }
 
 /**

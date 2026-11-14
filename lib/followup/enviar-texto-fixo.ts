@@ -17,6 +17,7 @@ import { createSupabaseAdminClient, type FollowupJobRequest } from "@/lib/follow
 import { canalDaConversa, decidirAdiamentoPorJanela } from "@/lib/followup/janela-de-disparo";
 import { liberaEnvioComODonoViaSupabase } from "@/lib/followup/envio-com-o-dono";
 import { criarPacingDoCanal } from "@/lib/agent-engine/pacing/ledger-supabase";
+import { travaDoChipPorSupabase } from "@/lib/campanhas/chip-de-prospeccao";
 import { adiamentoPorRitmo } from "@/lib/followup/ritmo-do-texto-fixo";
 import type { EnrollmentRow } from "@/lib/followup/node-handlers";
 import { completeTurnForEnrollment, type TurnBridgeAdminClient } from "@/lib/followup/turn-bridge";
@@ -325,6 +326,45 @@ export async function enviarTextoFixoPendente(
             retryAt: ritmo.until.toISOString(),
             hold: true,
           });
+          continue;
+        }
+      }
+
+      // O NÚMERO DE PROSPECÇÃO (Linha A, v20): o texto fixo de fluxo é disparo, e no número de uma campanha de
+      // prospecção passa pelas travas dela — a janela e os dias da prospecção, o feriado nacional e a pessoa
+      // (`lib/campanhas/chip-de-prospeccao.ts`). Fora da hora, ADIA para a próxima abertura que não é feriado, como as
+      // janelas acima; pela pessoa (SAIR, etiqueta de parada, atendimento humano, recusa, lista de exclusão), PULA com o
+      // motivo. Sem conseguir conferir, adia 15 min. O handler confere de novo antes do provedor.
+      if (sessaoDoRitmo !== null) {
+        const travaDoChip = await travaDoChipPorSupabase(
+          admin,
+          { organizationId: job.organization_id as string, channelSessionId: sessaoDoRitmo, contactId },
+          new Date(),
+        );
+        if (travaDoChip !== null && travaDoChip.motivo !== "sem_leitura" && !travaDoChip.proximaAbertura) {
+          const motivo = `chip_de_prospeccao:${travaDoChip.motivo}`;
+          logger.info("[followup] texto fixo pulado — número de prospecção", {
+            organization_id: job.organization_id,
+            conversation_id: conversationId,
+            enrollment_id: enrollmentId,
+            motivo,
+          });
+          await completeTurnForEnrollment(ponte, job.organization_id, enrollmentId, nodeId, { kind: "skipped", reason: motivo }, undefined, job.id, jobClaim);
+          await settle(job.organization_id, job.id, jobClaim.acquired_at, true, motivo);
+          continue;
+        }
+        if (travaDoChip !== null) {
+          const ate = travaDoChip.proximaAbertura ?? new Date(Date.now() + 15 * 60_000);
+          const motivo = `chip_de_prospeccao:${travaDoChip.motivo}`;
+          logger.info("[followup] texto fixo adiado — número de prospecção", {
+            organization_id: job.organization_id,
+            conversation_id: conversationId,
+            enrollment_id: enrollmentId,
+            motivo,
+            next_run_at: ate.toISOString(),
+          });
+          await completeTurnForEnrollment(ponte, job.organization_id, enrollmentId, nodeId, { kind: "deferred", until: ate, reason: motivo }, undefined, job.id, jobClaim);
+          await settle(job.organization_id, job.id, jobClaim.acquired_at, false, undefined, { retryAt: ate.toISOString(), hold: true });
           continue;
         }
       }
