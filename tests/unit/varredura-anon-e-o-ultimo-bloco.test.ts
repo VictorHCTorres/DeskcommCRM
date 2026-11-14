@@ -43,6 +43,24 @@
  *
  * Apêndice novo entra ANTES do bloco da varredura. Nenhuma função é criada
  * depois dele, e nenhum `grant` devolve `anon` depois dele.
+ *
+ * ## No fork (canal da Suindara): duas varreduras
+ *
+ * O baseline do fork tem DUAS cópias do bloco. A primeira fica onde o upstream a
+ * mantém (logo depois do último apêndice de função dele — testes do upstream
+ * fatiam o arquivo "do meu bloco até a VARREDURA" e dependem disso), com o
+ * cabeçalho dele, `-- ---- VARREDURA anon:`. A segunda fecha o apêndice próprio
+ * do fork, que NÃO pode subir para antes da primeira: os blocos do fork dependem
+ * do miolo que vem depois dela (0237…9084 — o gatilho de subtarefa lê
+ * `crm_tasks.demanda_id`, que nasce na 0659). Ela tem cabeçalho PRÓPRIO,
+ * `-- ---- VARREDURA anon do fork`, para os testes do upstream que ancoram em
+ * "VARREDURA anon:" seguirem achando uma só (a cerca
+ * `sonda-do-baseline-ancora-na-ultima-definicao` reprova âncora em texto repetido).
+ *
+ * A régua de função passa a ser medida na varredura que roda POR ÚLTIMO (é ela
+ * que cura tudo o que veio antes); a de `grant … to anon` continua na PRIMEIRA,
+ * que é a régua mais estrita — a varredura só cura EXECUTE de definer, não
+ * desfaz grant de tabela. E as duas cópias têm de rodar o MESMO código.
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -51,8 +69,11 @@ import { describe, expect, it } from "vitest";
 
 const BASELINE = join(process.cwd(), "supabase", "baseline.sql");
 
-/** O cabeçalho do bloco da 0116, no apêndice. */
-const MARCADOR = /^-- ---- VARREDURA anon:/m;
+/** O cabeçalho do bloco da 0116, no apêndice — a cópia do upstream. */
+const MARCADOR = /^-- ---- VARREDURA anon:/gm;
+
+/** A cópia do fork, que fecha o apêndice próprio (cabeçalho distinto de propósito — ver acima). */
+const MARCADOR_DO_FORK = /^-- ---- VARREDURA anon do fork/gm;
 
 /**
  * Criação de função ancorada em INÍCIO DE LINHA, e não em qualquer ocorrência do
@@ -65,8 +86,37 @@ const CRIA_FUNCAO = /^[ \t]*create[ \t]+(?:or[ \t]+replace[ \t]+)?function/gim;
 /** Devolve `anon` a algo — o outro jeito de desfazer a varredura por baixo. */
 const GRANT_PARA_ANON = /^[ \t]*grant[ \t][^;]*\bto\b[^;]*\banon\b/gim;
 
+/** Todas as cópias, das duas marcas, em ordem de arquivo. */
+function posicoesDaVarredura(sql: string): number[] {
+  return [...sql.matchAll(MARCADOR), ...sql.matchAll(MARCADOR_DO_FORK)]
+    .map((m) => m.index)
+    .sort((a, b) => a - b);
+}
+
+/** A ÚLTIMA varredura: é ela que precisa ver toda função criada. */
 function posicaoDaVarredura(sql: string): number {
-  return MARCADOR.exec(sql)?.index ?? -1;
+  const todas = posicoesDaVarredura(sql);
+  return todas.length > 0 ? todas[todas.length - 1]! : -1;
+}
+
+/** A PRIMEIRA varredura: depois dela, nenhum grant devolve `anon`. */
+function posicaoDaPrimeiraVarredura(sql: string): number {
+  return posicoesDaVarredura(sql)[0] ?? -1;
+}
+
+/**
+ * O CÓDIGO de um bloco de varredura — do cabeçalho até o próximo cabeçalho de
+ * bloco (`-- ---- `) ou o fim do arquivo —, sem comentário nem linha em branco.
+ * Comparar código, e não texto, deixa as cópias terem prosa diferente.
+ */
+function codigoDaVarredura(sql: string, inicio: number): string {
+  const resto = sql.slice(inicio);
+  const proximo = resto.slice(1).search(/^-- ---- /m);
+  const bloco = proximo === -1 ? resto : resto.slice(0, proximo + 1);
+  return bloco
+    .split("\n")
+    .filter((l) => l.trim() !== "" && !l.trimStart().startsWith("--"))
+    .join("\n");
 }
 
 function posicoesDe(sql: string, padrao: RegExp): number[] {
@@ -110,8 +160,8 @@ describe("baseline.sql — a varredura de anon é o último bloco", () => {
 
   it("nenhum grant devolve anon depois da varredura", () => {
     // O outro caminho para o mesmo estrago: não criar função nova, e sim
-    // reconceder o que a varredura acabou de tirar.
-    const varredura = posicaoDaVarredura(sql);
+    // reconceder o que a varredura acabou de tirar. Medido da PRIMEIRA cópia.
+    const varredura = posicaoDaPrimeiraVarredura(sql);
     const depois = posicoesDe(sql, GRANT_PARA_ANON)
       .filter((i) => i > varredura)
       .map((i) => `linha ${linhaDe(sql, i)}`);
@@ -129,11 +179,39 @@ describe("baseline.sql — a varredura de anon é o último bloco", () => {
     // Contado como DELTA sobre o arquivo real, não como total absoluto: se o
     // baseline um dia estiver de fato violando a regra, quem tem de ficar
     // vermelho são os casos acima — este aqui continua medindo só o detector.
-    const depois = (texto: string, padrao: RegExp) =>
-      posicoesDe(texto, padrao).filter((i) => i > posicaoDaVarredura(texto)).length;
+    const depois = (texto: string, padrao: RegExp, posicao: (t: string) => number) =>
+      posicoesDe(texto, padrao).filter((i) => i > posicao(texto)).length;
 
-    expect(depois(sabotado, CRIA_FUNCAO) - depois(sql, CRIA_FUNCAO)).toBe(1);
-    expect(depois(sabotado, GRANT_PARA_ANON) - depois(sql, GRANT_PARA_ANON)).toBe(1);
+    expect(
+      depois(sabotado, CRIA_FUNCAO, posicaoDaVarredura) -
+        depois(sql, CRIA_FUNCAO, posicaoDaVarredura),
+    ).toBe(1);
+    expect(
+      depois(sabotado, GRANT_PARA_ANON, posicaoDaPrimeiraVarredura) -
+        depois(sql, GRANT_PARA_ANON, posicaoDaPrimeiraVarredura),
+    ).toBe(1);
+  });
+
+  it("as cópias da varredura rodam o MESMO código (fork: a do upstream e a que fecha o apêndice do fork)", () => {
+    const doUpstream = [...sql.matchAll(MARCADOR)].map((m) => m.index);
+    const doFork = [...sql.matchAll(MARCADOR_DO_FORK)].map((m) => m.index);
+    // Uma de cada: duas com o MESMO cabeçalho fariam as âncoras do upstream mirarem texto repetido.
+    expect(doUpstream.length, "cópias com o cabeçalho do upstream ('VARREDURA anon:')").toBe(1);
+    expect(doFork.length, "cópias com o cabeçalho do fork ('VARREDURA anon do fork')").toBe(1);
+    expect(doFork[0]!, "a cópia do fork fecha o apêndice: vem DEPOIS da do upstream").toBeGreaterThan(
+      doUpstream[0]!,
+    );
+    const todas = posicoesDaVarredura(sql);
+    const codigos = todas.map((i) => codigoDaVarredura(sql, i));
+    // Controle: o extrator achou o `do $$ … end $$;` e as regras de authenticated.
+    for (const c of codigos) {
+      expect(c).toContain("has_function_privilege('authenticated'");
+      expect(c).toContain("revoke execute on function public.fn_decrypt_oauth(bytea) from authenticated;");
+    }
+    expect(
+      new Set(codigos).size,
+      "as varreduras divergiram — o upstream mudou a dele? Copie a mudança para a do fork",
+    ).toBe(1);
   });
 
   it("a prosa do próprio bloco não é confundida com código", () => {

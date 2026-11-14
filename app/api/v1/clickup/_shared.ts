@@ -1,5 +1,6 @@
 import { fail } from "@/lib/api/wrappers";
 import { ClickUpStoreError } from "@/lib/clickup/store";
+import { logger } from "@/lib/logger";
 
 export async function readJson(request: Request): Promise<unknown> {
   try {
@@ -16,7 +17,7 @@ export function clickupFailure(error: unknown, requestId: string): Response {
       return fail("state_conflict", error.message, 409, { requestId });
     }
   }
-  console.error("[clickup-import] operation failed", {
+  logger.error("[clickup-import] operation failed", {
     requestId,
     kind: error instanceof Error ? error.name : "unknown",
   });

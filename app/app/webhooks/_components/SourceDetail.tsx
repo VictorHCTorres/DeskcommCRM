@@ -49,6 +49,7 @@ import {
 } from "@/lib/webhooks/formulario";
 import { useT } from "@/hooks/i18n/useT";
 import { WebhookFormFieldsEditor } from "./WebhookFormFieldsEditor";
+import { LeadAdsDaMeta } from "./LeadAdsDaMeta";
 
 interface Props {
   source: WebhookSourceRow;
@@ -586,6 +587,8 @@ export function SourceDetail({ source, open, onOpenChange }: Props) {
               </p>
             )}
           </section>
+
+          <LeadAdsDaMeta source={source} />
 
           <section className="space-y-2">
             <p className="text-sm font-medium text-text">

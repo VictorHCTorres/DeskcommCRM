@@ -30,9 +30,14 @@ export const CHANNEL_CAPABILITIES: Record<ProviderDeMensagem, ChannelCapabilitie
     groups: "full",
     costPerMessage: false,
     alteraMensagemEnviada: true,
+    podeReagir: true,
+    transmissao: false,
     // É a linha que conversa com um APARELHO pareado: a agenda salva no
     // celular está lá dentro, e o `contacts/all` a devolve paginada (#2736).
     phonebook: true,
+    // Status é do WhatsApp com aparelho atrás: só a linha por QR tem o
+    // endpoint de publicação. Ver `publishStatus` em `./types`.
+    statusUpdates: true,
   },
   // Hetero-restrição: não me banem, mas a Meta me proíbe e me cobra.
   meta_cloud: {
@@ -47,9 +52,15 @@ export const CHANNEL_CAPABILITIES: Record<ProviderDeMensagem, ChannelCapabilitie
     groups: "limited",
     costPerMessage: true,
     alteraMensagemEnviada: false,
+    podeReagir: true,
+    transmissao: false,
     // Nenhuma destas linhas conversa com um aparelho pareado — não existe
     // agenda de celular a ler, e dizer `true` aqui seria um botão que só falha.
     phonebook: false,
+    // A API oficial não tem endpoint de Status: o gesto só existe no app do
+    // WhatsApp, atrás de um aparelho pareado. Declarar `true` aqui ofereceria
+    // um botão que sempre falha (ver `publishStatus` em `./types`).
+    statusUpdates: false,
   },
   // Mesma hetero-restrição do canal oficial, por baixo: é um BSP: a WABA é da
   // Meta, os templates são aprovados pela Meta e a janela de 24h é da Meta. O
@@ -84,9 +95,15 @@ export const CHANNEL_CAPABILITIES: Record<ProviderDeMensagem, ChannelCapabilitie
     groups: "none",
     costPerMessage: true,
     alteraMensagemEnviada: false,
+    podeReagir: false,
+    transmissao: false,
     // Nenhuma destas linhas conversa com um aparelho pareado — não existe
     // agenda de celular a ler, e dizer `true` aqui seria um botão que só falha.
     phonebook: false,
+    // A API oficial não tem endpoint de Status: o gesto só existe no app do
+    // WhatsApp, atrás de um aparelho pareado. Declarar `true` aqui ofereceria
+    // um botão que sempre falha (ver `publishStatus` em `./types`).
+    statusUpdates: false,
   },
   zernio: {
     freeformOutsideWindow: false,
@@ -98,9 +115,19 @@ export const CHANNEL_CAPABILITIES: Record<ProviderDeMensagem, ChannelCapabilitie
     groups: "limited",
     costPerMessage: true,
     alteraMensagemEnviada: false,
+    podeReagir: false,
+    // MEDIDO em 16/10/2026 (2 destinatários, entregues em 1 a 3 s): o provedor
+    // cria a transmissão, recebe os telefones e manda a todos. O valor de cada
+    // variável sai LITERAL do `components` — o `variableMapping` documentado
+    // chegou ao destinatário como "{{1}}", e o nome que ele guarda é o número.
+    transmissao: true,
     // Nenhuma destas linhas conversa com um aparelho pareado — não existe
     // agenda de celular a ler, e dizer `true` aqui seria um botão que só falha.
     phonebook: false,
+    // A API oficial não tem endpoint de Status: o gesto só existe no app do
+    // WhatsApp, atrás de um aparelho pareado. Declarar `true` aqui ofereceria
+    // um botão que sempre falha (ver `publishStatus` em `./types`).
+    statusUpdates: false,
   },
   // Parceiro homologado pela Meta que espelha a Cloud API (recorte do #1130):
   // a WABA, a janela de 24h e o custo são da Meta. O parceiro muda o TRANSPORTE
@@ -121,9 +148,15 @@ export const CHANNEL_CAPABILITIES: Record<ProviderDeMensagem, ChannelCapabilitie
     groups: "limited",
     costPerMessage: true,
     alteraMensagemEnviada: false,
+    podeReagir: false,
+    transmissao: false,
     // Nenhuma destas linhas conversa com um aparelho pareado — não existe
     // agenda de celular a ler, e dizer `true` aqui seria um botão que só falha.
     phonebook: false,
+    // A API oficial não tem endpoint de Status: o gesto só existe no app do
+    // WhatsApp, atrás de um aparelho pareado. Declarar `true` aqui ofereceria
+    // um botão que sempre falha (ver `publishStatus` em `./types`).
+    statusUpdates: false,
   },
 };
 
@@ -147,6 +180,13 @@ export const CHANNEL_PROVIDER_WAHA: ChannelProvider = "waha";
 export const CHANNEL_PROVIDER_META: ChannelProvider = "meta_cloud";
 export const CHANNEL_PROVIDER_SOCIAL: ChannelProvider = "zernio_social";
 export const CHANNEL_PROVIDER_ZERNIO: ChannelProvider = "zernio";
+/**
+ * Os canais cuja entrada responde ANTES de processar a mensagem nova — o porquê
+ * está em `./inbound.ts`, que o reexporta. Mora aqui, num módulo sem dependência,
+ * porque o piso ocioso do cron (`lib/cron/piso-ocioso.ts`) também o lê: ele
+ * pergunta se há entrada aceita a reprocessar SEM escrever o nome do canal.
+ */
+export const CANAIS_QUE_RESPONDEM_ANTES: readonly string[] = [CHANNEL_PROVIDER_ZERNIO];
 /** Parceiro que espelha a Cloud API — canal opcional da instalação, desligado por padrão. */
 export const CHANNEL_PROVIDER_DATAFY: ChannelProvider = "datafy";
 /** Chamada de voz WhatsApp (spec 18). Não transporta mensagem — ver abaixo. */
@@ -256,8 +296,27 @@ export function canalConhecidoSemMensagem(provider: string | null | undefined): 
 }
 
 /**
+ * O canal de campanha por E-MAIL (#3441, fatia E2a).
+ *
+ * Não é `ProviderDeMensagem`: e-mail não é um `channel_sessions` — ninguém pareia
+ * um aparelho, não há janela de 24 horas, não há modelo aprovado pela plataforma
+ * e não há número. O endereço vem de `contacts.email` e o remetente da conta
+ * Resend da organização. Mora AQUI, e não numa condição espalhada, porque a
+ * pergunta "a campanha fala por quê?" continua sendo do canal.
+ *
+ * A régua da conta de envio NÃO mora aqui: esta função responde só o FORMATO do
+ * conteúdo. Quem sabe se a organização tem conta Resend conectada é
+ * `decidirConteudo` (`lib/campanhas/conteudo-do-canal.ts`), que consulta
+ * `organization_resend_accounts` e recusa com motivo próprio.
+ */
+export const CANAL_DE_CAMPANHA_EMAIL = "email";
+
+/** O que uma campanha pode mandar por um canal. `null` = por este canal não há campanha. */
+export type ModoDeCampanha = "text" | "template" | "email";
+
+/**
  * Como uma CAMPANHA fala por este canal: texto livre (`text`), modelo aprovado
- * (`template`) ou não fala (`null`).
+ * (`template`), assunto + corpo (`email`) ou não fala (`null`).
  *
  * Campanha é contato que a empresa inicia — quase sempre fora das 24 horas da
  * última mensagem do cliente. Por isso a pergunta é `freeformOutsideWindow`, e
@@ -269,7 +328,12 @@ export function canalConhecidoSemMensagem(provider: string | null | undefined): 
  * responde `null` em vez de lançar — a tela de campanha lista conexões, e um
  * throw apagaria a lista inteira.
  */
-export function modoDeCampanhaDoCanal(provider: string | null | undefined): "text" | "template" | null {
+export function modoDeCampanhaDoCanal(
+  provider: string | null | undefined,
+): ModoDeCampanha | null {
+  // Antes de `transportaMensagem`: e-mail não transporta mensagem de conversa,
+  // e é justamente por isso que a pergunta anterior responderia `false` para ele.
+  if (provider === CANAL_DE_CAMPANHA_EMAIL) return "email";
   if (!transportaMensagem(provider)) return null;
   try {
     const caps = capabilitiesOf(provider as ProviderDeMensagem);
@@ -292,6 +356,21 @@ export function canalTemRiscoDeBanimento(provider: string | null | undefined): b
     return capabilitiesOf(provider as ProviderDeMensagem).banRisk;
   } catch {
     return true;
+  }
+}
+
+/**
+ * O provedor deste número faz a transmissão (a lista inteira de uma vez, com o
+ * relatório por destinatário)? Liga a terceira velocidade da campanha.
+ * Desconhecido responde `false`: sem a certeza, a campanha fica no envio que o
+ * próprio sistema controla.
+ */
+export function canalTemTransmissao(provider: string | null | undefined): boolean {
+  if (!transportaMensagem(provider)) return false;
+  try {
+    return capabilitiesOf(provider as ProviderDeMensagem).transmissao;
+  } catch {
+    return false;
   }
 }
 

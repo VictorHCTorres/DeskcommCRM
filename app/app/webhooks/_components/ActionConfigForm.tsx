@@ -5,6 +5,8 @@ import * as React from "react";
 import { useQuery } from "@tanstack/react-query";
 
 import { Input } from "@/components/ui/input";
+import { PreviaComValores } from "@/components/variaveis/PreviaComValores";
+import { SeletorDeVariavel, type AtalhoDeVariavel } from "@/components/variaveis/SeletorDeVariavel";
 import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
@@ -21,6 +23,7 @@ import { usePipelines, usePipelineStages } from "@/hooks/webhooks/useWebhookSour
 import { useAgentsList } from "@/hooks/ai/useAgents";
 import { channelLabel, useChannelSessions } from "@/hooks/channels/useChannelSessions";
 import { useAssignableMembers, type AssignableMember } from "@/hooks/inbox/useAssignableMembers";
+import { useSectors } from "@/hooks/team/useSectors";
 import { useDefaultPipeline } from "@/hooks/pipelines/useDefaultPipeline";
 import {
   CHAVE_DA_ESCOLHA,
@@ -28,7 +31,10 @@ import {
   lerEscolhaNoEnvio,
   type EscolhaNoEnvio,
 } from "@/lib/agenda/escolha-no-envio";
+import { EscolhaQuandoHaCompromisso } from "@/components/agenda/EscolhaQuandoHaCompromisso";
 import { camposDeDataDoNegocio, camposDoFunil } from "@/lib/leads/campos-do-funil";
+import { motivosDoFunil, opcoesDeMotivoDePerda } from "@/lib/leads/motivos-de-perda-do-funil";
+import { rotuloDoMotivoDePerda } from "@/lib/schemas/leads";
 import { apiClient } from "@/lib/api/client";
 import { useAuth } from "@/hooks/auth/AuthProvider";
 import {
@@ -90,7 +96,21 @@ export const DESTINOS_DO_ATRIBUIR = ["responsavel_do_negocio", "dono_da_carteira
 export type DestinoDoAtribuir = (typeof DESTINOS_DO_ATRIBUIR)[number];
 
 export type ActionItem =
-  | { type: "create_or_move_lead"; config: { pipeline_id: string; stage_id: string } }
+  | {
+      type: "create_or_move_lead";
+      config: {
+        pipeline_id: string;
+        stage_id: string;
+        /**
+         * #4297 — o motivo da perda, exigido quando a etapa de destino é de
+         * perda (`is_lost`). O valor é o mesmo que o arrasto grava: canônico do
+         * produto ou um dos motivos cadastrados no funil. Ausente = regra que
+         * não passa por etapa de perda (ou regra antiga, que falha com o código
+         * real no recibo).
+         */
+        lost_reason?: string;
+      };
+    }
   | {
       type: "send_whatsapp_message";
       config: {
@@ -130,11 +150,15 @@ export type ActionItem =
       type: "add_tag";
       config: { tags: string[]; destino?: "card" | "contato" };
     }
+  | {
+      type: "remove_tag";
+      config: { tags: string[]; destino?: "card" | "contato" };
+    }
   | { type: "assign_owner"; config: ConfigDoAtribuir }
   | { type: "call_webhook"; config: { url: string; secret?: string; secret_enc?: string; include_owner?: boolean } }
   | {
       type: "start_message_flow";
-      config: { flow_pointer_id: string; surface?: "followup" | "atendimento" };
+      config: { flow_pointer_id: string; surface?: "followup" | "atendimento"; replace_live_flow?: boolean };
     }
   // #1540 — o lembrete interno: mesmos campos do schema da API e do nó de fluxo.
   | {
@@ -158,7 +182,11 @@ export type ActionItem =
   // isso não existe campo de número, de endereço, de pessoa nem de canal: a
   // configuração guarda só o canal, e é o executor que lê o destino
   // cadastrado. Mesmos campos do schema da API.
-  | { type: "notify_team"; config: { canal: "whatsapp" } };
+  | { type: "notify_team"; config: { canal: "whatsapp" } }
+  // #3881 — a conversa vai para um SETOR. Mesmos campos do schema da API: o
+  // setor escolhido e a caixa (desligada por padrão) que autoriza a regra a
+  // reclassificar o que uma pessoa classificou à mão.
+  | { type: "define_sector"; config: { sector_id: string; sobrescrever_setor_manual?: boolean } };
 
 export function defaultActionConfig(type: ActionItem["type"]): ActionItem {
   switch (type) {
@@ -183,6 +211,7 @@ export function defaultActionConfig(type: ActionItem["type"]): ActionItem {
     case "send_ai_message":
       return { type, config: { agent_id: "", channel_session_id: "", instruction: "" } };
     case "add_tag":
+    case "remove_tag":
       return { type, config: { tags: [] } };
     case "assign_owner":
       return { type, config: { user_id: "" } };
@@ -209,6 +238,11 @@ export function defaultActionConfig(type: ActionItem["type"]): ActionItem {
     // por isso o `config` guarda apenas o canal (o schema exige o literal).
     case "notify_team":
       return { type, config: { canal: "whatsapp" } };
+    // #3881 — o setor nasce vazio: a lista é da INSTALAÇÃO (módulo `setores`) e
+    // quem escolhe é quem monta a regra. Sem escolha, a regra falha nomeada no
+    // disparo (`sector_id_ausente`) em vez de gravar qualquer coisa.
+    case "define_sector":
+      return { type, config: { sector_id: "" } };
   }
 }
 
@@ -218,45 +252,22 @@ interface FormProps<T> {
 }
 
 /**
- * #3813 — AS TRÊS RESPOSTAS PARA "E SE O CONTATO TIVER HORÁRIO MARCADO?".
+ * O CONFIG DO PASSO com a escolha nova — preservando o resto.
  *
- * A escolha mora no `config` do PASSO que envia, e não no `trigger_config`:
- * é de lá que `lerEscolhaNoEnvio` a lê no disparo (`send-whatsapp.ts:24`,
- * `send-ai-message.ts:64`), e gravar no gatilho daria uma tela que o motor não
- * obedece. Cada passo tem a sua — a mesma regra pode adiar o lembrete de
- * cobrança e mandar o pós-atendimento na hora.
- *
- * A ajuda de cada opção diz o EFEITO, não o nome do campo: quem lê esta gaveta
- * é quem descobriu que os parabéns saíram duas semanas atrasados.
- */
-const ESCOLHAS_DA_AGENDA: Array<{ valor: EscolhaNoEnvio; rotulo: string; ajuda: string }> = [
-  {
-    valor: "adiar",
-    rotulo: "Adiar e enviar depois do horário",
-    ajuda:
-      "A mensagem espera o atendimento terminar e sai logo depois. É o comportamento de sempre e o que continua valendo em quem nunca mexeu aqui.",
-  },
-  {
-    valor: "enviar",
-    rotulo: "Enviar mesmo assim",
-    ajuda:
-      "A mensagem sai na hora, mesmo com atendimento marcado. Serve para o pós-atendimento e o aniversário, que perdem o sentido se esperarem.",
-  },
-  {
-    valor: "nao_enviar",
-    rotulo: "Não enviar",
-    ajuda:
-      "A mensagem não sai e o pulo fica registrado na Atividade com o motivo “contato com horário marcado”, para a equipe saber que a automação passou.",
-  },
-];
-
-/**
- * O config do passo com a escolha nova — preservando o resto.
+ * #3813 — a escolha mora no `config` do PASSO que envia, e não no
+ * `trigger_config`: é de lá que `lerEscolhaNoEnvio` a lê no disparo
+ * (`send-whatsapp.ts:24`, `send-ai-message.ts:64`), e gravar no gatilho daria
+ * uma tela que o motor não obedece. Cada passo tem a sua — a mesma regra pode
+ * adiar o lembrete de cobrança e mandar o pós-atendimento na hora.
  *
  * `...config` é o que impede a escolha de apagar o número, a mensagem e a
  * mídia que a pessoa acabou de preencher. `adiar` é o padrão declarado da
  * leitura tolerante, então voltar para ele REMOVE a chave: a regra de antes
  * desta entrega não a tem, e um payload sem ela é byte a byte o de sempre.
+ *
+ * (A lista de opções e o rádio vivem em
+ * `components/agenda/EscolhaQuandoHaCompromisso` — a MESMA tela serve ao
+ * follow-up do agente desde esta entrega.)
  */
 function configComEscolha<T extends object>(config: T, escolha: EscolhaNoEnvio): T {
   const { [CHAVE_DA_ESCOLHA]: _anterior, ...resto } = config as Record<string, unknown>;
@@ -265,54 +276,11 @@ function configComEscolha<T extends object>(config: T, escolha: EscolhaNoEnvio):
   ) as T;
 }
 
-function EscolhaQuandoHaCompromisso({
-  escolha,
-  onChange,
-}: {
-  /** O valor JÁ lido com `lerEscolhaNoEnvio` — quem chama não reimplementa a leitura. */
-  escolha: EscolhaNoEnvio;
-  onChange: (escolha: EscolhaNoEnvio) => void;
-}) {
-  const t = useT();
-  const grupo = React.useId();
-
-  return (
-    <div className="space-y-1">
-      <Label id={`${grupo}-rotulo`}>{t("Quando o contato tiver horário marcado")}</Label>
-      <p className="text-xs text-muted-foreground">
-        {t(
-          "Em qualquer das três continuam valendo o descadastro do contato, a janela de envio do número e o limite diário.",
-        )}
-      </p>
-      <div role="radiogroup" aria-labelledby={`${grupo}-rotulo`} className="space-y-1">
-        {ESCOLHAS_DA_AGENDA.map((opcao) => (
-          <label
-            key={opcao.valor}
-            className="flex cursor-pointer items-start gap-2 rounded-md border p-3"
-          >
-            <input
-              type="radio"
-              name={grupo}
-              value={opcao.valor}
-              checked={escolha === opcao.valor}
-              onChange={() => onChange(opcao.valor)}
-              className="mt-1"
-            />
-            <span className="space-y-0.5">
-              <span className="block text-sm font-medium">{t(opcao.rotulo)}</span>
-              <span className="block text-xs text-muted-foreground">{t(opcao.ajuda)}</span>
-            </span>
-          </label>
-        ))}
-      </div>
-    </div>
-  );
-}
 
 function CreateOrMoveLeadForm({
   config,
   onChange,
-}: FormProps<{ pipeline_id: string; stage_id: string }>) {
+}: FormProps<{ pipeline_id: string; stage_id: string; lost_reason?: string }>) {
   const t = useT();
   const { data: pipelinesRes, isLoading: pipelinesLoading } = usePipelines();
   const { data: boardRes, isLoading: stagesLoading } = usePipelineStages(
@@ -320,6 +288,18 @@ function CreateOrMoveLeadForm({
   );
   const pipelines = pipelinesRes?.data ?? [];
   const stages = boardRes?.data?.stages ?? [];
+  const funil = pipelines.find((p) => p.id === config.pipeline_id) ?? null;
+  /**
+   * #4297 — A ETAPA DE DESTINO FECHA O NEGÓCIO COMO PERDA?
+   *
+   * É a MESMA coluna que o #917 lê no servidor (`is_lost`), e a lista de
+   * motivos é a MESMA do arrasto (`opcoesDeMotivoDePerda` sobre os
+   * `settings.lost_reasons` do funil): canônicos do produto, ou os que o
+   * operador cadastrou em Configurações › Funis. Redigitar a lista aqui faria a
+   * regra oferecer um motivo que o banco recusa no clique.
+   */
+  const etapaDePerda = stages.find((s) => s.id === config.stage_id)?.is_lost === true;
+  const motivos = opcoesDeMotivoDePerda(motivosDoFunil(funil?.settings ?? null));
 
   return (
     <div className="grid gap-2 sm:grid-cols-2">
@@ -346,7 +326,16 @@ function CreateOrMoveLeadForm({
         <Label>{t("Etapa")}</Label>
         <Select
           value={config.stage_id}
-          onValueChange={(v) => onChange({ ...config, stage_id: v })}
+          onValueChange={(v) => {
+            if (stages.find((s) => s.id === v)?.is_lost !== true) {
+              // Sair da etapa de perda tira o motivo junto: guardar um motivo
+              // numa ação que não perde nada é dado morto, e ele voltaria a
+              // valer sozinho se alguém trocasse a etapa de novo.
+              onChange({ pipeline_id: config.pipeline_id, stage_id: v });
+              return;
+            }
+            onChange({ ...config, stage_id: v });
+          }}
           disabled={!config.pipeline_id || stagesLoading}
         >
           <SelectTrigger>
@@ -363,18 +352,60 @@ function CreateOrMoveLeadForm({
           </SelectContent>
         </Select>
       </div>
+      {etapaDePerda ? (
+        <div className="space-y-1 sm:col-span-2">
+          <Label htmlFor={`motivo-da-perda-${config.stage_id}`}>{t("Motivo da perda")}</Label>
+          <Select
+            value={config.lost_reason ?? ""}
+            onValueChange={(v) => onChange({ ...config, lost_reason: v })}
+          >
+            <SelectTrigger id={`motivo-da-perda-${config.stage_id}`}>
+              <SelectValue placeholder={t("Escolha o motivo da perda")} />
+            </SelectTrigger>
+            <SelectContent>
+              {motivos.map((opcao) => (
+                <SelectItem key={opcao.valor} value={opcao.valor}>
+                  {/* Motivo cadastrado pelo operador é DADO, não interface:
+                      aparece como ele escreveu, em qualquer idioma. O canônico
+                      é texto do produto e passa por t(), pelo mesmo rótulo do
+                      diálogo de perda (`rotuloDoMotivoDePerda`). */}
+                  {opcao.doFunil ? opcao.valor : t(rotuloDoMotivoDePerda(opcao.valor))}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <p className="text-xs text-muted-foreground">
+            {t("Esta etapa fecha o negócio como perdido: a automação precisa dizer por quê.")}
+          </p>
+        </div>
+      ) : null}
     </div>
   );
 }
 
-// O rótulo de cada variável é chave do dicionário e passa por t() onde vira botão: escrito cru, ele saía em
-// português em todo idioma. Só estas três: os campos do formulário que vêm junto são rótulos que a pessoa escreveu,
-// e dado não se traduz.
-const TEMPLATE_VARS = [
-  { token: "{{nome}}", label: "Nome" },
-  { token: "{{telefone}}", label: "Telefone" },
-  { token: "{{lead.title}}", label: "Título do lead" },
-];
+/**
+ * O que a automação oferece além do catálogo (#3687): o título do card e os
+ * campos que a organização criou no funil. Os campos NÃO entram no catálogo: a
+ * chave nasce em runtime, e o rótulo é texto que a pessoa escreveu — dado não se
+ * traduz.
+ *
+ * `{{lead.title}}` está aqui porque o catálogo só conhece o CURINGA `lead.*`, e
+ * curinga não é token: o seletor o mostra como dica, nunca como item de inserir
+ * (`{{lead.*}}` iria literal para o cliente). O título é o caminho que o botão
+ * antigo « Título do lead » inseria, e continua a um clique.
+ *
+ * As variáveis fechadas de CRM (`{{nome}}`, `{{telefone}}`…) não estão nesta
+ * lista: quem as oferece é `SeletorDeVariavel`, lendo o catálogo.
+ */
+function atalhosDaAutomacao(settings: unknown, t: ReturnType<typeof useT>): AtalhoDeVariavel[] {
+  return [
+    { chave: "lead.title", rotulo: t("Título do lead"), grupo: "campo-do-negocio" },
+    ...camposDoFunil(settings as Parameters<typeof camposDoFunil>[0]).map((f) => ({
+      chave: f.key,
+      rotulo: f.label,
+    })),
+  ];
+}
 
 function SendWhatsappForm({
   config,
@@ -394,9 +425,7 @@ function SendWhatsappForm({
   // monta a mensagem clica em "Serviço" em vez de adivinhar o nome interno. O
   // token é só a chave — `renderTemplate` a resolve em `lead.custom_fields`.
   const pipeline = useDefaultPipeline(true);
-  const camposDoFormulario = camposDoFunil(pipeline.data?.pipeline.settings ?? null)
-    .filter((f) => !TEMPLATE_VARS.some((v) => v.token === `{{${f.key}}}`))
-    .map((f) => ({ token: `{{${f.key}}}`, label: f.label }));
+  const atalhos = atalhosDaAutomacao(pipeline.data?.pipeline.settings ?? null, t);
 
   const insertVar = (token: string) => {
     const el = textareaRef.current;
@@ -437,19 +466,9 @@ function SendWhatsappForm({
         ) : null}
       </div>
       <div className="space-y-1">
-        <Label>{t("Mensagem")}</Label>
-        <div className="flex flex-wrap gap-1">
-          {[...TEMPLATE_VARS.map((v) => ({ ...v, label: t(v.label) })), ...camposDoFormulario].map((v) => (
-            <Button
-              key={v.token}
-              type="button"
-              variant="secondary"
-              size="sm"
-              onClick={() => insertVar(v.token)}
-            >
-              {v.label}
-            </Button>
-          ))}
+        <div className="flex items-center justify-between gap-2">
+          <Label>{t("Mensagem")}</Label>
+          <SeletorDeVariavel fonte="automacao" onInserir={insertVar} extras={atalhos} />
         </div>
         <Textarea
           ref={textareaRef}
@@ -458,6 +477,7 @@ function SendWhatsappForm({
           onChange={(e) => onChange({ ...config, template: e.target.value })}
           placeholder={t("Oi {{nome}}, tudo bem?")}
         />
+        <PreviaComValores texto={config.template} fonte="automacao" />
         <p className="text-xs text-muted-foreground">
           {/* NÃO cravar "7h e 22h": a janela passou a vir dos ajustes DO NÚMERO
               (Conexões), no fuso da sua organização, e quem a mudou lá veria a
@@ -521,9 +541,15 @@ function SendEmailForm({
   const textareaRef = React.useRef<HTMLTextAreaElement>(null);
   const { data: membros } = useAssignableMembers(true);
   const pipeline = useDefaultPipeline(true);
-  const camposDoFormulario = camposDoFunil(pipeline.data?.pipeline.settings ?? null)
-    .filter((f) => !TEMPLATE_VARS.some((v) => v.token === `{{${f.key}}}`))
-    .map((f) => ({ token: `{{${f.key}}}`, label: f.label }));
+  const atalhos: AtalhoDeVariavel[] = [
+    ...atalhosDaAutomacao(pipeline.data?.pipeline.settings ?? null, t),
+    // #2642 — a variável desta ação: o resumo do negócio montado no disparo
+    // (só dado de forma fixa + atalho para a ficha; doc 176 A). Fica só no
+    // e-mail de propósito: no WhatsApp da equipe o corpo É o resumo, sem
+    // modelo. `{{resumo}}` entra no contexto em `send-email.ts` e o resolvedor
+    // a lê de lá; não é variável de CRM, por isso não está no catálogo.
+    { chave: "resumo", rotulo: t("Resumo do negócio"), grupo: "acao" },
+  ];
 
   const insertVar = (token: string) => {
     const el = textareaRef.current;
@@ -611,27 +637,9 @@ function SendEmailForm({
         </div>
       ) : null}
       <div className="space-y-1">
-        <Label>{t("Corpo do e-mail")}</Label>
-        <div className="flex flex-wrap gap-1">
-          {[
-            ...TEMPLATE_VARS.map((v) => ({ ...v, label: t(v.label) })),
-            // #2642 — a variável desta ação: o resumo do negócio montado no
-            // disparo (só dado de forma fixa + atalho para a ficha; doc 176 A).
-            // Fica só no e-mail de propósito: no WhatsApp da equipe o corpo É
-            // o resumo, sem modelo.
-            { token: "{{resumo}}", label: t("Resumo do negócio") },
-            ...camposDoFormulario,
-          ].map((v) => (
-            <Button
-              key={v.token}
-              type="button"
-              variant="secondary"
-              size="sm"
-              onClick={() => insertVar(v.token)}
-            >
-              {v.label}
-            </Button>
-          ))}
+        <div className="flex items-center justify-between gap-2">
+          <Label>{t("Corpo do e-mail")}</Label>
+          <SeletorDeVariavel fonte="automacao" onInserir={insertVar} extras={atalhos} />
         </div>
         <Textarea
           ref={textareaRef}
@@ -640,6 +648,7 @@ function SendEmailForm({
           onChange={(e) => onChange({ ...config, corpo: e.target.value })}
           placeholder={t("Oi {{nome}}, tudo bem?")}
         />
+        <PreviaComValores texto={config.corpo} fonte="automacao" />
       </div>
       <div className="space-y-1">
         <Label>{t("Formato do corpo")}</Label>
@@ -660,6 +669,9 @@ function SendEmailForm({
       </p>
       <p className="text-xs text-muted-foreground">
         {t('Para não depender do dado, ponha um texto de reserva: {{primeiro_nome|"aluno"}}.')}
+      </p>
+      <p className="text-xs text-muted-foreground">
+        {t("Para escrever uma data no formato do cliente, use {{campo|data}}.")}
       </p>
       <p className="text-xs text-muted-foreground">
         {t(
@@ -784,14 +796,21 @@ function SendAiMessageForm({
 function AddTagForm({
   config,
   onChange,
-}: FormProps<{ tags: string[]; destino?: "card" | "contato" }>) {
+  tirar = false,
+}: FormProps<{ tags: string[]; destino?: "card" | "contato" }> & {
+  /** `remove_tag`: a mesma tela, com as frases de quem TIRA a etiqueta. */
+  tirar?: boolean;
+}) {
   const t = useT();
   const [text, setText] = React.useState(config.tags.join(", "));
   return (
     <div className="space-y-2">
       <div className="space-y-1">
-        <Label>{t("Tags (separadas por vírgula)")}</Label>
+        <Label htmlFor={tirar ? "remove-tag-tags" : "add-tag-tags"}>
+          {tirar ? t("Tags para tirar (separadas por vírgula)") : t("Tags (separadas por vírgula)")}
+        </Label>
         <Input
+          id={tirar ? "remove-tag-tags" : "add-tag-tags"}
           value={text}
           onChange={(e) => {
             setText(e.target.value);
@@ -807,7 +826,7 @@ function AddTagForm({
         />
       </div>
       <div className="space-y-1">
-        <Label>{t("Destino da etiqueta")}</Label>
+        <Label>{tirar ? t("De onde tirar") : t("Destino da etiqueta")}</Label>
         <Select
           value={config.destino ?? "card"}
           onValueChange={(v) => onChange({ ...config, destino: v as "card" | "contato" })}
@@ -816,13 +835,15 @@ function AddTagForm({
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="card">{t("Card (comportamento atual)")}</SelectItem>
-            <SelectItem value="contato">{t("Contato do lead")}</SelectItem>
+            <SelectItem value="card">{tirar ? t("Do card") : t("Card (comportamento atual)")}</SelectItem>
+            <SelectItem value="contato">{tirar ? t("Do contato do lead") : t("Contato do lead")}</SelectItem>
           </SelectContent>
         </Select>
         {config.destino === "contato" && (
           <p className="text-xs text-muted-foreground">
-            {t("Sem contato vinculado, a etiqueta não é aplicada.")}
+            {tirar
+              ? t("Sem contato vinculado, nenhuma etiqueta é tirada.")
+              : t("Sem contato vinculado, a etiqueta não é aplicada.")}
           </p>
         )}
       </div>
@@ -1425,7 +1446,7 @@ function CallWebhookForm({
 function StartMessageFlowForm({
   config,
   onChange,
-}: FormProps<{ flow_pointer_id: string; surface?: "followup" | "atendimento" }>) {
+}: FormProps<{ flow_pointer_id: string; surface?: "followup" | "atendimento"; replace_live_flow?: boolean }>) {
   const t = useT();
   const superficie: "followup" | "atendimento" =
     config.surface === "atendimento" ? "atendimento" : "followup";
@@ -1515,6 +1536,27 @@ function StartMessageFlowForm({
               "O roteiro de atendimento acontece na conversa: a automação abre o atendimento e a primeira pergunta sai quando o cliente responder.",
             )}
           </p>
+        ) : null}
+        {/* Trocar de fluxo só existe no follow-up: o roteiro de atendimento tem a
+            própria regra de um por contato. Um contato só anda em UM follow-up
+            por vez; desligado, a regra perde para o fluxo que chegou antes — e
+            quem acabou de pedir pode ficar sem a confirmação porque já estava
+            num fluxo de remarketing. */}
+        {!ehRoteiro ? (
+          <div className="mt-2 flex items-center justify-between gap-3 rounded-md border p-3">
+            <div className="space-y-0.5">
+              <Label>{t("Tirar o contato de outro fluxo")}</Label>
+              <p className="text-xs text-muted-foreground">
+                {t(
+                  "Se o contato já estiver em outro fluxo, ele sai daquele e entra neste. Fluxo pausado por uma pessoa não é trocado.",
+                )}
+              </p>
+            </div>
+            <Switch
+              checked={config.replace_live_flow === true}
+              onCheckedChange={(v) => onChange({ ...config, replace_live_flow: v ? true : undefined })}
+            />
+          </div>
         ) : null}
       </div>
     </div>
@@ -1690,6 +1732,77 @@ function NotifyTeamForm() {
   );
 }
 
+/**
+ * `define_sector` (#3881) — a regra classifica a conversa num SETOR.
+ *
+ * A lista vem de `/api/v1/attendants/sectors` (o mesmo leitor da aba Equipe:
+ * uma pergunta, um dono). Módulo `setores` desligado ⇒ a rota responde 404 e a
+ * tela diz isso, em vez de oferecer uma escolha que não existe na instalação.
+ *
+ * A caixa de sobrescrita nasce DESMARCADA e o texto diz o que ela faz: sem ela,
+ * a regra só classifica conversa sem setor ou conversa que a própria automação
+ * classificou. É a precedência do trabalho manual, dita na tela de quem monta a
+ * regra — não escondida no executor.
+ */
+function DefineSectorForm({
+  config,
+  onChange,
+}: FormProps<{ sector_id: string; sobrescrever_setor_manual?: boolean }>) {
+  const t = useT();
+  const setores = useSectors();
+  const lista = setores.data?.data ?? [];
+
+  return (
+    <div className="space-y-2">
+      <div className="space-y-1">
+        <Label>{t("Setor da conversa")}</Label>
+        {setores.isError ? (
+          <p className="text-xs text-muted-foreground">
+            {t("Os setores de atendimento não estão disponíveis nesta instalação.")}
+          </p>
+        ) : (
+          <Select
+            value={config.sector_id || undefined}
+            onValueChange={(v) => onChange({ ...config, sector_id: v })}
+          >
+            <SelectTrigger>
+              <SelectValue placeholder={t("Escolha o setor")} />
+            </SelectTrigger>
+            <SelectContent>
+              {lista.map((setor) => (
+                <SelectItem key={setor.id} value={setor.id}>
+                  {setor.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        )}
+        <p className="text-xs text-muted-foreground">
+          {t(
+            "A conversa passa a ser distribuída para quem atende este setor. Se ela já tiver dono, continua com ele.",
+          )}
+        </p>
+      </div>
+      <div className="flex items-center justify-between gap-3">
+        <div className="space-y-0.5">
+          <Label>{t("Sobrescrever o setor escolhido por uma pessoa")}</Label>
+          <p className="text-xs text-muted-foreground">
+            {t(
+              "Desligado, a regra só classifica conversa sem setor ou que ela mesma classificou antes.",
+            )}
+          </p>
+        </div>
+        <Switch
+          checked={config.sobrescrever_setor_manual === true}
+          onCheckedChange={(v) =>
+            onChange({ ...config, sobrescrever_setor_manual: v ? true : undefined })
+          }
+        />
+      </div>
+    </div>
+  );
+}
+
 export function ActionConfigForm({
   action,
   onChange,
@@ -1729,6 +1842,14 @@ export function ActionConfigForm({
     case "add_tag":
       return (
         <AddTagForm
+          config={action.config}
+          onChange={(config) => onChange({ type: action.type, config })}
+        />
+      );
+    case "remove_tag":
+      return (
+        <AddTagForm
+          tirar
           config={action.config}
           onChange={(config) => onChange({ type: action.type, config })}
         />
@@ -1777,5 +1898,12 @@ export function ActionConfigForm({
       );
     case "notify_team":
       return <NotifyTeamForm />;
+    case "define_sector":
+      return (
+        <DefineSectorForm
+          config={action.config}
+          onChange={(config) => onChange({ type: action.type, config })}
+        />
+      );
   }
 }

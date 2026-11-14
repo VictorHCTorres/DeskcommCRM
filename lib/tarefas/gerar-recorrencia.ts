@@ -1,6 +1,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 
 import { audit } from "@/lib/audit";
+import { portaDaAplicacao } from "@/lib/db";
 import { logger } from "@/lib/logger";
 import { ehOperante, STATUS_OPERANTE, statusDaOrgEmbutida } from "@/lib/organizacao/operante";
 import { registraAtividadeDaTarefa } from "@/lib/tarefas/atividade";
@@ -234,7 +235,10 @@ export async function gerarRecorrenciasDeTarefas(
         bypassedRls: true,
         metadata: { origem: "recorrencia", recurrence_id: recorrencia.id, generation: novaGeracao },
       });
-      await registraAtividadeDaTarefa(db, {
+      // A linha do tempo do negócio é escrita pela porta de `lib/db` (#3715 F1, upstream):
+      // `registraAtividadeDaTarefa` deixou de aceitar o cliente do PostgREST. O pool não
+      // passa por RLS; a organização vai explícita, a da própria série.
+      await registraAtividadeDaTarefa(portaDaAplicacao(), {
         organizationId: recorrencia.organization_id,
         tarefa: tarefaGerada,
         tipo: "task_created",

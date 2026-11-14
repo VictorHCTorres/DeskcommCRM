@@ -21,10 +21,12 @@ import { assertServiceBoundarySupabase } from "@/lib/atendimento/origem";
 import type { SupabaseClient } from "@supabase/supabase-js";
 
 import { idsDoContatoEGemeos } from "@/lib/channels/contato-por-telefone";
+import { portaDaAplicacao } from "@/lib/db";
 import { logger } from "@/lib/logger";
 
 import { flowGraphSchema, type FlowGraph, type FlowNode, type ReplySaveTo } from "./graph-schema";
 import { TETO_DE_PASSOS_DO_MOTOR } from "./custo-no-motor";
+import { enviosJaFeitos, redacaoDaVez, redacoesDoPasso } from "./variacoes-do-passo";
 import {
   ACTION_RECHECK_MS,
   BACKOFF_MS,
@@ -424,6 +426,8 @@ function turnPayloadExtras(
   smartWaits: EsperaAdaptativa[],
   events: EnrollmentEventRef[] = [],
   contexto?: Record<string, unknown> | null,
+  /** #4429 — o contato, semente estável do ponto de partida da rotação. */
+  semente?: string,
 ): Partial<FollowupJobRequest["payload"]> {
   if (node.type === "action" && node.config.mode === "ai_message") {
     return {
@@ -432,8 +436,16 @@ function turnPayloadExtras(
     };
   }
   if (node.type === "action" && node.config.mode === "text") {
+    // #4429 — QUAL REDAÇÃO SAI, ESCOLHIDO AQUI. O texto do passo deixou de ser
+    // um só: `variacoes` guarda outras redações do MESMO passo e a rotação anda
+    // um passo por mensagem já enviada nesta inscrição (`enviosJaFeitos`), com
+    // ponto de partida no hash do contato. Passo com uma redação só — o de
+    // hoje, e todo grafo já publicado — cai em `redacoes[0]`, que é o `body`:
+    // nenhuma diferença byte a byte no que sai.
+    const redacoes = redacoesDoPasso(node.config);
+    const redacao = redacaoDaVez(redacoes, semente ?? "", enviosJaFeitos(events));
     return {
-      fixed_body: interpolarVolta(node.config.body, events, contexto),
+      fixed_body: interpolarVolta(redacao, events, contexto),
       ...(node.config.media_url ? { fixed_media_url: node.config.media_url } : {}),
     };
   }
@@ -838,7 +850,7 @@ async function applyResult(
             node_id: node.id,
             source_step_key: idemKey,
             purpose: result.purpose,
-            ...turnPayloadExtras(node, smartWaits, events, contexto),
+            ...turnPayloadExtras(node, smartWaits, events, contexto, enrollment.contact_id),
             ...(result.fixed_body ? { fixed_body: result.fixed_body } : {}),
           },
         });
@@ -1071,8 +1083,14 @@ async function processEnrollment(
   const temRegraDeData = graph.nodes.some(
     (n) => n.type === "condition" && n.config.checks.some((c) => c.field === "lead_date"),
   );
+  // A espera com horário (`ate_o_horario`) também pergunta pelo relógio da
+  // organização: "9h às 18h" sem fuso seria 9h às 18h em UTC — 6h às 15h em
+  // São Paulo, e o toque sairia cedo demais, que é o que o horário impede.
+  const temEsperaComHorario = graph.nodes.some(
+    (n) => n.type === "wait" && n.config.mode === "fixed" && n.config.ate_o_horario !== undefined,
+  );
   const fusoDaOrg =
-    temRegraDeData && db.loadFusoDaOrganizacao
+    (temRegraDeData || temEsperaComHorario) && db.loadFusoDaOrganizacao
       ? await db.loadFusoDaOrganizacao(enrollment.organization_id)
       : null;
 
@@ -1532,7 +1550,7 @@ export function createSupabaseAdminClient(admin: SupabaseClient): AdminClient {
         .maybeSingle();
       if (leadErr) throw new Error(leadErr.message);
 
-      const resultado = await criarTarefaNoCrm(admin, {
+      const resultado = await criarTarefaNoCrm(portaDaAplicacao(), {
         organizationId: item.organization_id,
         titulo: item.config.titulo,
         venceEmDias: item.config.vence_em_dias,
