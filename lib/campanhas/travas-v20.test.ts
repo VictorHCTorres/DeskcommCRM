@@ -75,7 +75,7 @@ vi.mock("@/app/api/v1/messages/_handler", () => ({
   },
 }));
 
-import { ATRASO_MAXIMO_DA_VAGA_DA_CAMPANHA_MS as FOLGA, rodarUmaRodadaDeCampanha } from "@/lib/campanhas/rodada";
+import { rodarUmaRodadaDeCampanha } from "@/lib/campanhas/rodada";
 import { recebeuOutraCampanhaNoDia } from "@/lib/campanhas/conferencia";
 
 type Linha = Record<string, unknown>;

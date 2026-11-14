@@ -43,7 +43,7 @@ import { hashDoEndereco } from "./exclusoes";
 
 /** O mínimo de banco que a leitura por conexão usa (`pg.Pool`, `pg.PoolClient`). */
 interface Consultavel {
-  query<R = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<{ rows: R[] }>;
+  query(sql: string, params?: unknown[]): Promise<{ rows: unknown[] }>;
 }
 
 export type MotivoDaHoraNoChip = "fora_da_janela_de_prospeccao" | "feriado_nacional";
@@ -136,7 +136,7 @@ export async function travaDoChipPorPg(
   try {
     // A marca na linha: só conta a linha que veio desta consulta (um dublê que devolve a mesma linha a toda
     // consulta não transforma um número qualquer em número de prospecção; o banco de verdade sempre a devolve).
-    const { rows } = await db.query<{ audience_filter: unknown; marca_da_prospeccao?: unknown }>(
+    const { rows: lidas } = await db.query(
       `select 'prospeccao' as marca_da_prospeccao, k.audience_filter from campaigns k
         where k.organization_id = $1 and k.base_legal = 'legitimate_interest' and k.status <> 'draft'
           and (k.channel_session_id = $2::uuid
@@ -145,7 +145,8 @@ export async function travaDoChipPorPg(
                              and p.channel_session_id = $2::uuid))`,
       [alvo.organizationId, alvo.channelSessionId],
     );
-    const daProspeccao = (rows ?? []).filter((r) => r?.marca_da_prospeccao === "prospeccao");
+    const rows = (lidas ?? []) as Array<{ audience_filter: unknown; marca_da_prospeccao?: unknown } | null>;
+    const daProspeccao = rows.filter((r): r is { audience_filter: unknown } => r?.marca_da_prospeccao === "prospeccao");
     if (daProspeccao.length === 0) return null;
     filtros = daProspeccao.map((r) => r.audience_filter);
   } catch {
@@ -157,11 +158,11 @@ export async function travaDoChipPorPg(
       const hora = motivoDaHoraNoChip(agora, knobs);
       if (hora) return { motivo: hora, proximaAbertura: proximaAberturaSemFeriado(agora, knobs) };
     }
-    const { rows: contatos } = await db.query<ContatoDoChip>(
+    const { rows: contatos } = await db.query(
       `select ${COLUNAS_DO_CONTATO} from contacts where organization_id = $1 and id = $2::uuid`,
       [alvo.organizationId, alvo.contactId],
     );
-    const contato = contatos[0];
+    const contato = contatos[0] as ContatoDoChip | undefined;
     if (!contato) return { motivo: "sem_leitura" };
     const pessoa = motivoDaPessoaNoChip(contato, paradasDoFiltro(filtros));
     if (pessoa) return { motivo: pessoa };
