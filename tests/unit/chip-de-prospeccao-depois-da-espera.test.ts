@@ -22,12 +22,12 @@ const LEAD = '00000000-0000-4000-8000-000000000002';
 const NUMERO = '00000000-0000-4000-8000-000000000004';
 const ENVIADA: ChannelSendResult = { kind: 'sent', idempotencyKey: 'k', messageId: 'm' };
 
-function knobs(throttleMs: number) {
+function knobs(throttleMs: number, janela: [number, number]) {
   return {
     throttle_ms: throttleMs,
     jitter_max_ms: 0,
-    window_start_hour: 8,
-    window_end_hour: 18,
+    window_start_hour: janela[0],
+    window_end_hour: janela[1],
     resposta_start_hour: null,
     resposta_end_hour: null,
     atraso_notar_ms: null,
@@ -51,6 +51,8 @@ interface Opcoes {
   inicio: string;
   ultimaSaida: string;
   throttleMs?: number;
+  /** A janela de disparo do número; por omissão, 8h–18h. */
+  janela?: [number, number];
   /** `false` = o número não é de campanha de prospecção. */
   deProspeccao?: boolean;
   /** A etiqueta que o contato ganha DEPOIS da conferência da entrada. */
@@ -65,7 +67,7 @@ function cenario(o: Opcoes) {
   const responder = (sql: string) => {
     const s = n(sql);
     consultas.push(s);
-    if (s.includes('left join channel_knobs')) return { rows: [knobs(o.throttleMs ?? 60_000)], rowCount: 1 };
+    if (s.includes('left join channel_knobs')) return { rows: [knobs(o.throttleMs ?? 60_000, o.janela ?? [8, 18])], rowCount: 1 };
     if (s.startsWith('select (select sent_at from pacing_ledger'))
       return { rows: [{ last_sent_at: new Date(o.ultimaSaida), sent_today: '1' }], rowCount: 1 };
     if (s.includes("'prospeccao' as marca_da_prospeccao"))
@@ -156,6 +158,24 @@ describe('v20 · o número de prospecção: a hora é reconferida depois da espe
     if (r.status !== 'vetoed') return;
     expect(r.code).toBe('outside_window');
     expect(r.nextAllowedAt?.toISOString()).toBe('2026-11-23T11:00:00.000Z');
+  });
+
+  it('⭐ o feriado também: com o número aberto o dia inteiro, a espera que vira a meia-noite de 20/11 não manda', async () => {
+    // Quinta 19/11 às 23h59m50s em Fortaleza; 50 s depois é sexta 20/11 (feriado nacional), 0h00m40s.
+    const c = cenario({
+      inicio: '2026-11-20T02:59:50.000Z',
+      ultimaSaida: '2026-11-20T02:59:40.000Z',
+      janela: [0, 24],
+    });
+    const r = await c.run();
+    expect(c.send).not.toHaveBeenCalled();
+    expect(r.status).toBe('vetoed');
+    if (r.status !== 'vetoed') return;
+    expect(r.code).toBe('outside_window');
+    expect(r.trace.at(-1)).toMatchObject({ gate: 'chip_de_prospeccao', code: 'feriado_nacional' });
+    // Sábado e domingo não são dias da prospecção: segunda 23/11, 0h00.
+    expect(r.nextAllowedAt?.toISOString()).toBe('2026-11-23T03:00:00.000Z');
+    expect(gravouALinha(c.consultas)).toBe(false);
   });
 
   it('⭐ a folga do transporte conta: às 17h59m55s, sem espera, a mensagem poderia chegar ao provedor até 18h00m05s; não sai', async () => {
