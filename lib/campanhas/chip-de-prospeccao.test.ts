@@ -14,6 +14,7 @@ import {
   travaDoChipPorPg,
   travaDoChipPorSupabase,
 } from "./chip-de-prospeccao";
+import { hashDoEndereco } from "./exclusoes";
 
 const em = (dia: string, hhmm: string) => new Date(`${dia}T${hhmm}:00-03:00`);
 const KNOBS: PacingKnobs = {
@@ -72,7 +73,7 @@ describe("a pessoa no número de prospecção", () => {
 });
 
 /** Um banco de mentira para a leitura por conexão: responde por padrão de SQL. */
-function bancoPg(opcoes: { campanha?: boolean; contato?: Partial<typeof CONTATO>; lista?: boolean; comPessoa?: boolean; falha?: RegExp } = {}) {
+function bancoPg(opcoes: { campanha?: boolean; contato?: Partial<typeof CONTATO>; semContato?: boolean; lista?: boolean; comPessoa?: boolean; falha?: RegExp } = {}) {
   const consultas: string[] = [];
   return {
     consultas,
@@ -88,7 +89,7 @@ function bancoPg(opcoes: { campanha?: boolean; contato?: Partial<typeof CONTATO>
             prospeccao_dias: [1, 2, 3, 4, 5], timezone: "America/Fortaleza", warmup_daily_caps: null, number_activated_at: null }],
         };
       }
-      if (/from contacts/.test(sql)) return { rows: [{ ...CONTATO, ...(opcoes.contato ?? {}) }] };
+      if (/from contacts/.test(sql)) return { rows: opcoes.semContato ? [] : [{ ...CONTATO, ...(opcoes.contato ?? {}) }] };
       if (/from campaign_suppressions/.test(sql)) return { rows: opcoes.lista ? [{ "?column?": 1 }] : [] };
       if (/from conversations/.test(sql)) return { rows: opcoes.comPessoa ? [{ "?column?": 1 }] : [] };
       return { rows: [] };
@@ -124,6 +125,9 @@ describe("a leitura por conexão (a cadeia do agente e o resgate)", () => {
     [{ falha: /from campaigns k/ }, "sem_leitura"],
   ] as const)("⭐ a pessoa: %o → %s", async (opcoes, motivo) => {
     expect((await travaDoChipPorPg(bancoPg(opcoes as never), ALVO, em("2026-11-18", "10:00")))?.motivo).toBe(motivo);
+  });
+  it("⭐ o contato que não se acha não deixa sair (sem_leitura)", async () => {
+    expect((await travaDoChipPorPg(bancoPg({ semContato: true }), ALVO, em("2026-11-18", "10:00")))?.motivo).toBe("sem_leitura");
   });
   it("`hora: false` pula a hora e confere a pessoa", async () => {
     expect(await travaDoChipPorPg(bancoPg(), ALVO, em("2026-11-20", "10:00"), { hora: false })).toBeNull();
@@ -201,5 +205,13 @@ describe("a leitura pelo PostgREST (o handler de mensagens)", () => {
   });
   it("controle: quarta às 10h, pessoa livre: passa", async () => {
     expect(await travaDoChipPorSupabase(postgrest(base()), ALVO, em("2026-11-18", "10:00"))).toBeNull();
+  });
+  it("⭐ o telefone do contato na lista de exclusão: recusa", async () => {
+    const t = base({ campaign_suppressions: [{ organization_id: "org-1", recipient_address_hash: hashDoEndereco(CONTATO.phone_number) }] });
+    expect((await travaDoChipPorSupabase(postgrest(t), ALVO, em("2026-11-18", "10:00")))?.motivo).toBe("suprimido");
+  });
+  it("⭐ uma leitura que LANÇA (e não devolve `error`) não deixa sair", async () => {
+    const quebrado = { from: (t: string) => { if (t === "contacts") throw new Error("cliente quebrado"); return (postgrest(base()) as { from: (x: string) => unknown }).from(t); } } as never;
+    expect((await travaDoChipPorSupabase(quebrado, ALVO, em("2026-11-18", "10:00")))?.motivo).toBe("sem_leitura");
   });
 });
